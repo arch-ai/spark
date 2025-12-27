@@ -7,9 +7,10 @@ use crossterm::terminal;
 
 use crate::app::AppState;
 
-use super::{
-    clear_list_area, fit_left, format_separator, format_top_border, render_help_table_rows_colored,
-    render_line, render_title, HelpSegment,
+use super::layout::{layout_for_screen, render_sidebar, render_sidebar_gap};
+use super::table::{
+    clear_list_area_at, fit_left, format_separator, format_top_border,
+    render_help_table_rows_colored_at, render_line_at, render_title_at, HelpSegment,
 };
 
 pub fn render_docker_envs(
@@ -24,20 +25,28 @@ pub fn render_docker_envs(
     selected: usize,
 ) -> io::Result<()> {
     let (width, height) = terminal::size().unwrap_or((80, 24));
-    let width_usize = width as usize;
+    let screen_width = width as usize;
     let height_usize = height as usize;
+    let layout = layout_for_screen(screen_width);
+    if layout.show_sidebar {
+        render_sidebar(stdout, _state, &layout, height_usize)?;
+        render_sidebar_gap(stdout, &layout, height_usize)?;
+    }
+    let width_usize = layout.main_width;
+    let main_x = layout.main_x;
 
-    queue!(stdout, MoveTo(0, 0))?;
+    queue!(stdout, MoveTo(main_x, 0))?;
 
     let mut row = 0u16;
-    render_line(
+    render_line_at(
         stdout,
+        main_x,
         row,
         &format!("┌{}┐", "─".repeat(width_usize.saturating_sub(2))),
         width_usize,
     )?;
     row += 1;
-    render_title(stdout, row, width_usize, "DOCKER ENV")?;
+    render_title_at(stdout, main_x, row, width_usize, "DOCKER ENV")?;
     row += 2;
 
     let compose_text = format!("Compose: {compose_name}");
@@ -58,30 +67,30 @@ pub fn render_docker_envs(
         &ports_text,
     );
     let info_top = format_top_border(&info_widths);
-    render_line(stdout, row, &info_top, width_usize)?;
+    render_line_at(stdout, main_x, row, &info_top, width_usize)?;
     row += 1;
     let info_row1 = format_env_info_row(&info_widths, &compose_text, &path_text);
-    render_line(stdout, row, &info_row1, width_usize)?;
+    render_line_at(stdout, main_x, row, &info_row1, width_usize)?;
     row += 1;
     let info_sep = format_separator(&info_widths);
-    render_line(stdout, row, &info_sep, width_usize)?;
+    render_line_at(stdout, main_x, row, &info_sep, width_usize)?;
     row += 1;
     let info_row2 = format_env_info_row(&info_widths, &container_text, &ports_text);
-    render_line(stdout, row, &info_row2, width_usize)?;
+    render_line_at(stdout, main_x, row, &info_row2, width_usize)?;
     row += 1;
     let info_bottom = format_bottom_border(&info_widths);
-    render_line(stdout, row, &info_bottom, width_usize)?;
+    render_line_at(stdout, main_x, row, &info_bottom, width_usize)?;
     row += 1;
 
     let env_widths = env_column_widths(width_usize, envs);
     let env_top = format_top_border(&env_widths);
-    render_line(stdout, row, &env_top, width_usize)?;
+    render_line_at(stdout, main_x, row, &env_top, width_usize)?;
     row += 1;
     let env_header = format_env_header(&env_widths);
-    render_line(stdout, row, &env_header, width_usize)?;
+    render_line_at(stdout, main_x, row, &env_header, width_usize)?;
     row += 1;
     let env_sep = format_separator(&env_widths);
-    render_line(stdout, row, &env_sep, width_usize)?;
+    render_line_at(stdout, main_x, row, &env_sep, width_usize)?;
     row += 1;
 
     let list_start = row as usize;
@@ -104,18 +113,19 @@ pub fn render_docker_envs(
             if line_index == selected {
                 queue!(
                     stdout,
-                    MoveTo(0, y as u16),
+                    MoveTo(main_x, y as u16),
                     SetAttribute(Attribute::Reverse),
                     Print(fit_left(&line, width_usize)),
                     SetAttribute(Attribute::Reset)
                 )?;
             } else {
-                render_line(stdout, y as u16, &line, width_usize)?;
+                render_line_at(stdout, main_x, y as u16, &line, width_usize)?;
             }
             rendered += 1;
         }
-        clear_list_area(
+        clear_list_area_at(
             stdout,
+            main_x,
             list_start + rendered,
             max_rows.saturating_sub(rendered),
             width_usize,
@@ -124,7 +134,7 @@ pub fn render_docker_envs(
 
     if height_usize >= footer_lines {
         let message_line = height_usize.saturating_sub(footer_lines) as u16;
-        render_line(stdout, message_line, "Esc to return", width_usize)?;
+        render_line_at(stdout, main_x, message_line, "Esc to return", width_usize)?;
 
         let help_rows = vec![vec![
             HelpSegment::plain("Actions: "),
@@ -132,7 +142,7 @@ pub fn render_docker_envs(
             HelpSegment::plain(" back"),
         ]];
         let help_start = height_usize.saturating_sub(help_rows.len() + 2) as u16;
-        render_help_table_rows_colored(stdout, help_start, width_usize, &help_rows)?;
+        render_help_table_rows_colored_at(stdout, main_x, help_start, width_usize, &help_rows)?;
     }
 
     stdout.flush()?;
