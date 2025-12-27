@@ -135,6 +135,34 @@ pub fn open_container_logs(container_id: &str) -> io::Result<()> {
     }))
 }
 
+pub fn load_container_env(container_id: &str) -> io::Result<Vec<String>> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+            container_id,
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "docker inspect failed",
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<String> = stdout
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect();
+    if lines.is_empty() {
+        lines.push("No env vars found".to_string());
+    }
+    Ok(lines)
+}
+
 enum TerminalMode {
     DashE,
     DoubleDash,

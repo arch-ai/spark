@@ -9,6 +9,9 @@ use crate::app::{AppState, InputMode, SortBy, SortOrder};
 use crate::system::docker::{ContainerInfo, DockerRow};
 use crate::system::process::{ProcInfo, TreeRow};
 
+mod docker_env;
+pub use docker_env::render_docker_envs;
+
 pub fn render_processes(
     stdout: &mut io::Stdout,
     state: &AppState,
@@ -138,18 +141,8 @@ pub fn render_processes(
 
     if height_usize >= footer_lines {
         let message_line = height_usize.saturating_sub(footer_lines) as u16;
-        if !state.docker_filter.is_empty() {
-            render_docker_search_status(
-                stdout,
-                message_line,
-                width_usize,
-                &state.docker_filter,
-                state.docker_filtered_out,
-            )?;
-        } else {
-            let message = state.message.as_deref().unwrap_or("");
-            render_line(stdout, message_line, message, width_usize)?;
-        }
+        let message = state.message.as_deref().unwrap_or("");
+        render_line(stdout, message_line, message, width_usize)?;
 
         let help_rows = if state.input_mode == InputMode::Filter {
             vec![
@@ -388,6 +381,8 @@ pub fn render_containers(
                     HelpSegment::plain(" shell | "),
                     HelpSegment::key("l"),
                     HelpSegment::plain(" logs | "),
+                    HelpSegment::key("e"),
+                    HelpSegment::plain(" env | "),
                     HelpSegment::key("q"),
                     HelpSegment::plain(" quit | "),
                     HelpSegment::key("arrows"),
@@ -506,7 +501,7 @@ fn render_group_row(
     Ok(())
 }
 
-fn render_line(stdout: &mut io::Stdout, y: u16, text: &str, width: usize) -> io::Result<()> {
+pub(super) fn render_line(stdout: &mut io::Stdout, y: u16, text: &str, width: usize) -> io::Result<()> {
     let line = fit_left(text, width);
     queue!(stdout, MoveTo(0, y))?;
 
@@ -595,7 +590,7 @@ fn find_selected_row(rows: &[DockerRow], selected_container: usize) -> Option<us
     None
 }
 
-fn truncate_str(input: &str, max_len: usize) -> String {
+pub(super) fn truncate_str(input: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
@@ -648,7 +643,7 @@ fn split_at_chars(input: &str, count: usize) -> (String, String) {
     (left, right)
 }
 
-fn render_title(stdout: &mut io::Stdout, y: u16, width: usize, title: &str) -> io::Result<()> {
+pub(super) fn render_title(stdout: &mut io::Stdout, y: u16, width: usize, title: &str) -> io::Result<()> {
     let text = title.to_uppercase();
     let inner = width.saturating_sub(2);
     let line = if inner == 0 {
@@ -677,7 +672,7 @@ fn center_text(text: &str, width: usize) -> String {
     format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
 }
 
-fn render_help_table_rows_colored(
+pub(super) fn render_help_table_rows_colored(
     stdout: &mut io::Stdout,
     y: u16,
     width: usize,
@@ -745,7 +740,7 @@ fn print_table_bar(stdout: &mut io::Stdout) -> io::Result<()> {
 }
 
 
-fn clear_list_area(
+pub(super) fn clear_list_area(
     stdout: &mut io::Stdout,
     start: usize,
     count: usize,
@@ -757,7 +752,7 @@ fn clear_list_area(
     Ok(())
 }
 
-fn fit_left(text: &str, width: usize) -> String {
+pub(super) fn fit_left(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
@@ -783,7 +778,7 @@ fn fit_right(text: &str, width: usize) -> String {
     }
 }
 
-struct HelpSegment {
+pub(super) struct HelpSegment {
     text: String,
     color: Option<Color>,
 }
@@ -984,7 +979,7 @@ fn format_docker_header(widths: &[usize]) -> String {
     )
 }
 
-fn format_separator(widths: &[usize]) -> String {
+pub(super) fn format_separator(widths: &[usize]) -> String {
     let mut line = String::new();
     line.push('├');
     for (idx, width) in widths.iter().enumerate() {
@@ -998,7 +993,7 @@ fn format_separator(widths: &[usize]) -> String {
     line
 }
 
-fn format_top_border(widths: &[usize]) -> String {
+pub(super) fn format_top_border(widths: &[usize]) -> String {
     let mut line = String::new();
     line.push('┌');
     for (idx, width) in widths.iter().enumerate() {
