@@ -18,6 +18,8 @@ pub struct ContainerInfo {
     pub id: String,
     pub name: String,
     pub image: String,
+    pub port_public: String,
+    pub port_internal: String,
     pub status: String,
     pub cpu: f32,
     pub memory_bytes: u64,
@@ -212,9 +214,12 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             continue;
         }
 
-        let (meta_name, meta_image, meta_status, meta_group) = resolve_meta(&meta, id);
+        let (meta_name, meta_image, meta_ports_public, meta_ports_internal, meta_status, meta_group) =
+            resolve_meta(&meta, id);
         let resolved_name = if name.is_empty() { meta_name } else { name.to_string() };
         let resolved_image = meta_image.unwrap_or_else(|| "-".to_string());
+        let resolved_ports_public = meta_ports_public.unwrap_or_else(|| "-".to_string());
+        let resolved_ports_internal = meta_ports_internal.unwrap_or_else(|| "-".to_string());
         let resolved_status = meta_status.unwrap_or_else(|| "-".to_string());
         let group = meta_group.unwrap_or_else(|| ComposeGroup {
             name: "Other".to_string(),
@@ -227,6 +232,8 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             id: id.to_string(),
             name: resolved_name,
             image: resolved_image,
+            port_public: resolved_ports_public,
+            port_internal: resolved_ports_internal,
             status: resolved_status,
             cpu,
             memory_bytes: mem_bytes,
@@ -239,13 +246,13 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
 }
 
 fn load_docker_container_meta(
-) -> Option<HashMap<String, (String, String, String, Option<ComposeGroup>)>> {
+) -> Option<HashMap<String, (String, String, String, String, String, Option<ComposeGroup>)>> {
     let output = Command::new("docker")
         .args([
             "ps",
             "--no-trunc",
             "--format",
-            "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Labels}}",
+            "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}|{{.Status}}|{{.Labels}}",
         ])
         .output()
         .ok()?;
@@ -261,21 +268,25 @@ fn load_docker_container_meta(
         if line.trim().is_empty() {
             continue;
         }
-        let mut parts = line.splitn(5, '|');
+        let mut parts = line.splitn(6, '|');
         let id = parts.next().unwrap_or("").trim();
         let name = parts.next().unwrap_or("").trim();
         let image = parts.next().unwrap_or("").trim();
+        let ports_raw = parts.next().unwrap_or("").trim();
         let status = parts.next().unwrap_or("").trim();
         let labels = parts.next().unwrap_or("").trim();
         if id.is_empty() || name.is_empty() {
             continue;
         }
+        let (ports_public, ports_internal) = parse_docker_ports(ports_raw);
         let group = compose_group_from_labels(labels);
         meta.insert(
             id.to_string(),
             (
                 name.to_string(),
                 image.to_string(),
+                ports_public.clone(),
+                ports_internal.clone(),
                 status.to_string(),
                 group.clone(),
             ),
@@ -283,7 +294,14 @@ fn load_docker_container_meta(
         if id.len() >= 12 {
             meta.insert(
                 id[..12].to_string(),
-                (name.to_string(), image.to_string(), status.to_string(), group.clone()),
+                (
+                    name.to_string(),
+                    image.to_string(),
+                    ports_public.clone(),
+                    ports_internal.clone(),
+                    status.to_string(),
+                    group.clone(),
+                ),
             );
         }
     }
@@ -292,28 +310,41 @@ fn load_docker_container_meta(
 }
 
 fn resolve_meta(
-    meta: &HashMap<String, (String, String, String, Option<ComposeGroup>)>,
+    meta: &HashMap<String, (String, String, String, String, String, Option<ComposeGroup>)>,
     id: &str,
-) -> (String, Option<String>, Option<String>, Option<ComposeGroup>) {
-    if let Some((name, image, status, group)) = meta.get(id) {
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<ComposeGroup>,
+) {
+    if let Some((name, image, ports_public, ports_internal, status, group)) = meta.get(id) {
         return (
             name.clone(),
             Some(image.clone()),
+            Some(ports_public.clone()),
+            Some(ports_internal.clone()),
             Some(status.clone()),
             group.clone(),
         );
     }
     if id.len() > 12 {
-        if let Some((name, image, status, group)) = meta.get(&id[..12]) {
+        if let Some((name, image, ports_public, ports_internal, status, group)) =
+            meta.get(&id[..12])
+        {
             return (
                 name.clone(),
                 Some(image.clone()),
+                Some(ports_public.clone()),
+                Some(ports_internal.clone()),
                 Some(status.clone()),
                 group.clone(),
             );
         }
     }
-    ("-".to_string(), None, None, None)
+    ("-".to_string(), None, None, None, None, None)
 }
 
 fn compose_group_from_labels(labels: &str) -> Option<ComposeGroup> {
@@ -447,6 +478,8 @@ pub fn apply_container_filter(containers: &mut Vec<ContainerInfo>, filter: &str)
         container.id.to_lowercase().contains(&filter_lower)
             || container.name.to_lowercase().contains(&filter_lower)
             || container.image.to_lowercase().contains(&filter_lower)
+            || container.port_public.to_lowercase().contains(&filter_lower)
+            || container.port_internal.to_lowercase().contains(&filter_lower)
             || container.status.to_lowercase().contains(&filter_lower)
             || container.group_name.to_lowercase().contains(&filter_lower)
             || container
@@ -578,4 +611,87 @@ fn parse_docker_size(input: &str) -> Option<u64> {
     };
 
     Some((value * multiplier) as u64)
+}
+
+fn parse_docker_ports(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return ("-".to_string(), "-".to_string());
+    }
+
+    let mut public_ports = Vec::new();
+    let mut internal_ports = Vec::new();
+    let mut unbound_ports = Vec::new();
+
+    for part in trimmed.split(',') {
+        let entry = part.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some((left, right)) = entry.split_once("->") {
+            let host_port = extract_host_port(left.trim());
+            let internal_port = extract_container_port(right.trim());
+            if !host_port.is_empty() {
+                public_ports.push(host_port);
+            }
+            if !internal_port.is_empty() {
+                internal_ports.push(internal_port);
+            }
+        } else {
+            let port = extract_unbound_port(entry);
+            if !port.is_empty() {
+                unbound_ports.push(port);
+            }
+        }
+    }
+
+    if !public_ports.is_empty() {
+        if !unbound_ports.is_empty() {
+            internal_ports.extend(unbound_ports);
+        }
+        let pub_join = public_ports.join(",");
+        let internal_join = internal_ports.join(",");
+        let internal = if internal_join.is_empty() {
+            "-".to_string()
+        } else {
+            internal_join
+        };
+        (pub_join, internal)
+    } else if !unbound_ports.is_empty() {
+        (unbound_ports.join(","), "-".to_string())
+    } else {
+        ("-".to_string(), "-".to_string())
+    }
+}
+
+fn extract_host_port(input: &str) -> String {
+    let mut parts = input.rsplit(':');
+    parts.next().unwrap_or("").trim().to_string()
+}
+
+fn extract_container_port(input: &str) -> String {
+    input
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn extract_unbound_port(input: &str) -> String {
+    let trimmed = input.trim();
+    if let Some((port, proto)) = trimmed.split_once('/') {
+        let port = port.trim();
+        let proto = proto.trim();
+        if port.is_empty() {
+            return String::new();
+        }
+        if proto.eq_ignore_ascii_case("tcp") || proto.is_empty() {
+            port.to_string()
+        } else {
+            format!("{port}/{proto}")
+        }
+    } else {
+        trimmed.to_string()
+    }
 }

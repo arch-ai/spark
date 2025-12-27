@@ -21,10 +21,10 @@ pub fn render_processes(
 
     queue!(stdout, MoveTo(0, 0))?;
 
-    let filter_display = if state.filter.is_empty() {
+    let filter_display = if state.process_filter.is_empty() {
         "<none>"
     } else {
-        state.filter.as_str()
+        state.process_filter.as_str()
     };
     let sort_label = match state.sort_by {
         SortBy::Cpu => "CPU",
@@ -138,8 +138,18 @@ pub fn render_processes(
 
     if height_usize >= footer_lines {
         let message_line = height_usize.saturating_sub(footer_lines) as u16;
-        let message = state.message.as_deref().unwrap_or("");
-        render_line(stdout, message_line, message, width_usize)?;
+        if !state.docker_filter.is_empty() {
+            render_docker_search_status(
+                stdout,
+                message_line,
+                width_usize,
+                &state.docker_filter,
+                state.docker_filtered_out,
+            )?;
+        } else {
+            let message = state.message.as_deref().unwrap_or("");
+            render_line(stdout, message_line, message, width_usize)?;
+        }
 
         let help_rows = if state.input_mode == InputMode::Filter {
             vec![
@@ -147,14 +157,6 @@ pub fn render_processes(
                     HelpSegment::plain("Filters: "),
                     HelpSegment::key("/"),
                     HelpSegment::plain(" search | "),
-                    HelpSegment::key("c"),
-                    HelpSegment::plain(" CPU | "),
-                    HelpSegment::key("m"),
-                    HelpSegment::plain(" MEM | "),
-                    HelpSegment::key("n"),
-                    HelpSegment::plain(" NAME | "),
-                    HelpSegment::key("r"),
-                    HelpSegment::plain(" reverse | "),
                     HelpSegment::key("x"),
                     HelpSegment::plain(" clear search"),
                 ],
@@ -172,14 +174,6 @@ pub fn render_processes(
                     HelpSegment::plain("Filters: "),
                     HelpSegment::key("/"),
                     HelpSegment::plain(" search | "),
-                    HelpSegment::key("c"),
-                    HelpSegment::plain(" CPU | "),
-                    HelpSegment::key("m"),
-                    HelpSegment::plain(" MEM | "),
-                    HelpSegment::key("n"),
-                    HelpSegment::plain(" NAME | "),
-                    HelpSegment::key("r"),
-                    HelpSegment::plain(" reverse | "),
                     HelpSegment::key("x"),
                     HelpSegment::plain(" clear search"),
                 ],
@@ -218,11 +212,6 @@ pub fn render_containers(
 
     queue!(stdout, MoveTo(0, 0))?;
 
-    let filter_display = if state.filter.is_empty() {
-        "<none>"
-    } else {
-        state.filter.as_str()
-    };
     let sort_label = match state.sort_by {
         SortBy::Cpu => "CPU",
         SortBy::Memory => "MEM",
@@ -244,8 +233,8 @@ pub fn render_containers(
     row += 2;
 
     let header = format!(
-        "Rust Task Manager | View: DOCKER | Filter: {} | Sort: {} {} | Mode: {}",
-        filter_display, sort_label, order_label, mode_label
+        "Rust Task Manager | View: DOCKER | Sort: {} {} | Mode: {}",
+        sort_label, order_label, mode_label
     );
     render_line(stdout, row, &header, width_usize)?;
     row += 1;
@@ -352,8 +341,18 @@ pub fn render_containers(
 
     if height_usize >= footer_lines {
         let message_line = height_usize.saturating_sub(footer_lines) as u16;
-        let message = state.message.as_deref().unwrap_or("");
-        render_line(stdout, message_line, message, width_usize)?;
+        if !state.docker_filter.is_empty() {
+            render_docker_search_status(
+                stdout,
+                message_line,
+                width_usize,
+                &state.docker_filter,
+                state.docker_filtered_out,
+            )?;
+        } else {
+            let message = state.message.as_deref().unwrap_or("");
+            render_line(stdout, message_line, message, width_usize)?;
+        }
 
         let help_rows = if state.input_mode == InputMode::Filter {
             vec![
@@ -361,14 +360,6 @@ pub fn render_containers(
                     HelpSegment::plain("Filters: "),
                     HelpSegment::key("/"),
                     HelpSegment::plain(" search | "),
-                    HelpSegment::key("c"),
-                    HelpSegment::plain(" CPU | "),
-                    HelpSegment::key("m"),
-                    HelpSegment::plain(" MEM | "),
-                    HelpSegment::key("n"),
-                    HelpSegment::plain(" NAME | "),
-                    HelpSegment::key("r"),
-                    HelpSegment::plain(" reverse | "),
                     HelpSegment::key("x"),
                     HelpSegment::plain(" clear search"),
                 ],
@@ -386,14 +377,6 @@ pub fn render_containers(
                     HelpSegment::plain("Filters: "),
                     HelpSegment::key("/"),
                     HelpSegment::plain(" search | "),
-                    HelpSegment::key("c"),
-                    HelpSegment::plain(" CPU | "),
-                    HelpSegment::key("m"),
-                    HelpSegment::plain(" MEM | "),
-                    HelpSegment::key("n"),
-                    HelpSegment::plain(" NAME | "),
-                    HelpSegment::key("r"),
-                    HelpSegment::plain(" reverse | "),
                     HelpSegment::key("x"),
                     HelpSegment::plain(" clear search"),
                 ],
@@ -472,11 +455,13 @@ fn format_container_line(container: &ContainerInfo, width: usize, prefix: &str) 
     let name_text = format!("{prefix}{}", container.name);
     let name_cell = fit_left(&name_text, widths[3]);
     let image_cell = fit_left(&container.image, widths[4]);
-    let status_cell = fit_left(&container.status, widths[5]);
+    let port_cell = fit_left(&container.port_public, widths[5]);
+    let int_port_cell = fit_left(&container.port_internal, widths[6]);
+    let status_cell = fit_left(&container.status, widths[7]);
 
     format!(
-        "│{}│{}│{}│{}│{}│{}│",
-        id_cell, cpu_cell, mem_cell, name_cell, image_cell, status_cell
+        "│{}│{}│{}│{}│{}│{}│{}│{}│",
+        id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
     )
 }
 
@@ -496,7 +481,9 @@ fn render_group_row(
     let cpu_cell = fit_right("", widths[1]);
     let mem_cell = fit_right("", widths[2]);
     let image_cell = fit_left(path_label, widths[4]);
-    let status_cell = fit_left(&status_label, widths[5]);
+    let port_cell = fit_left("-", widths[5]);
+    let int_port_cell = fit_left("-", widths[6]);
+    let status_cell = fit_left(&status_label, widths[7]);
 
     queue!(stdout, MoveTo(0, y))?;
     print_table_bar(stdout)?;
@@ -509,6 +496,10 @@ fn render_group_row(
     render_group_name_cell(stdout, &label, widths[3])?;
     print_table_bar(stdout)?;
     queue!(stdout, Print(image_cell))?;
+    print_table_bar(stdout)?;
+    queue!(stdout, Print(port_cell))?;
+    print_table_bar(stdout)?;
+    queue!(stdout, Print(int_port_cell))?;
     print_table_bar(stdout)?;
     queue!(stdout, Print(status_cell))?;
     print_table_bar(stdout)?;
@@ -543,6 +534,53 @@ fn render_line(stdout: &mut io::Stdout, y: u16, text: &str, width: usize) -> io:
     }
 
     queue!(stdout, ResetColor)?;
+    Ok(())
+}
+
+fn render_docker_search_status(
+    stdout: &mut io::Stdout,
+    y: u16,
+    width: usize,
+    term: &str,
+    filtered_out: usize,
+) -> io::Result<()> {
+    if width == 0 {
+        return Ok(());
+    }
+
+    let prefix = "Search: ";
+    let suffix = format!(" | {} docker filtered out | x clear search", filtered_out);
+    let prefix_len = prefix.chars().count();
+    let mut suffix_display = suffix.clone();
+    let min_term = if term.is_empty() { 0 } else { 1 };
+
+    if prefix_len + suffix_display.chars().count() + min_term > width {
+        let max_suffix = width.saturating_sub(prefix_len + min_term);
+        suffix_display = truncate_str(&suffix, max_suffix);
+    }
+
+    let suffix_len = suffix_display.chars().count();
+    let available = width.saturating_sub(prefix_len + suffix_len);
+    let term_display = truncate_str(term, available);
+    let term_len = term_display.chars().count();
+
+    queue!(stdout, MoveTo(0, y), Print(prefix))?;
+    if !term_display.is_empty() {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::Blue),
+            SetAttribute(Attribute::Bold),
+            Print(term_display),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )?;
+    }
+    queue!(stdout, Print(suffix_display))?;
+
+    let printed = prefix_len + term_len + suffix_len;
+    if printed < width {
+        queue!(stdout, Print(" ".repeat(width - printed)))?;
+    }
     Ok(())
 }
 
@@ -821,50 +859,97 @@ fn process_column_widths(width: usize, max_user_len: usize) -> Vec<usize> {
 
 fn docker_column_widths(width: usize) -> Vec<usize> {
     let fixed = 12 + 6 + 9;
-    let separators = 7usize;
+    let separators = 9usize;
     let content_width = width.saturating_sub(separators);
     let remaining = content_width.saturating_sub(fixed);
     let min_name = 10usize;
     let min_image = 10usize;
+    let min_ports = 8usize;
+    let min_int_ports = 8usize;
     let min_status = 10usize;
 
-    let (name_width, image_width, status_width) = if remaining >= min_name + min_image + min_status
+    let (name_width, image_width, ports_width, int_ports_width, status_width) = if remaining
+        >= min_name + min_image + min_ports + min_int_ports + min_status
     {
-        let mut name_width = remaining * 3 / 8;
-        let mut image_width = remaining * 3 / 8;
-        let mut status_width = remaining - name_width - image_width;
+        let mut name_width = remaining * 3 / 12;
+        let mut image_width = remaining * 3 / 12;
+        let mut ports_width = remaining * 2 / 12;
+        let mut int_ports_width = remaining * 2 / 12;
+        let mut status_width =
+            remaining - name_width - image_width - ports_width - int_ports_width;
         if status_width < min_status {
             status_width = min_status;
             let leftover = remaining - status_width;
-            name_width = leftover / 2;
-            image_width = leftover - name_width;
+            name_width = leftover * 3 / 9;
+            image_width = leftover * 3 / 9;
+            ports_width = leftover * 2 / 9;
+            int_ports_width = leftover - name_width - image_width - ports_width;
         }
         if name_width < min_name {
             name_width = min_name;
             let leftover = remaining - name_width;
-            image_width = leftover / 2;
-            status_width = leftover - image_width;
+            image_width = leftover * 3 / 8;
+            ports_width = leftover * 2 / 8;
+            int_ports_width = leftover * 2 / 8;
+            status_width = leftover - image_width - ports_width - int_ports_width;
         }
         if image_width < min_image {
             image_width = min_image;
             let leftover = remaining - image_width;
-            name_width = leftover / 2;
-            status_width = leftover - name_width;
+            name_width = leftover * 3 / 8;
+            ports_width = leftover * 2 / 8;
+            int_ports_width = leftover * 2 / 8;
+            status_width = leftover - name_width - ports_width - int_ports_width;
         }
-        (name_width, image_width, status_width)
+        if ports_width < min_ports {
+            ports_width = min_ports;
+            let leftover = remaining - ports_width;
+            name_width = leftover * 3 / 8;
+            image_width = leftover * 3 / 8;
+            int_ports_width = leftover * 2 / 8;
+            status_width = leftover - name_width - image_width - int_ports_width;
+        }
+        if int_ports_width < min_int_ports {
+            int_ports_width = min_int_ports;
+            let leftover = remaining - int_ports_width;
+            name_width = leftover * 3 / 8;
+            image_width = leftover * 3 / 8;
+            ports_width = leftover * 2 / 8;
+            status_width = leftover - name_width - image_width - ports_width;
+        }
+        (
+            name_width,
+            image_width,
+            ports_width,
+            int_ports_width,
+            status_width,
+        )
     } else {
         let mut name_width = remaining;
         let mut image_width = 0usize;
+        let mut ports_width = 0usize;
+        let mut int_ports_width = 0usize;
         let mut status_width = 0usize;
-        if name_width >= min_name + min_image + min_status {
+        if name_width >= min_name + min_image + min_ports + min_int_ports + min_status {
             name_width = min_name;
             image_width = min_image;
-            status_width = remaining - name_width - image_width;
+            ports_width = min_ports;
+            int_ports_width = min_int_ports;
+            status_width = remaining - name_width - image_width - ports_width - int_ports_width;
         }
-        (name_width, image_width, status_width)
+        (name_width, image_width, ports_width, int_ports_width, status_width)
     };
 
-    vec![12, 6, 9, name_width, image_width, status_width]
+    vec![
+        12,
+        6,
+        9,
+        name_width,
+        image_width,
+        ports_width,
+        int_ports_width,
+        status_width,
+    ]
 }
 
 fn format_process_header(widths: &[usize]) -> String {
@@ -889,11 +974,13 @@ fn format_docker_header(widths: &[usize]) -> String {
         fit_right("MEM(GB)", widths[2]),
         fit_left("NAME", widths[3]),
         fit_left("IMAGE", widths[4]),
-        fit_left("STATUS", widths[5]),
+        fit_left("PORT", widths[5]),
+        fit_left("INT PORT", widths[6]),
+        fit_left("STATUS", widths[7]),
     ];
     format!(
-        "│{}│{}│{}│{}│{}│{}│",
-        cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]
+        "│{}│{}│{}│{}│{}│{}│{}│{}│",
+        cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7]
     )
 }
 

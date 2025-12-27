@@ -45,7 +45,8 @@ impl SortOrder {
 
 pub struct AppState {
     pub input_mode: InputMode,
-    pub filter: String,
+    pub process_filter: String,
+    pub docker_filter: String,
     pub sort_by: SortBy,
     pub sort_order: SortOrder,
     pub zoom: bool,
@@ -59,6 +60,8 @@ pub struct AppState {
     pub container_last_refresh: Instant,
     pub user_cache: HashMap<Uid, String>,
     pub user_last_refresh: Instant,
+    pub docker_filtered_out: usize,
+    pub docker_total: usize,
     pub cpu_usage: f32,
     pub mem_total: u64,
     pub mem_available: u64,
@@ -70,7 +73,8 @@ impl AppState {
     fn new() -> Self {
         Self {
             input_mode: InputMode::Normal,
-            filter: String::new(),
+            process_filter: String::new(),
+            docker_filter: String::new(),
             sort_by: SortBy::Memory,
             sort_order: SortOrder::Desc,
             zoom: false,
@@ -84,6 +88,8 @@ impl AppState {
             container_last_refresh: Instant::now() - Duration::from_secs(60),
             user_cache: HashMap::new(),
             user_last_refresh: Instant::now() - Duration::from_secs(60),
+            docker_filtered_out: 0,
+            docker_total: 0,
             cpu_usage: 0.0,
             mem_total: 0,
             mem_available: 0,
@@ -116,6 +122,20 @@ impl AppState {
             self.sort_order = SortOrder::Desc;
         }
     }
+
+    fn active_filter(&self) -> &str {
+        match self.view_mode {
+            ViewMode::Process => &self.process_filter,
+            ViewMode::Docker => &self.docker_filter,
+        }
+    }
+
+    fn active_filter_mut(&mut self) -> &mut String {
+        match self.view_mode {
+            ViewMode::Process => &mut self.process_filter,
+            ViewMode::Docker => &mut self.docker_filter,
+        }
+    }
 }
 
 pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
@@ -145,7 +165,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
     loop {
         if event::poll(input_poll)? {
             if let Event::Key(key) = event::read()? {
-                let prev_filter = state.filter.clone();
+                let prev_filter = state.active_filter().to_string();
                 let prev_sort_by = state.sort_by;
                 let prev_sort_order = state.sort_order;
                 let prev_zoom = state.zoom;
@@ -155,13 +175,19 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     break;
                 }
 
-                let filter_changed = state.filter != prev_filter;
+                let filter_changed = state.active_filter() != prev_filter;
                 let sort_changed =
                     state.sort_by != prev_sort_by || state.sort_order != prev_sort_order;
                 let zoom_changed = state.zoom != prev_zoom;
                 let view_changed = state.view_mode != prev_view;
 
-                if filter_changed || sort_changed {
+                if filter_changed {
+                    match state.view_mode {
+                        ViewMode::Process => process_dirty = true,
+                        ViewMode::Docker => docker_dirty = true,
+                    }
+                }
+                if sort_changed {
                     process_dirty = true;
                     docker_dirty = true;
                 }
@@ -196,7 +222,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     maybe_refresh_user_cache(&mut state);
                     process_cache = process::collect_processes(
                         &system,
-                        &state.filter,
+                        &state.process_filter,
                         &state.container_cache,
                         &state.user_cache,
                         state.zoom,
@@ -228,11 +254,14 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
 
                 if docker_dirty {
                     docker_view = docker_raw.clone();
-                    docker::apply_container_filter(&mut docker_view, &state.filter);
+                    docker::apply_container_filter(&mut docker_view, &state.docker_filter);
                     let (grouped, rows) =
                         docker::group_containers(docker_view, state.sort_by, state.sort_order);
                     docker_view = grouped;
                     docker_rows = rows;
+                    state.docker_total = docker_raw.len();
+                    state.docker_filtered_out =
+                        state.docker_total.saturating_sub(docker_view.len());
                     clamp_selection(&mut state, docker_view.len());
                     state.visible_containers =
                         docker_view.iter().map(|container| container.id.clone()).collect();
@@ -345,8 +374,8 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
             }
         }
         KeyCode::Char('x') => {
-            if !state.filter.is_empty() {
-                state.filter.clear();
+            if !state.active_filter().is_empty() {
+                state.active_filter_mut().clear();
                 state.input_mode = InputMode::Normal;
                 state.set_message("Search cleared");
             }
@@ -410,13 +439,13 @@ fn handle_filter_mode(key: KeyEvent, state: &mut AppState) -> bool {
             state.input_mode = InputMode::Normal;
         }
         KeyCode::Backspace => {
-            state.filter.pop();
+            state.active_filter_mut().pop();
         }
         KeyCode::Char(ch) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
-                state.filter.push(ch);
+                state.active_filter_mut().push(ch);
             }
         }
         _ => {}
