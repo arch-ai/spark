@@ -13,6 +13,16 @@ EXEC_CMD="$BIN_DIR/$BIN_NAME"
 TERMINAL_ENTRY="true"
 STARTUP_WMCLASS_LINE=""
 
+if ! command -v rustc >/dev/null 2>&1; then
+  if command -v apt >/dev/null 2>&1; then
+    echo "rustc not found; installing via apt..."
+    sudo apt install -y rustc
+  else
+    echo "rustc not found and apt is unavailable. Please install Rust first."
+    exit 1
+  fi
+fi
+
 if command -v gnome-terminal >/dev/null 2>&1; then
   SESSION_BACKEND=""
   if [ -n "${GDK_BACKEND:-}" ]; then
