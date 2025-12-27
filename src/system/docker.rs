@@ -163,6 +163,21 @@ pub fn load_container_env(container_id: &str) -> io::Result<Vec<String>> {
     Ok(lines)
 }
 
+pub fn kill_container(container_id: &str) -> io::Result<()> {
+    let output = Command::new("docker")
+        .args(["kill", container_id])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "docker kill failed",
+        ))
+    }
+}
+
 enum TerminalMode {
     DashE,
     DoubleDash,

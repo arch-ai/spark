@@ -6,6 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use sysinfo::{Pid, System, Users, Uid};
 
 use crate::system::docker;
+use crate::system::ports;
 use crate::system::process;
 use crate::ui;
 
@@ -20,6 +21,7 @@ pub enum ViewMode {
     Process,
     Docker,
     DockerEnv,
+    Ports,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -48,6 +50,7 @@ pub struct AppState {
     pub input_mode: InputMode,
     pub process_filter: String,
     pub docker_filter: String,
+    pub ports_filter: String,
     pub sort_by: SortBy,
     pub sort_order: SortOrder,
     pub zoom: bool,
@@ -62,6 +65,8 @@ pub struct AppState {
     pub visible_container_ports_internal: Vec<String>,
     pub visible_container_group_name: Vec<String>,
     pub visible_container_group_path: Vec<String>,
+    pub visible_ports: Vec<Pid>,
+    pub visible_ports_container_ids: Vec<Option<String>>,
     pub container_cache: HashMap<String, String>,
     pub container_last_refresh: Instant,
     pub user_cache: HashMap<Uid, String>,
@@ -88,6 +93,7 @@ impl AppState {
             input_mode: InputMode::Normal,
             process_filter: String::new(),
             docker_filter: String::new(),
+            ports_filter: String::new(),
             sort_by: SortBy::Memory,
             sort_order: SortOrder::Desc,
             zoom: false,
@@ -102,6 +108,8 @@ impl AppState {
             visible_container_ports_internal: Vec::new(),
             visible_container_group_name: Vec::new(),
             visible_container_group_path: Vec::new(),
+            visible_ports: Vec::new(),
+            visible_ports_container_ids: Vec::new(),
             container_cache: HashMap::new(),
             container_last_refresh: Instant::now() - Duration::from_secs(60),
             user_cache: HashMap::new(),
@@ -152,6 +160,7 @@ impl AppState {
         match self.view_mode {
             ViewMode::Process => &self.process_filter,
             ViewMode::Docker | ViewMode::DockerEnv => &self.docker_filter,
+            ViewMode::Ports => &self.ports_filter,
         }
     }
 
@@ -159,6 +168,7 @@ impl AppState {
         match self.view_mode {
             ViewMode::Process => &mut self.process_filter,
             ViewMode::Docker | ViewMode::DockerEnv => &mut self.docker_filter,
+            ViewMode::Ports => &mut self.ports_filter,
         }
     }
 }
@@ -186,6 +196,8 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
     let mut docker_rows: Vec<docker::DockerRow> = Vec::new();
     let mut docker_dirty = true;
     let mut last_docker_pull = Instant::now() - Duration::from_secs(60);
+    let mut ports_cache: Vec<ports::PortInfo> = Vec::new();
+    let mut ports_dirty = true;
 
     loop {
         if event::poll(input_poll)? {
@@ -211,6 +223,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                         ViewMode::Process => process_dirty = true,
                         ViewMode::Docker => docker_dirty = true,
                         ViewMode::DockerEnv => {}
+                        ViewMode::Ports => ports_dirty = true,
                     }
                 }
                 if sort_changed {
@@ -223,6 +236,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                 if view_changed {
                     process_dirty = true;
                     docker_dirty = true;
+                    ports_dirty = true;
                 }
 
                 needs_render = true;
@@ -234,6 +248,9 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
             update_system_snapshot(&mut state, &system);
             last_tick = Instant::now();
             process_dirty = true;
+            if state.view_mode == ViewMode::Ports {
+                ports_dirty = true;
+            }
             needs_render = true;
         }
 
@@ -267,6 +284,8 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     state.visible_container_ports_internal.clear();
                     state.visible_container_group_name.clear();
                     state.visible_container_group_path.clear();
+                    state.visible_ports.clear();
+                    state.visible_ports_container_ids.clear();
                     process_dirty = false;
                     needs_render = true;
                 }
@@ -320,6 +339,8 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                         })
                         .collect();
                     state.visible_pids.clear();
+                    state.visible_ports.clear();
+                    state.visible_ports_container_ids.clear();
                     docker_dirty = false;
                     needs_render = true;
                 }
@@ -342,6 +363,36 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                         &state.docker_env_port_internal,
                         state.docker_env_selected,
                     )?;
+                    needs_render = false;
+                }
+            }
+            ViewMode::Ports => {
+                if ports_dirty {
+                    ports_cache = ports::collect_ports(&system);
+                    if !state.ports_filter.is_empty() {
+                        let filter = state.ports_filter.to_lowercase();
+                        ports_cache.retain(|row| {
+                            row.proto.to_lowercase().contains(&filter)
+                                || row.port.to_string().contains(&filter)
+                                || row.pid.to_string().contains(&filter)
+                                || row.name.to_lowercase().contains(&filter)
+                                || row.exe_path.to_lowercase().contains(&filter)
+                        });
+                    }
+                    clamp_selection(&mut state, ports_cache.len());
+                    state.visible_ports = ports_cache.iter().map(|row| row.pid).collect();
+                    state.visible_ports_container_ids = ports_cache
+                        .iter()
+                        .map(|row| row.container_id.clone())
+                        .collect();
+                    state.visible_pids.clear();
+                    state.visible_containers.clear();
+                    ports_dirty = false;
+                    needs_render = true;
+                }
+
+                if needs_render {
+                    ui::render_ports(stdout, &state, &ports_cache)?;
                     needs_render = false;
                 }
             }
@@ -420,6 +471,7 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
         ViewMode::Process => state.visible_pids.len(),
         ViewMode::Docker => state.visible_containers.len(),
         ViewMode::DockerEnv => 0,
+        ViewMode::Ports => state.visible_ports.len(),
     };
 
     match key.code {
@@ -460,20 +512,39 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                 ViewMode::Process => ViewMode::Docker,
                 ViewMode::Docker => ViewMode::Process,
                 ViewMode::DockerEnv => ViewMode::Docker,
+                ViewMode::Ports => ViewMode::Docker,
             };
             state.selected = 0;
             let label = match state.view_mode {
                 ViewMode::Process => "Process",
                 ViewMode::Docker => "Docker",
                 ViewMode::DockerEnv => "Docker Env",
+                ViewMode::Ports => "Ports",
+            };
+            state.set_message(format!("View: {label}"));
+        }
+        KeyCode::Char('p') => {
+            state.view_mode = match state.view_mode {
+                ViewMode::Ports => ViewMode::Process,
+                ViewMode::DockerEnv => ViewMode::Docker,
+                _ => ViewMode::Ports,
+            };
+            state.selected = 0;
+            let label = match state.view_mode {
+                ViewMode::Process => "Process",
+                ViewMode::Docker => "Docker",
+                ViewMode::DockerEnv => "Docker Env",
+                ViewMode::Ports => "Ports",
             };
             state.set_message(format!("View: {label}"));
         }
         KeyCode::Char('k') => {
             if state.view_mode == ViewMode::Process {
                 kill_selected_process(state, system);
+            } else if state.view_mode == ViewMode::Ports {
+                kill_selected_port_process(state, system);
             } else {
-                state.set_message("Kill disabled in Docker view");
+                state.set_message("Kill disabled in this view");
             }
         }
         KeyCode::Enter => {
@@ -573,6 +644,46 @@ fn kill_selected_process(state: &mut AppState, system: &mut System) {
         state.set_message("No process selected");
         return;
     };
+
+    match system.process(pid) {
+        Some(process) => {
+            let name = process.name().to_string();
+            if process.kill() {
+                state.set_message(format!("Killed PID {} ({})", pid, name));
+            } else {
+                state.set_message(format!("Failed to kill PID {} ({})", pid, name));
+            }
+        }
+        None => {
+            state.set_message(format!("Process PID {} not found", pid));
+        }
+    }
+}
+
+fn kill_selected_port_process(state: &mut AppState, system: &mut System) {
+    let Some(pid) = state.visible_ports.get(state.selected).cloned() else {
+        state.set_message("No port selected");
+        return;
+    };
+    if pid == Pid::from_u32(0) {
+        let container_id = state
+            .visible_ports_container_ids
+            .get(state.selected)
+            .and_then(|id| id.clone());
+        if let Some(id) = container_id {
+            match docker::kill_container(&id) {
+                Ok(()) => {
+                    state.set_message(format!("Killed container {}", id));
+                }
+                Err(err) => {
+                    state.set_message(format!("Failed to kill container: {err}"));
+                }
+            }
+        } else {
+            state.set_message("No process associated with this port");
+        }
+        return;
+    }
 
     match system.process(pid) {
         Some(process) => {
