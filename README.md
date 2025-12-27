@@ -46,6 +46,12 @@ the installer with:
 FORCE_X11=1 ./install.sh
 ```
 
+## Install from Git (Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arch-ai/spark/main/install-from-git.sh | bash
+```
+
 ## Notes
 
 - Docker view requires the `docker` CLI in `PATH`.
