@@ -21,6 +21,7 @@ cargo run
 ```
 
 ## Install (Linux)
+Installer made for Ubuntu.
 
 ```bash
 ./install.sh
