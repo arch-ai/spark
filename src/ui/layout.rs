@@ -54,34 +54,60 @@ pub(crate) fn render_sidebar(
 
     let width = layout.sidebar_width;
     let inner = width.saturating_sub(2);
-    let title = center_text("VIEWS", inner);
     let top = format!("┌{}┐", "─".repeat(inner));
+    let bottom = format!("└{}┘", "─".repeat(inner));
+    let title = center_text("SPARK", inner);
     let title_line = format!("│{}│", title);
     let sep = format!("├{}┤", "─".repeat(inner));
-    let bottom = format!("└{}┘", "─".repeat(inner));
+    let logo_lines = [
+        "     .     .",
+        "  .  |\\   /|  .",
+        "     | \\ / |",
+        " ---+-- * --+---",
+        "     | / \\ |",
+        "  .  |/   \\|  .",
+        "     '     '",
+    ];
 
     render_line_at(stdout, 0, 0, &top, width)?;
     if height == 1 {
         return Ok(());
     }
-    render_line_at(stdout, 0, 1, &title_line, width)?;
-    if height == 2 {
-        return Ok(());
-    }
-    if height == 3 {
-        render_line_at(stdout, 0, 2, &bottom, width)?;
-        return Ok(());
-    }
-    render_line_at(stdout, 0, 2, &sep, width)?;
 
-    let items = ["Processes", "Docker", "Ports"];
+    let bottom_row = height.saturating_sub(1);
+    let mut row = 1usize;
+    let available_inner = bottom_row.saturating_sub(row);
+    let min_after_logo = 2usize;
+    let max_logo = available_inner.saturating_sub(min_after_logo);
+    let logo_count = logo_lines.len().min(max_logo);
+
+    for line in logo_lines.iter().take(logo_count) {
+        let line = format!("│{}│", fit_left(line, inner));
+        render_line_at(stdout, 0, row as u16, &line, width)?;
+        row += 1;
+        if row >= bottom_row {
+            render_line_at(stdout, 0, bottom_row as u16, &bottom, width)?;
+            return Ok(());
+        }
+    }
+
+    if row < bottom_row {
+        render_line_at(stdout, 0, row as u16, &title_line, width)?;
+        row += 1;
+    }
+    if row < bottom_row {
+        render_line_at(stdout, 0, row as u16, &sep, width)?;
+        row += 1;
+    }
+
+    let items = ["Processes", "Ports", "Docker", "Node JS"];
     let active_index = match state.view_mode {
         ViewMode::Process => 0,
-        ViewMode::Docker | ViewMode::DockerEnv => 1,
-        ViewMode::Ports => 2,
+        ViewMode::Ports => 1,
+        ViewMode::Docker | ViewMode::DockerEnv => 2,
+        ViewMode::Node => 3,
     };
-    let list_start = 3usize;
-    let bottom_row = height.saturating_sub(1);
+    let list_start = row;
     let mut item_idx = 0usize;
 
     for y in list_start..bottom_row {

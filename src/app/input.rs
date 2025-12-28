@@ -29,6 +29,7 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
         ViewMode::Docker => state.visible_containers.len(),
         ViewMode::DockerEnv => 0,
         ViewMode::Ports => state.visible_ports.len(),
+        ViewMode::Node => state.visible_pids.len(),
     };
 
     if matches!(key.code, KeyCode::Left | KeyCode::Right) {
@@ -48,7 +49,7 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                 state.set_view(view_for_sidebar_index(state.sidebar_index));
             }
             KeyCode::Down => {
-                if state.sidebar_index < 2 {
+                if state.sidebar_index < 3 {
                     state.sidebar_index += 1;
                 }
                 state.set_view(view_for_sidebar_index(state.sidebar_index));
@@ -103,15 +104,11 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                 ViewMode::Docker => ViewMode::Process,
                 ViewMode::DockerEnv => ViewMode::Docker,
                 ViewMode::Ports => ViewMode::Docker,
+                ViewMode::Node => ViewMode::Docker,
             };
             state.set_view(view);
             state.focus = Focus::Main;
-            let label = match state.view_mode {
-                ViewMode::Process => "Process",
-                ViewMode::Docker => "Docker",
-                ViewMode::DockerEnv => "Docker Env",
-                ViewMode::Ports => "Ports",
-            };
+            let label = view_label(state.view_mode);
             state.set_message(format!("View: {label}"));
         }
         KeyCode::Char('p') => {
@@ -122,16 +119,21 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
             };
             state.set_view(view);
             state.focus = Focus::Main;
-            let label = match state.view_mode {
-                ViewMode::Process => "Process",
-                ViewMode::Docker => "Docker",
-                ViewMode::DockerEnv => "Docker Env",
-                ViewMode::Ports => "Ports",
+            let label = view_label(state.view_mode);
+            state.set_message(format!("View: {label}"));
+        }
+        KeyCode::Char('j') => {
+            let view = match state.view_mode {
+                ViewMode::Node => ViewMode::Process,
+                _ => ViewMode::Node,
             };
+            state.set_view(view);
+            state.focus = Focus::Main;
+            let label = view_label(state.view_mode);
             state.set_message(format!("View: {label}"));
         }
         KeyCode::Char('k') => {
-            if state.view_mode == ViewMode::Process {
+            if state.view_mode == ViewMode::Process || state.view_mode == ViewMode::Node {
                 kill_selected_process(state, system);
             } else if state.view_mode == ViewMode::Ports {
                 kill_selected_port_process(state, system);
@@ -159,20 +161,56 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
             }
         }
         KeyCode::Up => {
-            if state.selected > 0 {
+            if state.view_mode == ViewMode::Ports {
+                move_ports_selection(state, -1);
+            } else if state.view_mode == ViewMode::Node {
+                move_node_selection(state, -1);
+            } else if state.selected > 0 {
                 state.selected -= 1;
             }
         }
         KeyCode::Down => {
-            if state.selected + 1 < list_len {
+            if state.view_mode == ViewMode::Ports {
+                move_ports_selection(state, 1);
+            } else if state.view_mode == ViewMode::Node {
+                move_node_selection(state, 1);
+            } else if state.selected + 1 < list_len {
                 state.selected += 1;
             }
         }
         KeyCode::PageUp => {
-            state.selected = state.selected.saturating_sub(10);
+            if state.view_mode == ViewMode::Ports {
+                for _ in 0..10 {
+                    if !move_ports_selection(state, -1) {
+                        break;
+                    }
+                }
+            } else if state.view_mode == ViewMode::Node {
+                for _ in 0..10 {
+                    if !move_node_selection(state, -1) {
+                        break;
+                    }
+                }
+            } else {
+                state.selected = state.selected.saturating_sub(10);
+            }
         }
         KeyCode::PageDown => {
-            state.selected = (state.selected + 10).min(list_len.saturating_sub(1));
+            if state.view_mode == ViewMode::Ports {
+                for _ in 0..10 {
+                    if !move_ports_selection(state, 1) {
+                        break;
+                    }
+                }
+            } else if state.view_mode == ViewMode::Node {
+                for _ in 0..10 {
+                    if !move_node_selection(state, 1) {
+                        break;
+                    }
+                }
+            } else {
+                state.selected = (state.selected + 10).min(list_len.saturating_sub(1));
+            }
         }
         _ => {}
     }
@@ -229,4 +267,58 @@ fn handle_docker_env_mode(key: KeyEvent, state: &mut AppState) -> bool {
         _ => {}
     }
     false
+}
+
+fn move_ports_selection(state: &mut AppState, direction: isize) -> bool {
+    if direction == 0 {
+        return false;
+    }
+    let len = state.visible_ports.len() as isize;
+    if len == 0 {
+        return false;
+    }
+    let mut idx = state.selected as isize;
+    loop {
+        idx += direction;
+        if idx < 0 || idx >= len {
+            return false;
+        }
+        let next = idx as usize;
+        if !state.is_ports_group_row(next) {
+            state.selected = next;
+            return true;
+        }
+    }
+}
+
+fn move_node_selection(state: &mut AppState, direction: isize) -> bool {
+    if direction == 0 {
+        return false;
+    }
+    let len = state.visible_pids.len() as isize;
+    if len == 0 {
+        return false;
+    }
+    let mut idx = state.selected as isize;
+    loop {
+        idx += direction;
+        if idx < 0 || idx >= len {
+            return false;
+        }
+        let next = idx as usize;
+        if state.is_node_selectable_row(next) {
+            state.selected = next;
+            return true;
+        }
+    }
+}
+
+fn view_label(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Process => "Processes",
+        ViewMode::Docker => "Docker",
+        ViewMode::DockerEnv => "Docker Env",
+        ViewMode::Ports => "Ports",
+        ViewMode::Node => "Node.js",
+    }
 }

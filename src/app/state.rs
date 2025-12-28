@@ -21,6 +21,7 @@ pub enum ViewMode {
     Docker,
     DockerEnv,
     Ports,
+    Node,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -50,6 +51,7 @@ pub struct AppState {
     pub process_filter: String,
     pub docker_filter: String,
     pub ports_filter: String,
+    pub node_filter: String,
     pub sort_by: SortBy,
     pub sort_order: SortOrder,
     pub zoom: bool,
@@ -68,6 +70,7 @@ pub struct AppState {
     pub visible_container_group_path: Vec<String>,
     pub visible_ports: Vec<Pid>,
     pub visible_ports_container_ids: Vec<Option<String>>,
+    pub visible_node_selectable: Vec<bool>,
     pub container_cache: HashMap<String, String>,
     pub container_last_refresh: Instant,
     pub user_cache: HashMap<Uid, String>,
@@ -95,6 +98,7 @@ impl AppState {
             process_filter: String::new(),
             docker_filter: String::new(),
             ports_filter: String::new(),
+            node_filter: String::new(),
             sort_by: SortBy::Memory,
             sort_order: SortOrder::Desc,
             zoom: false,
@@ -113,6 +117,7 @@ impl AppState {
             visible_container_group_path: Vec::new(),
             visible_ports: Vec::new(),
             visible_ports_container_ids: Vec::new(),
+            visible_node_selectable: Vec::new(),
             container_cache: HashMap::new(),
             container_last_refresh: Instant::now() - Duration::from_secs(60),
             user_cache: HashMap::new(),
@@ -170,6 +175,7 @@ impl AppState {
             ViewMode::Process => &self.process_filter,
             ViewMode::Docker | ViewMode::DockerEnv => &self.docker_filter,
             ViewMode::Ports => &self.ports_filter,
+            ViewMode::Node => &self.node_filter,
         }
     }
 
@@ -178,22 +184,44 @@ impl AppState {
             ViewMode::Process => &mut self.process_filter,
             ViewMode::Docker | ViewMode::DockerEnv => &mut self.docker_filter,
             ViewMode::Ports => &mut self.ports_filter,
+            ViewMode::Node => &mut self.node_filter,
         }
+    }
+
+    pub(crate) fn is_ports_group_row(&self, index: usize) -> bool {
+        let Some(pid) = self.visible_ports.get(index) else {
+            return false;
+        };
+        let has_container = self
+            .visible_ports_container_ids
+            .get(index)
+            .and_then(|id| id.as_ref())
+            .is_some();
+        pid.as_u32() == 0 && !has_container
+    }
+
+    pub(crate) fn is_node_selectable_row(&self, index: usize) -> bool {
+        self.visible_node_selectable
+            .get(index)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
 pub(crate) fn sidebar_index_for_view(view: ViewMode) -> usize {
     match view {
         ViewMode::Process => 0,
-        ViewMode::Docker | ViewMode::DockerEnv => 1,
-        ViewMode::Ports => 2,
+        ViewMode::Ports => 1,
+        ViewMode::Docker | ViewMode::DockerEnv => 2,
+        ViewMode::Node => 3,
     }
 }
 
 pub(crate) fn view_for_sidebar_index(index: usize) -> ViewMode {
     match index {
-        1 => ViewMode::Docker,
-        2 => ViewMode::Ports,
+        1 => ViewMode::Ports,
+        2 => ViewMode::Docker,
+        3 => ViewMode::Node,
         _ => ViewMode::Process,
     }
 }

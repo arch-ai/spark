@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use sysinfo::Pid;
@@ -6,7 +7,11 @@ use super::PortInfo;
 
 pub fn load_docker_port_bindings() -> Vec<PortInfo> {
     let output = Command::new("docker")
-        .args(["ps", "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}"])
+        .args([
+            "ps",
+            "--format",
+            "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}|{{.Labels}}",
+        ])
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -22,14 +27,16 @@ pub fn load_docker_port_bindings() -> Vec<PortInfo> {
         if line.trim().is_empty() {
             continue;
         }
-        let mut parts = line.splitn(4, '|');
+        let mut parts = line.splitn(5, '|');
         let id = parts.next().unwrap_or("").trim();
         let name = parts.next().unwrap_or("").trim();
         let image = parts.next().unwrap_or("").trim();
         let ports_raw = parts.next().unwrap_or("").trim();
+        let labels = parts.next().unwrap_or("").trim();
         if id.is_empty() || name.is_empty() || ports_raw.is_empty() {
             continue;
         }
+        let group_name = compose_group_from_labels(labels);
         for binding in parse_docker_port_bindings(ports_raw) {
             let label = format!("docker:{name}");
             let path = if binding.container_port > 0 {
@@ -44,6 +51,8 @@ pub fn load_docker_port_bindings() -> Vec<PortInfo> {
                 name: label,
                 exe_path: path,
                 container_id: Some(id.to_string()),
+                group_name: group_name.clone(),
+                project_name: group_name.clone(),
             });
         }
     }
@@ -126,4 +135,38 @@ fn parse_port_range(input: &str) -> Vec<u16> {
         return (start..=end).collect();
     }
     input.trim().parse::<u16>().map(|val| vec![val]).unwrap_or_default()
+}
+
+fn compose_group_from_labels(labels: &str) -> Option<String> {
+    let mut project = None;
+    let mut working_dir = None;
+    for part in labels.split(',') {
+        let mut kv = part.splitn(2, '=');
+        let key = kv.next().unwrap_or("").trim();
+        let value = kv.next().unwrap_or("").trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        match key {
+            "com.docker.compose.project.working_dir" => {
+                working_dir = Some(value.to_string());
+            }
+            "com.docker.compose.project" => {
+                project = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(dir) = working_dir {
+        let path = Path::new(&dir);
+        if let Some(name) = path.file_name() {
+            return Some(name.to_string_lossy().into_owned());
+        }
+        if !dir.is_empty() {
+            return Some(dir);
+        }
+    }
+
+    project
 }
