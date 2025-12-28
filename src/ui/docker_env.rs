@@ -13,23 +13,13 @@ use super::table::{
     render_help_table_rows_colored_at, render_line_at, render_title_at, HelpSegment,
 };
 
-pub fn render_docker_envs(
-    stdout: &mut io::Stdout,
-    _state: &AppState,
-    envs: &[String],
-    container_name: Option<&str>,
-    compose_name: &str,
-    compose_path: &str,
-    port_public: &str,
-    port_internal: &str,
-    selected: usize,
-) -> io::Result<()> {
+pub fn render_envs(stdout: &mut io::Stdout, state: &AppState) -> io::Result<()> {
     let (width, height) = terminal::size().unwrap_or((80, 24));
     let screen_width = width as usize;
     let height_usize = height as usize;
     let layout = layout_for_screen(screen_width);
     if layout.show_sidebar {
-        render_sidebar(stdout, _state, &layout, height_usize)?;
+        render_sidebar(stdout, state, &layout, height_usize)?;
         render_sidebar_gap(stdout, &layout, height_usize)?;
     }
     let width_usize = layout.main_width;
@@ -46,25 +36,19 @@ pub fn render_docker_envs(
         width_usize,
     )?;
     row += 1;
-    render_title_at(stdout, main_x, row, width_usize, "DOCKER ENV")?;
+    render_title_at(stdout, main_x, row, width_usize, &state.env_title)?;
     row += 2;
 
-    let compose_text = format!("Compose: {compose_name}");
-    let path_text = format!("Path: {compose_path}");
-    let container_title = container_name.unwrap_or("-");
-    let container_text = format!("Container: {container_title}");
-    let ports_text = if port_internal != "-" {
-        format!("Ports: {port_public} | Int: {port_internal}")
-    } else {
-        format!("Ports: {port_public}")
-    };
-
+    let compose_text = state.env_info_left1.as_str();
+    let path_text = state.env_info_right1.as_str();
+    let container_text = state.env_info_left2.as_str();
+    let ports_text = state.env_info_right2.as_str();
     let info_widths = env_info_widths(
         width_usize,
-        &compose_text,
-        &container_text,
-        &path_text,
-        &ports_text,
+        compose_text,
+        container_text,
+        path_text,
+        ports_text,
     );
     let info_top = format_top_border(&info_widths);
     render_line_at(stdout, main_x, row, &info_top, width_usize)?;
@@ -82,7 +66,7 @@ pub fn render_docker_envs(
     render_line_at(stdout, main_x, row, &info_bottom, width_usize)?;
     row += 1;
 
-    let env_widths = env_column_widths(width_usize, envs);
+    let env_widths = env_column_widths(width_usize, &state.env_vars);
     let env_top = format_top_border(&env_widths);
     render_line_at(stdout, main_x, row, &env_top, width_usize)?;
     row += 1;
@@ -97,20 +81,20 @@ pub fn render_docker_envs(
     let footer_lines = 5usize;
     let max_rows = height_usize.saturating_sub(list_start + footer_lines);
     if max_rows > 0 {
-        let total = envs.len();
-        let scroll = if selected >= max_rows {
-            selected - max_rows + 1
+        let total = state.env_vars.len();
+        let scroll = if state.env_selected >= max_rows {
+            state.env_selected - max_rows + 1
         } else {
             0
         };
         let end = (scroll + max_rows).min(total);
         let mut rendered = 0usize;
-        for (idx, env_line) in envs[scroll..end].iter().enumerate() {
+        for (idx, env_line) in state.env_vars[scroll..end].iter().enumerate() {
             let line_index = scroll + idx;
             let y = list_start + idx;
             let (key, value) = split_env_line(env_line);
             let line = format_env_line(&env_widths, &key, &value);
-            if line_index == selected {
+            if line_index == state.env_selected {
                 queue!(
                     stdout,
                     MoveTo(main_x, y as u16),

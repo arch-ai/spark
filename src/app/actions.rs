@@ -1,7 +1,7 @@
 use sysinfo::{Pid, System};
 
 use crate::app::{AppState, InputMode, ViewMode};
-use crate::system::docker;
+use crate::system::{docker, process};
 
 pub(crate) fn kill_selected_process(state: &mut AppState, system: &mut System) {
     let Some(pid) = state.visible_pids.get(state.selected).cloned() else {
@@ -96,7 +96,17 @@ pub(crate) fn open_selected_container_logs(state: &mut AppState) {
     }
 }
 
-pub(crate) fn open_selected_container_env(state: &mut AppState) {
+pub(crate) fn open_selected_env(state: &mut AppState, system: &System) {
+    match state.view_mode {
+        ViewMode::Docker => open_selected_container_env(state, ViewMode::Docker),
+        ViewMode::Process => open_selected_process_env(state, system, ViewMode::Process),
+        ViewMode::Ports => open_selected_ports_env(state, system),
+        ViewMode::Node => open_selected_process_env(state, system, ViewMode::Node),
+        ViewMode::DockerEnv => {}
+    }
+}
+
+fn open_selected_container_env(state: &mut AppState, return_view: ViewMode) {
     let Some(container_id) = state.visible_containers.get(state.selected).cloned() else {
         state.set_message("No container selected");
         return;
@@ -127,18 +137,129 @@ pub(crate) fn open_selected_container_env(state: &mut AppState) {
         .cloned()
         .unwrap_or_else(|| "-".to_string());
 
-    state.input_mode = InputMode::Normal;
-    state.set_view(ViewMode::DockerEnv);
-    state.docker_env_name = Some(name);
-    state.docker_env_compose_name = compose_name;
-    state.docker_env_compose_path = compose_path;
-    state.docker_env_port_public = port_public;
-    state.docker_env_port_internal = port_internal;
-    state.docker_env_selected = 0;
+    enter_env_view(
+        state,
+        return_view,
+        "DOCKER ENV",
+        format!("Compose: {compose_name}"),
+        format!("Path: {compose_path}"),
+        format!("Container: {name}"),
+        format_ports_line(&port_public, &port_internal),
+    );
     match docker::load_container_env(&container_id) {
-        Ok(envs) => state.docker_env_vars = envs,
+        Ok(envs) => state.env_vars = envs,
         Err(err) => {
-            state.docker_env_vars = vec![format!("Failed to load env: {err}")];
+            state.env_vars = vec![format!("Failed to load env: {err}")];
         }
+    }
+}
+
+fn open_selected_ports_env(state: &mut AppState, system: &System) {
+    let Some(pid) = state.visible_ports.get(state.selected).cloned() else {
+        state.set_message("No port selected");
+        return;
+    };
+    if pid == Pid::from_u32(0) {
+        let container_id = state
+            .visible_ports_container_ids
+            .get(state.selected)
+            .and_then(|id| id.clone());
+        if let Some(id) = container_id {
+            enter_env_view(
+                state,
+                ViewMode::Ports,
+                "CONTAINER ENV",
+                format!("Container: {id}"),
+                "Source: Ports".to_string(),
+                "Compose: -".to_string(),
+                "Ports: -".to_string(),
+            );
+            match docker::load_container_env(&id) {
+                Ok(envs) => state.env_vars = envs,
+                Err(err) => {
+                    state.env_vars = vec![format!("Failed to load env: {err}")];
+                }
+            }
+        } else {
+            state.set_message("No process selected");
+        }
+        return;
+    }
+
+    open_process_env_for_pid(state, system, pid, ViewMode::Ports);
+}
+
+fn open_selected_process_env(state: &mut AppState, system: &System, return_view: ViewMode) {
+    let Some(pid) = state.visible_pids.get(state.selected).copied() else {
+        state.set_message("No process selected");
+        return;
+    };
+    open_process_env_for_pid(state, system, pid, return_view);
+}
+
+fn open_process_env_for_pid(
+    state: &mut AppState,
+    system: &System,
+    pid: Pid,
+    return_view: ViewMode,
+) {
+    let Some(process) = system.process(pid) else {
+        state.set_message(format!("Process PID {pid} not found"));
+        return;
+    };
+
+    let name = process.name().to_string();
+    let user = process
+        .user_id()
+        .and_then(|uid| state.user_cache.get(uid))
+        .cloned()
+        .unwrap_or_else(|| "-".to_string());
+    let exe = process
+        .exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".to_string());
+
+    enter_env_view(
+        state,
+        return_view,
+        "PROCESS ENV",
+        format!("Process: {name}"),
+        format!("PID: {pid}"),
+        format!("User: {user}"),
+        format!("Path: {exe}"),
+    );
+    match process::load_process_env(pid) {
+        Ok(envs) => state.env_vars = envs,
+        Err(err) => {
+            state.env_vars = vec![format!("Failed to load env: {err}")];
+        }
+    }
+}
+
+fn enter_env_view(
+    state: &mut AppState,
+    return_view: ViewMode,
+    title: &str,
+    info_left1: String,
+    info_right1: String,
+    info_left2: String,
+    info_right2: String,
+) {
+    state.input_mode = InputMode::Normal;
+    state.env_return_view = return_view;
+    state.view_mode = ViewMode::DockerEnv;
+    state.env_title = title.to_string();
+    state.env_info_left1 = info_left1;
+    state.env_info_right1 = info_right1;
+    state.env_info_left2 = info_left2;
+    state.env_info_right2 = info_right2;
+    state.env_selected = 0;
+}
+
+fn format_ports_line(port_public: &str, port_internal: &str) -> String {
+    if port_internal != "-" {
+        format!("Ports: {port_public} | Int: {port_internal}")
+    } else {
+        format!("Ports: {port_public}")
     }
 }

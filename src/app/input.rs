@@ -2,8 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sysinfo::System;
 
 use crate::app::actions::{
-    kill_selected_port_process, kill_selected_process, open_selected_container,
-    open_selected_container_env, open_selected_container_logs,
+    kill_selected_port_process, kill_selected_process, open_selected_container, open_selected_container_logs,
+    open_selected_env,
 };
 use crate::app::state::{view_for_sidebar_index, Focus, InputMode, SortBy, ViewMode};
 use crate::app::AppState;
@@ -14,7 +14,7 @@ pub(crate) fn handle_key_event(key: KeyEvent, state: &mut AppState, system: &mut
     }
 
     if state.view_mode == ViewMode::DockerEnv {
-        return handle_docker_env_mode(key, state);
+        return handle_env_mode(key, state);
     }
 
     match state.input_mode {
@@ -154,11 +154,7 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
             }
         }
         KeyCode::Char('e') => {
-            if state.view_mode == ViewMode::Docker {
-                open_selected_container_env(state);
-            } else {
-                state.set_message("Env only available in Docker view");
-            }
+            open_selected_env(state, system);
         }
         KeyCode::Up => {
             if state.view_mode == ViewMode::Ports {
@@ -239,29 +235,28 @@ fn handle_filter_mode(key: KeyEvent, state: &mut AppState) -> bool {
     false
 }
 
-fn handle_docker_env_mode(key: KeyEvent, state: &mut AppState) -> bool {
+fn handle_env_mode(key: KeyEvent, state: &mut AppState) -> bool {
     match key.code {
         KeyCode::Esc => {
-            state.set_view(ViewMode::Docker);
+            state.view_mode = state.env_return_view;
             state.input_mode = InputMode::Normal;
         }
         KeyCode::Up => {
-            if state.docker_env_selected > 0 {
-                state.docker_env_selected -= 1;
+            if state.env_selected > 0 {
+                state.env_selected -= 1;
             }
         }
         KeyCode::Down => {
-            if state.docker_env_selected + 1 < state.docker_env_vars.len() {
-                state.docker_env_selected += 1;
+            if state.env_selected + 1 < state.env_vars.len() {
+                state.env_selected += 1;
             }
         }
         KeyCode::PageUp => {
-            state.docker_env_selected = state.docker_env_selected.saturating_sub(10);
+            state.env_selected = state.env_selected.saturating_sub(10);
         }
         KeyCode::PageDown => {
-            if !state.docker_env_vars.is_empty() {
-                state.docker_env_selected =
-                    (state.docker_env_selected + 10).min(state.docker_env_vars.len() - 1);
+            if !state.env_vars.is_empty() {
+                state.env_selected = (state.env_selected + 10).min(state.env_vars.len() - 1);
             }
         }
         _ => {}
@@ -317,7 +312,7 @@ fn view_label(mode: ViewMode) -> &'static str {
     match mode {
         ViewMode::Process => "Processes",
         ViewMode::Docker => "Docker",
-        ViewMode::DockerEnv => "Docker Env",
+        ViewMode::DockerEnv => "Env",
         ViewMode::Ports => "Ports",
         ViewMode::Node => "Node.js",
     }

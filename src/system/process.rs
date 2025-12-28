@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,33 @@ pub fn build_tree_rows(
     }
 
     rows
+}
+
+pub fn load_process_env(pid: Pid) -> io::Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = format!("/proc/{}/environ", pid.as_u32());
+        let bytes = std::fs::read(path)?;
+        let mut vars = Vec::new();
+        for entry in bytes.split(|byte| *byte == 0u8) {
+            if entry.is_empty() {
+                continue;
+            }
+            vars.push(String::from_utf8_lossy(entry).to_string());
+        }
+        if vars.is_empty() {
+            vars.push("No env vars found".to_string());
+        }
+        Ok(vars)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "process env only supported on Linux",
+        ))
+    }
 }
 
 fn sort_pid_list(
