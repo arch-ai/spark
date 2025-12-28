@@ -7,7 +7,7 @@ use sysinfo::{Pid, System, Users};
 
 use crate::app::input::handle_key_event;
 use crate::app::{AppState, ViewMode};
-use crate::system::{docker, ports, process};
+use crate::system::{docker, node, ports, process};
 use crate::ui;
 
 pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
@@ -34,7 +34,13 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
     let mut docker_dirty = true;
     let mut last_docker_pull = Instant::now() - Duration::from_secs(60);
     let mut ports_cache: Vec<ports::PortInfo> = Vec::new();
+    let mut ports_rows: Vec<ports::PortRow> = Vec::new();
     let mut ports_dirty = true;
+
+    let mut node_view: Vec<node::NodeProcessInfo> = Vec::new();
+    let mut node_rows: Vec<node::NodeRow> = Vec::new();
+    let mut node_dirty = true;
+    let mut pm2_available = false;
 
     loop {
         if event::poll(input_poll)? {
@@ -61,6 +67,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                         ViewMode::Docker => docker_dirty = true,
                         ViewMode::DockerEnv => {}
                         ViewMode::Ports => ports_dirty = true,
+                        ViewMode::Node => node_dirty = true,
                     }
                 }
                 if sort_changed {
@@ -74,6 +81,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     process_dirty = true;
                     docker_dirty = true;
                     ports_dirty = true;
+                    node_dirty = true;
                 }
 
                 needs_render = true;
@@ -91,6 +99,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     // Docker data is refreshed via worker, no need to mark dirty here
                 }
                 ViewMode::Ports => ports_dirty = true,
+                ViewMode::Node => node_dirty = true,
             }
             needs_render = true;
         }
@@ -213,12 +222,26 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                 if ports_dirty {
                     ports_cache = ports::collect_ports(&system);
                     crate::util::apply_filter(&mut ports_cache, &state.ports_filter);
-                    clamp_selection(&mut state, ports_cache.len());
-                    state.visible_ports = ports_cache.iter().map(|row| row.pid).collect();
-                    state.visible_ports_container_ids = ports_cache
-                        .iter()
-                        .map(|row| row.container_id.clone())
-                        .collect();
+                    ports_rows = ports::group_ports(&ports_cache);
+                    clamp_selection(&mut state, ports_rows.len());
+                    state.visible_ports.clear();
+                    state.visible_ports_container_ids.clear();
+                    state.visible_ports.reserve(ports_rows.len());
+                    state.visible_ports_container_ids.reserve(ports_rows.len());
+                    for row in &ports_rows {
+                        match row {
+                            ports::PortRow::Group { .. } => {
+                                state.visible_ports.push(Pid::from_u32(0));
+                                state.visible_ports_container_ids.push(None);
+                            }
+                            ports::PortRow::Item { index } => {
+                                let port = &ports_cache[*index];
+                                state.visible_ports.push(port.pid);
+                                state.visible_ports_container_ids.push(port.container_id.clone());
+                            }
+                        }
+                    }
+                    clamp_ports_selection(&mut state);
                     state.visible_pids.clear();
                     state.visible_containers.clear();
                     ports_dirty = false;
@@ -226,7 +249,82 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                 }
 
                 if needs_render {
-                    ui::render_ports(stdout, &state, &ports_cache)?;
+                    ui::render_ports(stdout, &state, &ports_cache, &ports_rows)?;
+                    needs_render = false;
+                }
+            }
+            ViewMode::Node => {
+                if node_dirty {
+                    pm2_available = node::is_pm2_running();
+
+                    let node_cache = node::collect_node_processes(&system, &state.node_filter);
+                    let mut node_main = Vec::new();
+                    let mut node_utils = Vec::new();
+                    for proc in node_cache {
+                        if node::is_node_util(&proc) {
+                            node_utils.push(proc);
+                        } else {
+                            node_main.push(proc);
+                        }
+                    }
+
+                    let utils_offset = node_main.len();
+                    node_view = node_main;
+                    node_view.extend(node_utils);
+
+                    if node_view.is_empty() {
+                        node_rows.clear();
+                    } else if utils_offset == 0 {
+                        node_rows.clear();
+                        node_rows.push(node::NodeRow::UtilsSpacer);
+                        node_rows.push(node::NodeRow::UtilsTitle);
+                        node_rows.push(node::NodeRow::UtilsTop);
+                        node_rows.push(node::NodeRow::UtilsHeader);
+                        node_rows.push(node::NodeRow::UtilsSeparator);
+                        node_rows.extend(node::group_node_processes(&node_view, 0));
+                    } else {
+                        node_rows = node::group_node_processes(&node_view[..utils_offset], 0);
+                        if utils_offset < node_view.len() {
+                            node_rows.push(node::NodeRow::UtilsSpacer);
+                            node_rows.push(node::NodeRow::UtilsTitle);
+                            node_rows.push(node::NodeRow::UtilsTop);
+                            node_rows.push(node::NodeRow::UtilsHeader);
+                            node_rows.push(node::NodeRow::UtilsSeparator);
+                            node_rows.extend(node::group_node_processes(
+                                &node_view[utils_offset..],
+                                utils_offset,
+                            ));
+                        }
+                    }
+
+                    clamp_selection(&mut state, node_rows.len());
+                    state.visible_pids.clear();
+                    state.visible_node_selectable.clear();
+                    state.visible_pids.reserve(node_rows.len());
+                    state.visible_node_selectable.reserve(node_rows.len());
+                    for row in &node_rows {
+                        match row {
+                            node::NodeRow::Item { index } => {
+                                let proc = &node_view[*index];
+                                state.visible_pids.push(proc.pid);
+                                state.visible_node_selectable.push(true);
+                            }
+                            _ => {
+                                state.visible_pids.push(Pid::from_u32(0));
+                                state.visible_node_selectable.push(false);
+                            }
+                        }
+                    }
+                    clamp_node_selection(&mut state);
+                    state.visible_containers.clear();
+                    state.visible_ports.clear();
+
+                    node_dirty = false;
+                    needs_render = true;
+                }
+
+                if needs_render {
+                    ui::render_node_processes(stdout, &state, &node_view, &node_rows, pm2_available)?;
                     needs_render = false;
                 }
             }
@@ -282,5 +380,79 @@ fn clamp_selection(state: &mut AppState, list_len: usize) {
         state.selected = 0;
     } else if state.selected >= list_len {
         state.selected = list_len - 1;
+    }
+}
+
+fn clamp_ports_selection(state: &mut AppState) {
+    let len = state.visible_ports.len();
+    if len == 0 {
+        state.selected = 0;
+        return;
+    }
+    if state.selected >= len {
+        state.selected = len - 1;
+    }
+    if !state.is_ports_group_row(state.selected) {
+        return;
+    }
+    if let Some(next) = find_next_ports_row(state, state.selected, 1) {
+        state.selected = next;
+    } else if let Some(prev) = find_next_ports_row(state, state.selected, -1) {
+        state.selected = prev;
+    }
+}
+
+fn find_next_ports_row(state: &AppState, start: usize, direction: isize) -> Option<usize> {
+    if direction == 0 {
+        return None;
+    }
+    let len = state.visible_ports.len() as isize;
+    let mut idx = start as isize;
+    loop {
+        idx += direction;
+        if idx < 0 || idx >= len {
+            return None;
+        }
+        let next = idx as usize;
+        if !state.is_ports_group_row(next) {
+            return Some(next);
+        }
+    }
+}
+
+fn clamp_node_selection(state: &mut AppState) {
+    let len = state.visible_pids.len();
+    if len == 0 {
+        state.selected = 0;
+        return;
+    }
+    if state.selected >= len {
+        state.selected = len - 1;
+    }
+    if state.is_node_selectable_row(state.selected) {
+        return;
+    }
+    if let Some(next) = find_next_node_row(state, state.selected, 1) {
+        state.selected = next;
+    } else if let Some(prev) = find_next_node_row(state, state.selected, -1) {
+        state.selected = prev;
+    }
+}
+
+fn find_next_node_row(state: &AppState, start: usize, direction: isize) -> Option<usize> {
+    if direction == 0 {
+        return None;
+    }
+    let len = state.visible_pids.len() as isize;
+    let mut idx = start as isize;
+    loop {
+        idx += direction;
+        if idx < 0 || idx >= len {
+            return None;
+        }
+        let next = idx as usize;
+        if state.is_node_selectable_row(next) {
+            return Some(next);
+        }
     }
 }

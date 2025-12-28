@@ -314,7 +314,7 @@ fn render_group_row_at(
     path: Option<&str>,
     count: usize,
 ) -> io::Result<()> {
-    let label = format!("group: {name}");
+    let label = format!("{name}");
     let path_label = path.unwrap_or("-");
     let status_label = format!("{count} containers");
 
@@ -363,7 +363,7 @@ fn render_group_name_cell(stdout: &mut io::Stdout, label: &str, width: usize) ->
         }
         return Ok(());
     }
-    let prefix = "group: ";
+    let prefix = "";
     let prefix_len = prefix.chars().count();
     let display_len = display.chars().count();
     let prefix_visible = prefix_len.min(display_len);

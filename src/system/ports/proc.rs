@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
 use super::PortInfo;
+use crate::system::node;
 
 /// Cached inode-to-PID map with TTL to reduce /proc scanning overhead.
 /// The map is rebuilt when it expires or when explicitly invalidated.
@@ -157,6 +158,7 @@ fn parse_socket_table(
             .exe()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| "-".to_string());
+        let project_name = node::project_name_from_process(process);
 
         out.push(PortInfo {
             proto: proto.to_string(),
@@ -165,6 +167,8 @@ fn parse_socket_table(
             name,
             exe_path,
             container_id: None,
+            group_name: None,
+            project_name,
         });
     }
 }
