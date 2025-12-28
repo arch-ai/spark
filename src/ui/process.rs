@@ -226,6 +226,8 @@ pub fn render_processes(
                     HelpSegment::plain(" docker | "),
                     HelpSegment::key("p"),
                     HelpSegment::plain(" ports | "),
+                    HelpSegment::key("e"),
+                    HelpSegment::plain(" env | "),
                     HelpSegment::key("k"),
                     HelpSegment::plain(" kill | "),
                     HelpSegment::key("q"),

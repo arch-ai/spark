@@ -204,17 +204,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
             }
             ViewMode::DockerEnv => {
                 if needs_render {
-                    ui::render_docker_envs(
-                        stdout,
-                        &state,
-                        &state.docker_env_vars,
-                        state.docker_env_name.as_deref(),
-                        &state.docker_env_compose_name,
-                        &state.docker_env_compose_path,
-                        &state.docker_env_port_public,
-                        &state.docker_env_port_internal,
-                        state.docker_env_selected,
-                    )?;
+                    ui::render_envs(stdout, &state)?;
                     needs_render = false;
                 }
             }

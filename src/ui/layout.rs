@@ -101,7 +101,12 @@ pub(crate) fn render_sidebar(
     }
 
     let items = ["Processes", "Ports", "Docker", "Node JS"];
-    let active_index = match state.view_mode {
+    let active_view = if state.view_mode == ViewMode::DockerEnv {
+        state.env_return_view
+    } else {
+        state.view_mode
+    };
+    let active_index = match active_view {
         ViewMode::Process => 0,
         ViewMode::Ports => 1,
         ViewMode::Docker | ViewMode::DockerEnv => 2,
