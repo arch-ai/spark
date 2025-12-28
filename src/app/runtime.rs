@@ -84,9 +84,13 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
             refresh_system(&mut system);
             update_system_snapshot(&mut state, &system);
             last_tick = Instant::now();
-            process_dirty = true;
-            if state.view_mode == ViewMode::Ports {
-                ports_dirty = true;
+            // Only mark dirty for the active view to avoid unnecessary data collection
+            match state.view_mode {
+                ViewMode::Process => process_dirty = true,
+                ViewMode::Docker | ViewMode::DockerEnv => {
+                    // Docker data is refreshed via worker, no need to mark dirty here
+                }
+                ViewMode::Ports => ports_dirty = true,
             }
             needs_render = true;
         }
@@ -150,31 +154,33 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     state.docker_filtered_out =
                         state.docker_total.saturating_sub(docker_view.len());
                     clamp_selection(&mut state, docker_view.len());
-                    state.visible_containers =
-                        docker_view.iter().map(|container| container.id.clone()).collect();
-                    state.visible_container_names =
-                        docker_view.iter().map(|container| container.name.clone()).collect();
-                    state.visible_container_ports_public = docker_view
-                        .iter()
-                        .map(|container| container.port_public.clone())
-                        .collect();
-                    state.visible_container_ports_internal = docker_view
-                        .iter()
-                        .map(|container| container.port_internal.clone())
-                        .collect();
-                    state.visible_container_group_name = docker_view
-                        .iter()
-                        .map(|container| container.group_name.clone())
-                        .collect();
-                    state.visible_container_group_path = docker_view
-                        .iter()
-                        .map(|container| {
-                            container
-                                .group_path
-                                .clone()
-                                .unwrap_or_else(|| "-".to_string())
-                        })
-                        .collect();
+
+                    // Pre-allocate and fill all vectors in a single iteration
+                    let len = docker_view.len();
+                    state.visible_containers.clear();
+                    state.visible_containers.reserve(len);
+                    state.visible_container_names.clear();
+                    state.visible_container_names.reserve(len);
+                    state.visible_container_ports_public.clear();
+                    state.visible_container_ports_public.reserve(len);
+                    state.visible_container_ports_internal.clear();
+                    state.visible_container_ports_internal.reserve(len);
+                    state.visible_container_group_name.clear();
+                    state.visible_container_group_name.reserve(len);
+                    state.visible_container_group_path.clear();
+                    state.visible_container_group_path.reserve(len);
+
+                    for container in &docker_view {
+                        state.visible_containers.push(container.id.clone());
+                        state.visible_container_names.push(container.name.clone());
+                        state.visible_container_ports_public.push(container.port_public.to_string());
+                        state.visible_container_ports_internal.push(container.port_internal.to_string());
+                        state.visible_container_group_name.push(container.group_name.to_string());
+                        state.visible_container_group_path.push(
+                            container.group_path.clone().unwrap_or_else(|| "-".to_string())
+                        );
+                    }
+
                     state.visible_pids.clear();
                     state.visible_ports.clear();
                     state.visible_ports_container_ids.clear();
@@ -206,16 +212,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
             ViewMode::Ports => {
                 if ports_dirty {
                     ports_cache = ports::collect_ports(&system);
-                    if !state.ports_filter.is_empty() {
-                        let filter = state.ports_filter.to_lowercase();
-                        ports_cache.retain(|row| {
-                            row.proto.to_lowercase().contains(&filter)
-                                || row.port.to_string().contains(&filter)
-                                || row.pid.to_string().contains(&filter)
-                                || row.name.to_lowercase().contains(&filter)
-                                || row.exe_path.to_lowercase().contains(&filter)
-                        });
-                    }
+                    crate::util::apply_filter(&mut ports_cache, &state.ports_filter);
                     clamp_selection(&mut state, ports_cache.len());
                     state.visible_ports = ports_cache.iter().map(|row| row.pid).collect();
                     state.visible_ports_container_ids = ports_cache

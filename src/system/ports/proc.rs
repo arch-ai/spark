@@ -1,13 +1,30 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, System};
 
 use super::PortInfo;
 
+/// Cached inode-to-PID map with TTL to reduce /proc scanning overhead.
+/// The map is rebuilt when it expires or when explicitly invalidated.
+struct InodeMapCache {
+    map: HashMap<u64, Pid>,
+    last_refresh: Instant,
+}
+
+const INODE_MAP_TTL: Duration = Duration::from_secs(2);
+
+fn inode_map_cache() -> &'static Mutex<Option<InodeMapCache>> {
+    static CACHE: OnceLock<Mutex<Option<InodeMapCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
 pub fn collect_proc_ports(system: &System, inode_map: &HashMap<u64, Pid>) -> Vec<PortInfo> {
-    let mut rows = Vec::new();
+    // Pre-allocate with reasonable capacity
+    let mut rows = Vec::with_capacity(64);
 
     parse_socket_table(
         "/proc/net/tcp",
@@ -31,8 +48,38 @@ pub fn collect_proc_ports(system: &System, inode_map: &HashMap<u64, Pid>) -> Vec
     rows
 }
 
+/// Build inode-to-PID map with caching.
+/// Caches the result for INODE_MAP_TTL to avoid expensive /proc scanning on every call.
 pub fn build_inode_pid_map() -> HashMap<u64, Pid> {
-    let mut map = HashMap::new();
+    let cache = inode_map_cache();
+
+    // Check cache first
+    if let Ok(guard) = cache.lock() {
+        if let Some(ref cached) = *guard {
+            if cached.last_refresh.elapsed() < INODE_MAP_TTL {
+                return cached.map.clone();
+            }
+        }
+    }
+
+    // Cache miss or expired - rebuild the map
+    let map = build_inode_pid_map_uncached();
+
+    // Update cache
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(InodeMapCache {
+            map: map.clone(),
+            last_refresh: Instant::now(),
+        });
+    }
+
+    map
+}
+
+/// Build the inode-to-PID map without caching.
+/// Scans /proc/*/fd/* to find socket inodes.
+fn build_inode_pid_map_uncached() -> HashMap<u64, Pid> {
+    let mut map = HashMap::with_capacity(1024);
     let Ok(entries) = fs::read_dir("/proc") else {
         return map;
     };

@@ -5,6 +5,8 @@ use std::collections::HashSet;
 
 use sysinfo::{Pid, System};
 
+use crate::util::{contains_lower, Filterable};
+
 pub struct PortInfo {
     pub proto: String,
     pub port: u16,
@@ -12,6 +14,17 @@ pub struct PortInfo {
     pub name: String,
     pub exe_path: String,
     pub container_id: Option<String>,
+}
+
+impl Filterable for PortInfo {
+    fn matches_filter(&self, filter_lower: &str) -> bool {
+        contains_lower(&self.proto, filter_lower)
+            || self.port.to_string().contains(filter_lower)
+            || self.pid.to_string().contains(filter_lower)
+            || contains_lower(&self.name, filter_lower)
+            || contains_lower(&self.exe_path, filter_lower)
+            || self.container_id.as_deref().map_or(false, |c| contains_lower(c, filter_lower))
+    }
 }
 
 pub fn collect_ports(system: &System) -> Vec<PortInfo> {
