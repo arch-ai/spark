@@ -2,10 +2,10 @@ use std::io::{self, Write};
 
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal;
 
-use crate::app::{AppState, InputMode, SortBy, SortOrder};
+use crate::app::{AppState, ContextMenu, InputMode, SortBy, SortOrder};
 use crate::system::process::{ProcInfo, TreeRow};
 
 use super::bars::{format_cpu_bar, format_memory_bar, format_swap_bar};
@@ -265,7 +265,80 @@ pub fn render_processes(
         set_dim_mode(false);
     }
 
+    // Render context menu if open
+    if let Some(ref menu) = state.context_menu {
+        render_context_menu(stdout, menu)?;
+    }
+
     stdout.flush()?;
+    Ok(())
+}
+
+fn render_context_menu(stdout: &mut io::Stdout, menu: &ContextMenu) -> io::Result<()> {
+    const MENU_WIDTH: usize = 16;
+    const PADDING: u16 = 1;
+
+    let x = menu.x;
+    let y = menu.y;
+    let item_count = menu.items.len();
+    let menu_height = item_count as u16 + PADDING * 2;
+
+    // Draw border and background
+    let top_border = format!("┌{}┐", "─".repeat(MENU_WIDTH - 2));
+    let bottom_border = format!("└{}┘", "─".repeat(MENU_WIDTH - 2));
+
+    // Top border
+    queue!(
+        stdout,
+        MoveTo(x, y),
+        SetBackgroundColor(Color::Black),
+        SetForegroundColor(Color::Grey),
+        Print(&top_border),
+        ResetColor
+    )?;
+
+    // Menu items
+    for (idx, action) in menu.items.iter().enumerate() {
+        let row_y = y + PADDING + idx as u16;
+        let label = action.label(menu.is_group);
+        let padded = format!(" {:<width$}", label, width = MENU_WIDTH - 3);
+        let is_hovered = menu.hover == Some(idx);
+
+        queue!(stdout, MoveTo(x, row_y))?;
+
+        if is_hovered {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::DarkCyan),
+                SetForegroundColor(Color::White),
+                Print("│"),
+                Print(&padded),
+                Print("│"),
+                ResetColor
+            )?;
+        } else {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::Grey),
+                Print("│"),
+                Print(&padded),
+                Print("│"),
+                ResetColor
+            )?;
+        }
+    }
+
+    // Bottom border
+    queue!(
+        stdout,
+        MoveTo(x, y + menu_height - 1),
+        SetBackgroundColor(Color::Black),
+        SetForegroundColor(Color::Grey),
+        Print(&bottom_border),
+        ResetColor
+    )?;
+
     Ok(())
 }
 

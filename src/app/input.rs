@@ -428,13 +428,22 @@ pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState, contai
             true
         }
         MouseEventKind::Down(MouseButton::Right) => {
-            // Right-click to open context menu (Docker view only)
-            if state.view_mode == ViewMode::Docker {
-                let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
-                handle_docker_right_click(state, x, y, height, main_x, containers);
-                true
-            } else {
-                false
+            // Right-click to open context menu
+            let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
+            match state.view_mode {
+                ViewMode::Docker => {
+                    handle_docker_right_click(state, x, y, height, main_x, containers);
+                    true
+                }
+                ViewMode::Process => {
+                    handle_process_right_click(state, x, y, height, main_x);
+                    true
+                }
+                ViewMode::Ports => {
+                    handle_ports_right_click(state, x, y, height, main_x);
+                    true
+                }
+                _ => false
             }
         }
         MouseEventKind::Moved => {
@@ -815,9 +824,19 @@ fn handle_docker_right_click(
             };
             // Single container - show relevant actions
             let items = if container.running {
-                vec![ContextMenuAction::Stop, ContextMenuAction::Restart]
+                vec![
+                    ContextMenuAction::Shell,
+                    ContextMenuAction::Logs,
+                    ContextMenuAction::Env,
+                    ContextMenuAction::Stop,
+                    ContextMenuAction::Restart,
+                ]
             } else {
-                vec![ContextMenuAction::Start]
+                vec![
+                    ContextMenuAction::Logs,
+                    ContextMenuAction::Env,
+                    ContextMenuAction::Start,
+                ]
             };
             (target, items, false)
         }
@@ -840,6 +859,170 @@ fn handle_docker_right_click(
         hover: Some(0),
         target,
         is_group,
+    });
+}
+
+fn handle_process_right_click(
+    state: &mut AppState,
+    x: u16,
+    y: u16,
+    height: u16,
+    main_x: u16,
+) {
+    let list_start: u16 = 10;
+    if y < list_start {
+        return;
+    }
+
+    let clicked_visual_row = (y - list_start) as usize;
+    let footer_lines = 5usize;
+    let max_rows = (height as usize).saturating_sub(list_start as usize + footer_lines);
+    if max_rows == 0 {
+        return;
+    }
+
+    // Calculate scroll
+    let total = state.visible_pids.len();
+    if total == 0 {
+        return;
+    }
+
+    let half = max_rows / 2;
+    let scroll = if state.selected <= half {
+        0
+    } else if state.selected + half >= total {
+        total.saturating_sub(max_rows)
+    } else {
+        state.selected - half
+    };
+
+    let target_row = scroll + clicked_visual_row;
+    if target_row >= state.visible_pids.len() {
+        return;
+    }
+
+    let pid = state.visible_pids[target_row];
+    let pid_u32 = pid.as_u32();
+
+    // Get process name (use PID as fallback)
+    let name = format!("PID {}", pid_u32);
+
+    let target = ContextMenuTarget::Process {
+        pid: pid_u32,
+        name,
+    };
+
+    let items = vec![
+        ContextMenuAction::Kill,
+        ContextMenuAction::Env,
+    ];
+
+    // Position menu at click location, adjust if near edges
+    let menu_height = items.len() as u16 + MENU_PADDING * 2;
+    let menu_x = x.min((main_x + 80).saturating_sub(MENU_WIDTH));
+    let menu_y = if y + menu_height >= height {
+        y.saturating_sub(menu_height)
+    } else {
+        y
+    };
+
+    state.context_menu = Some(ContextMenu {
+        x: menu_x,
+        y: menu_y,
+        items,
+        hover: Some(0),
+        target,
+        is_group: false,
+    });
+}
+
+fn handle_ports_right_click(
+    state: &mut AppState,
+    x: u16,
+    y: u16,
+    height: u16,
+    main_x: u16,
+) {
+    let list_start: u16 = 10;
+    if y < list_start {
+        return;
+    }
+
+    let clicked_visual_row = (y - list_start) as usize;
+    let footer_lines = 5usize;
+    let max_rows = (height as usize).saturating_sub(list_start as usize + footer_lines);
+    if max_rows == 0 {
+        return;
+    }
+
+    // Calculate scroll
+    let total = state.visible_ports.len();
+    if total == 0 {
+        return;
+    }
+
+    let half = max_rows / 2;
+    let scroll = if state.selected <= half {
+        0
+    } else if state.selected + half >= total {
+        total.saturating_sub(max_rows)
+    } else {
+        state.selected - half
+    };
+
+    let target_row = scroll + clicked_visual_row;
+    if target_row >= state.visible_ports.len() {
+        return;
+    }
+
+    // Skip group rows (pid == 0 and no container)
+    if state.is_ports_group_row(target_row) {
+        return;
+    }
+
+    let pid = state.visible_ports[target_row];
+    let pid_u32 = pid.as_u32();
+
+    // Check if this is a container port
+    let is_container = state
+        .visible_ports_container_ids
+        .get(target_row)
+        .and_then(|id| id.as_ref())
+        .is_some();
+
+    if is_container {
+        // For container ports, no action available yet
+        return;
+    }
+
+    let name = format!("PID {}", pid_u32);
+
+    let target = ContextMenuTarget::Process {
+        pid: pid_u32,
+        name,
+    };
+
+    let items = vec![
+        ContextMenuAction::Kill,
+        ContextMenuAction::Env,
+    ];
+
+    // Position menu at click location, adjust if near edges
+    let menu_height = items.len() as u16 + MENU_PADDING * 2;
+    let menu_x = x.min((main_x + 80).saturating_sub(MENU_WIDTH));
+    let menu_y = if y + menu_height >= height {
+        y.saturating_sub(menu_height)
+    } else {
+        y
+    };
+
+    state.context_menu = Some(ContextMenu {
+        x: menu_x,
+        y: menu_y,
+        items,
+        hover: Some(0),
+        target,
+        is_group: false,
     });
 }
 
@@ -869,10 +1052,95 @@ fn execute_context_action(
     target: &ContextMenuTarget,
     containers: &[ContainerInfo],
 ) {
+    // Handle process-specific actions
+    if let ContextMenuTarget::Process { pid, name } = target {
+        match action {
+            ContextMenuAction::Kill => {
+                use sysinfo::{Pid, Signal, System};
+                let mut sys = System::new();
+                sys.refresh_processes();
+                let sysinfo_pid = Pid::from_u32(*pid);
+                if let Some(process) = sys.process(sysinfo_pid) {
+                    if process.kill_with(Signal::Term).unwrap_or(false) {
+                        state.set_message(format!("Killed {}", name));
+                    } else {
+                        state.set_message(format!("Failed to kill {}", name));
+                    }
+                } else {
+                    state.set_message(format!("Process {} not found", name));
+                }
+            }
+            ContextMenuAction::Env => {
+                use std::fs;
+                let env_path = format!("/proc/{}/environ", pid);
+                match fs::read(&env_path) {
+                    Ok(data) => {
+                        let env_vars: Vec<String> = data
+                            .split(|&b| b == 0)
+                            .filter(|s| !s.is_empty())
+                            .filter_map(|s| String::from_utf8(s.to_vec()).ok())
+                            .collect();
+                        state.env_vars = env_vars;
+                        state.env_title = format!("ENV: {}", name);
+                        state.env_info_left1 = format!("Process: {}", name);
+                        state.env_info_right1 = format!("PID: {}", pid);
+                        state.env_info_left2 = "-".to_string();
+                        state.env_info_right2 = "-".to_string();
+                        state.env_selected = 0;
+                        state.env_return_view = ViewMode::Process;
+                        state.view_mode = ViewMode::DockerEnv;
+                    }
+                    Err(_) => {
+                        state.set_message(format!("Failed to read env for {}", name));
+                    }
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Handle container-only actions
+    if action.is_container_only() {
+        if let ContextMenuTarget::Container { id, name, .. } = target {
+            match action {
+                ContextMenuAction::Logs => {
+                    state.set_message(format!("Opening logs for {}...", name));
+                    let _ = crate::system::docker::open_container_logs(id);
+                }
+                ContextMenuAction::Shell => {
+                    state.set_message(format!("Opening shell in {}...", name));
+                    let _ = crate::system::docker::open_container_shell(id);
+                }
+                ContextMenuAction::Env => {
+                    match crate::system::docker::load_container_env(id) {
+                        Ok(env_vars) => {
+                            state.env_vars = env_vars;
+                            state.env_title = format!("ENV: {}", name);
+                            state.env_info_left1 = format!("Container: {}", name);
+                            state.env_info_right1 = format!("ID: {}", &id[..12.min(id.len())]);
+                            state.env_info_left2 = "-".to_string();
+                            state.env_info_right2 = "-".to_string();
+                            state.env_selected = 0;
+                            state.env_return_view = ViewMode::Docker;
+                            state.view_mode = ViewMode::DockerEnv;
+                        }
+                        Err(_) => {
+                            state.set_message(format!("Failed to load env for {}", name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
     let action_name = match action {
         ContextMenuAction::Start => "Starting",
         ContextMenuAction::Stop => "Stopping",
         ContextMenuAction::Restart => "Restarting",
+        _ => return,
     };
 
     match target {
@@ -889,6 +1157,7 @@ fn execute_context_action(
                     ContextMenuAction::Start => crate::system::docker::start_container(&id),
                     ContextMenuAction::Stop => crate::system::docker::stop_container(&id),
                     ContextMenuAction::Restart => crate::system::docker::restart_container(&id),
+                    _ => Ok(()),
                 };
                 let _ = tx.send(OperationComplete {
                     container_id: id,
@@ -930,6 +1199,7 @@ fn execute_context_action(
                         ContextMenuAction::Start => crate::system::docker::start_container(&container_id),
                         ContextMenuAction::Stop => crate::system::docker::stop_container(&container_id),
                         ContextMenuAction::Restart => crate::system::docker::restart_container(&container_id),
+                        _ => Ok(()), // Container-only actions handled earlier
                     };
                     let _ = tx.send(OperationComplete {
                         container_id,
@@ -939,5 +1209,7 @@ fn execute_context_action(
                 });
             }
         }
+        // Process targets are handled at the start of the function
+        ContextMenuTarget::Process { .. } => {}
     }
 }

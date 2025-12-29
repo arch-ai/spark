@@ -8,7 +8,7 @@ use crossterm::style::{
 use crossterm::terminal;
 
 use crate::app::{AppState, ContextMenu, InputMode, SortBy, SortOrder};
-use crate::system::docker::{ContainerInfo, DockerRow};
+use crate::system::docker::{ContainerInfo, DockerRow, HealthStatus};
 
 use super::bars::{format_cpu_bar, format_memory_bar, format_swap_bar};
 use super::layout::{layout_for_screen, render_sidebar, render_sidebar_gap};
@@ -172,35 +172,17 @@ pub fn render_containers(
                         };
                         let is_pending = state.is_container_pending(&container.id);
                         let spinner = if is_pending { Some(state.spinner_char()) } else { None };
-                        let line = format_container_line(container, width_usize, prefix, spinner);
-                        if is_selected {
-                            queue!(
-                                stdout,
-                                MoveTo(main_x, y as u16),
-                                SetAttribute(Attribute::Reverse),
-                                Print(fit_left(&line, width_usize)),
-                                SetAttribute(Attribute::Reset)
-                            )?;
-                        } else if is_hovered {
-                            queue!(
-                                stdout,
-                                MoveTo(main_x, y as u16),
-                                SetBackgroundColor(Color::DarkGrey),
-                                Print(fit_left(&line, width_usize)),
-                                ResetColor
-                            )?;
-                        } else if !container.running {
-                            // Grey out stopped containers
-                            queue!(
-                                stdout,
-                                MoveTo(main_x, y as u16),
-                                SetForegroundColor(Color::DarkGrey),
-                                Print(fit_left(&line, width_usize)),
-                                ResetColor
-                            )?;
-                        } else {
-                            render_line_at(stdout, main_x, y as u16, &line, width_usize)?;
-                        }
+                        render_container_row_at(
+                            stdout,
+                            main_x,
+                            y as u16,
+                            container,
+                            width_usize,
+                            prefix,
+                            spinner,
+                            is_selected,
+                            is_hovered,
+                        )?;
                     }
                 }
                 rendered += 1;
@@ -326,7 +308,17 @@ pub fn render_containers(
     Ok(())
 }
 
-fn format_container_line(container: &ContainerInfo, width: usize, prefix: &str, spinner: Option<char>) -> String {
+fn render_container_row_at(
+    stdout: &mut io::Stdout,
+    x: u16,
+    y: u16,
+    container: &ContainerInfo,
+    width: usize,
+    prefix: &str,
+    spinner: Option<char>,
+    selected: bool,
+    hovered: bool,
+) -> io::Result<()> {
     let widths = docker_column_widths(width);
     let id = if container.id.len() > 12 {
         &container.id[..12]
@@ -338,22 +330,108 @@ fn format_container_line(container: &ContainerInfo, width: usize, prefix: &str, 
     let id_cell = fit_right(id, widths[0]);
     let cpu_cell = fit_right(&format!("{:.1}", container.cpu), widths[1]);
     let mem_cell = fit_right(&format!("{:.2}", mem_gb), widths[2]);
-    // Add animated spinner when operation is pending
-    let name_text = if let Some(spin_char) = spinner {
+
+    // Build name without health indicator (we'll add it with color)
+    let name_base = if let Some(spin_char) = spinner {
         format!("{}{} {}", prefix, spin_char, container.name)
     } else {
         format!("{}{}", prefix, container.name)
     };
-    let name_cell = fit_left(&name_text, widths[3]);
+
+    let (health_char, health_color) = match container.health {
+        HealthStatus::Healthy => (Some("*"), Color::Green),
+        HealthStatus::Unhealthy => (Some("!"), Color::Red),
+        HealthStatus::Starting => (Some("~"), Color::Yellow),
+        HealthStatus::None => (None, Color::Reset),
+    };
+
+    // Calculate name cell with space for health indicator
+    let name_with_health = if health_char.is_some() {
+        format!("{} {}", name_base, health_char.unwrap_or(""))
+    } else {
+        name_base.clone()
+    };
+    let name_cell = fit_left(&name_with_health, widths[3]);
+
     let image_cell = fit_left(&container.image, widths[4]);
     let port_cell = fit_left(&container.port_public, widths[5]);
     let int_port_cell = fit_left(&container.port_internal, widths[6]);
     let status_cell = fit_left(&container.status, widths[7]);
 
-    format!(
-        "│{}│{}│{}│{}│{}│{}│{}│{}│",
-        id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
-    )
+    // For selected/hovered/stopped, render without special health coloring
+    if selected {
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetAttribute(Attribute::Reverse),
+            Print(fit_left(&line, width)),
+            SetAttribute(Attribute::Reset)
+        )?;
+    } else if hovered {
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetBackgroundColor(Color::DarkGrey),
+            Print(fit_left(&line, width)),
+            ResetColor
+        )?;
+    } else if !container.running {
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(fit_left(&line, width)),
+            ResetColor
+        )?;
+    } else if health_char.is_some() {
+        // Render with colored health indicator
+        let name_cell_no_health = fit_left(&format!("{} ", name_base), widths[3] - 1);
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            Print("│"),
+            Print(&id_cell),
+            Print("│"),
+            Print(&cpu_cell),
+            Print("│"),
+            Print(&mem_cell),
+            Print("│"),
+            Print(&name_cell_no_health),
+            SetForegroundColor(health_color),
+            Print(health_char.unwrap_or("")),
+            ResetColor,
+            Print("│"),
+            Print(&image_cell),
+            Print("│"),
+            Print(&port_cell),
+            Print("│"),
+            Print(&int_port_cell),
+            Print("│"),
+            Print(&status_cell),
+            Print("│")
+        )?;
+    } else {
+        // Normal rendering without health indicator
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        render_line_at(stdout, x, y, &line, width)?;
+    }
+
+    Ok(())
 }
 
 fn render_group_row_at(
@@ -720,8 +798,8 @@ fn render_context_menu(stdout: &mut io::Stdout, menu: &ContextMenu) -> io::Resul
     queue!(
         stdout,
         MoveTo(x, y),
-        SetBackgroundColor(Color::DarkGrey),
-        SetForegroundColor(Color::White),
+        SetBackgroundColor(Color::Black),
+        SetForegroundColor(Color::Grey),
         Print(&top_border),
         ResetColor
     )?;
@@ -738,8 +816,8 @@ fn render_context_menu(stdout: &mut io::Stdout, menu: &ContextMenu) -> io::Resul
         if is_hovered {
             queue!(
                 stdout,
-                SetBackgroundColor(Color::Cyan),
-                SetForegroundColor(Color::Black),
+                SetBackgroundColor(Color::DarkCyan),
+                SetForegroundColor(Color::White),
                 Print("│"),
                 Print(&padded),
                 Print("│"),
@@ -748,8 +826,8 @@ fn render_context_menu(stdout: &mut io::Stdout, menu: &ContextMenu) -> io::Resul
         } else {
             queue!(
                 stdout,
-                SetBackgroundColor(Color::DarkGrey),
-                SetForegroundColor(Color::White),
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::Grey),
                 Print("│"),
                 Print(&padded),
                 Print("│"),
@@ -762,8 +840,8 @@ fn render_context_menu(stdout: &mut io::Stdout, menu: &ContextMenu) -> io::Resul
     queue!(
         stdout,
         MoveTo(x, y + menu_height - 1),
-        SetBackgroundColor(Color::DarkGrey),
-        SetForegroundColor(Color::White),
+        SetBackgroundColor(Color::Black),
+        SetForegroundColor(Color::Grey),
         Print(&bottom_border),
         ResetColor
     )?;

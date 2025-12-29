@@ -25,15 +25,28 @@ pub enum ContextMenuAction {
     Start,
     Stop,
     Restart,
+    Logs,
+    Shell,
+    Env,
+    Kill,
 }
 
 impl ContextMenuAction {
     pub fn label(&self, is_group: bool) -> &'static str {
         match self {
-            ContextMenuAction::Start => if is_group { "▶ Start All" } else { "▶ Start" },
-            ContextMenuAction::Stop => if is_group { "■ Stop All" } else { "■ Stop" },
-            ContextMenuAction::Restart => if is_group { "↻ Restart All" } else { "↻ Restart" },
+            ContextMenuAction::Start => if is_group { "> Start All" } else { "> Start" },
+            ContextMenuAction::Stop => if is_group { "x Stop All" } else { "x Stop" },
+            ContextMenuAction::Restart => if is_group { "~ Restart All" } else { "~ Restart" },
+            ContextMenuAction::Logs => "] Logs",
+            ContextMenuAction::Shell => "$ Shell",
+            ContextMenuAction::Env => "# Env",
+            ContextMenuAction::Kill => "x Kill",
         }
+    }
+
+    /// Returns true if this action is only available for single containers (not groups)
+    pub fn is_container_only(&self) -> bool {
+        matches!(self, ContextMenuAction::Logs | ContextMenuAction::Shell | ContextMenuAction::Env)
     }
 }
 
@@ -42,6 +55,7 @@ pub enum ContextMenuTarget {
     #[allow(dead_code)]
     Container { id: String, name: String, running: bool },
     Group { name: String, path: Option<String> },
+    Process { pid: u32, name: String },
 }
 
 #[derive(Clone, Debug)]

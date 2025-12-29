@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use super::{ContainerInfo, DockerRow};
+use super::{ContainerInfo, DockerRow, HealthStatus};
 
 /// Static string constants to avoid repeated allocations
 const DASH: &str = "-";
@@ -126,6 +126,7 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
         // Status starts with "Up" for running containers
         let running = status.starts_with("Up");
         let activity_secs = parse_activity_time(status);
+        let health = parse_health_status(status);
 
         containers.push(ContainerInfo {
             id: id.to_string(),
@@ -151,6 +152,7 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             group_path: group.and_then(|g| g.path),
             running,
             activity_secs,
+            health,
         });
     }
 
@@ -503,4 +505,20 @@ fn parse_duration_string(input: &str) -> u64 {
     };
 
     number.saturating_mul(multiplier)
+}
+
+/// Parse health status from Docker status string.
+/// Status contains "(healthy)", "(unhealthy)", "(health: starting)" when healthcheck is configured.
+fn parse_health_status(status: &str) -> HealthStatus {
+    let status_lower = status.to_lowercase();
+
+    if status_lower.contains("(healthy)") {
+        HealthStatus::Healthy
+    } else if status_lower.contains("(unhealthy)") {
+        HealthStatus::Unhealthy
+    } else if status_lower.contains("(health: starting)") || status_lower.contains("(starting)") {
+        HealthStatus::Starting
+    } else {
+        HealthStatus::None
+    }
 }
