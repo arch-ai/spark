@@ -1,14 +1,57 @@
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, Uid};
 
 use crate::system::docker::DockerRow;
 
+/// Message sent when a container operation completes
+#[derive(Debug)]
+pub struct OperationComplete {
+    pub container_id: String,
+    pub success: bool,
+    pub message: String,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     Filter,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ContextMenuAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ContextMenuAction {
+    pub fn label(&self, is_group: bool) -> &'static str {
+        match self {
+            ContextMenuAction::Start => if is_group { "▶ Start All" } else { "▶ Start" },
+            ContextMenuAction::Stop => if is_group { "■ Stop All" } else { "■ Stop" },
+            ContextMenuAction::Restart => if is_group { "↻ Restart All" } else { "↻ Restart" },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum ContextMenuTarget {
+    #[allow(dead_code)]
+    Container { id: String, name: String, running: bool },
+    Group { name: String, path: Option<String> },
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    pub items: Vec<ContextMenuAction>,
+    pub hover: Option<usize>,
+    pub target: ContextMenuTarget,
+    pub is_group: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -74,6 +117,7 @@ pub struct AppState {
     pub docker_rows: Vec<DockerRow>,
     pub hover_row: Option<usize>,
     pub sidebar_hover: Option<usize>,
+    pub context_menu: Option<ContextMenu>,
     pub visible_ports: Vec<Pid>,
     pub visible_ports_container_ids: Vec<Option<String>>,
     pub visible_node_selectable: Vec<bool>,
@@ -96,10 +140,17 @@ pub struct AppState {
     pub mem_available: u64,
     pub swap_total: u64,
     pub swap_used: u64,
+    /// Maps container ID -> expected running state (true = should be running, false = should be stopped)
+    pub pending_operations: HashMap<String, bool>,
+    pub operation_tx: Sender<OperationComplete>,
+    pub operation_rx: Receiver<OperationComplete>,
+    /// Frame counter for animated spinner
+    pub spinner_frame: usize,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let (operation_tx, operation_rx) = mpsc::channel();
         Self {
             input_mode: InputMode::Normal,
             process_filter: String::new(),
@@ -126,6 +177,7 @@ impl AppState {
             docker_rows: Vec::new(),
             hover_row: None,
             sidebar_hover: None,
+            context_menu: None,
             visible_ports: Vec::new(),
             visible_ports_container_ids: Vec::new(),
             visible_node_selectable: Vec::new(),
@@ -148,7 +200,68 @@ impl AppState {
             mem_available: 0,
             swap_total: 0,
             swap_used: 0,
+            pending_operations: HashMap::new(),
+            operation_tx,
+            operation_rx,
+            spinner_frame: 0,
         }
+    }
+
+    /// Advance spinner animation frame, returns true if there are pending operations
+    pub fn tick_spinner(&mut self) -> bool {
+        if !self.pending_operations.is_empty() {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get current spinner character
+    pub fn spinner_char(&self) -> char {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        SPINNER[self.spinner_frame % SPINNER.len()]
+    }
+
+    pub fn check_completed_operations(&mut self) -> bool {
+        let mut any_completed = false;
+        while let Ok(msg) = self.operation_rx.try_recv() {
+            // Only remove from pending on failure - success keeps it pending until state matches
+            if !msg.success {
+                self.pending_operations.remove(&msg.container_id);
+                self.set_message(msg.message);
+            }
+            any_completed = true;
+        }
+        any_completed
+    }
+
+    /// Check container states and remove from pending when state matches expected
+    pub fn update_pending_with_containers(&mut self, containers: &[crate::system::docker::ContainerInfo]) -> bool {
+        if self.pending_operations.is_empty() {
+            return false;
+        }
+
+        let mut to_remove = Vec::new();
+        for (container_id, expected_running) in &self.pending_operations {
+            // Find this container in the list
+            if let Some(container) = containers.iter().find(|c| &c.id == container_id) {
+                // If actual state matches expected state, operation is complete
+                if container.running == *expected_running {
+                    to_remove.push(container_id.clone());
+                }
+            }
+        }
+
+        let any_removed = !to_remove.is_empty();
+        for id in to_remove {
+            self.pending_operations.remove(&id);
+        }
+        any_removed
+    }
+
+    pub fn is_container_pending(&self, container_id: &str) -> bool {
+        self.pending_operations.contains_key(container_id)
     }
 
     pub(crate) fn set_message(&mut self, message: impl Into<String>) {

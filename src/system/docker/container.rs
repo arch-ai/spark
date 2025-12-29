@@ -59,6 +59,51 @@ pub fn kill_containers(container_ids: &[String]) -> (usize, usize) {
     (success, failed)
 }
 
+pub fn start_container(container_id: &str) -> io::Result<()> {
+    let output = Command::new("docker")
+        .args(["start", container_id])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "docker start failed",
+        ))
+    }
+}
+
+pub fn stop_container(container_id: &str) -> io::Result<()> {
+    let output = Command::new("docker")
+        .args(["stop", container_id])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "docker stop failed",
+        ))
+    }
+}
+
+pub fn restart_container(container_id: &str) -> io::Result<()> {
+    let output = Command::new("docker")
+        .args(["restart", container_id])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "docker restart failed",
+        ))
+    }
+}
+
 pub fn load_docker_container_cache() -> Option<HashMap<String, String>> {
     let output = Command::new("docker")
         .args(["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"])

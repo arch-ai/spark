@@ -7,7 +7,7 @@ use crossterm::style::{
 };
 use crossterm::terminal;
 
-use crate::app::{AppState, InputMode, SortBy, SortOrder};
+use crate::app::{AppState, ContextMenu, InputMode, SortBy, SortOrder};
 use crate::system::docker::{ContainerInfo, DockerRow};
 
 use super::bars::{format_cpu_bar, format_memory_bar, format_swap_bar};
@@ -15,7 +15,7 @@ use super::layout::{layout_for_screen, render_sidebar, render_sidebar_gap};
 use super::table::{
     clear_list_area_at, fit_left, fit_right, format_separator, format_top_border, is_dim_mode,
     render_help_table_rows_colored_at, render_line_at, render_search_box_at, render_title_at,
-    set_dim_mode, split_at_chars, truncate_str, HelpSegment, print_table_bar,
+    set_dim_mode, truncate_str, HelpSegment, print_table_bar,
 };
 
 pub fn render_containers(
@@ -170,7 +170,9 @@ pub fn render_containers(
                         let Some(container) = containers.get(*index) else {
                             continue;
                         };
-                        let line = format_container_line(container, width_usize, prefix);
+                        let is_pending = state.is_container_pending(&container.id);
+                        let spinner = if is_pending { Some(state.spinner_char()) } else { None };
+                        let line = format_container_line(container, width_usize, prefix, spinner);
                         if is_selected {
                             queue!(
                                 stdout,
@@ -315,11 +317,16 @@ pub fn render_containers(
         set_dim_mode(false);
     }
 
+    // Render context menu if open
+    if let Some(ref menu) = state.context_menu {
+        render_context_menu(stdout, menu)?;
+    }
+
     stdout.flush()?;
     Ok(())
 }
 
-fn format_container_line(container: &ContainerInfo, width: usize, prefix: &str) -> String {
+fn format_container_line(container: &ContainerInfo, width: usize, prefix: &str, spinner: Option<char>) -> String {
     let widths = docker_column_widths(width);
     let id = if container.id.len() > 12 {
         &container.id[..12]
@@ -331,7 +338,12 @@ fn format_container_line(container: &ContainerInfo, width: usize, prefix: &str) 
     let id_cell = fit_right(id, widths[0]);
     let cpu_cell = fit_right(&format!("{:.1}", container.cpu), widths[1]);
     let mem_cell = fit_right(&format!("{:.2}", mem_gb), widths[2]);
-    let name_text = format!("{prefix}{}", container.name);
+    // Add animated spinner when operation is pending
+    let name_text = if let Some(spin_char) = spinner {
+        format!("{}{} {}", prefix, spin_char, container.name)
+    } else {
+        format!("{}{}", prefix, container.name)
+    };
     let name_cell = fit_left(&name_text, widths[3]);
     let image_cell = fit_left(&container.image, widths[4]);
     let port_cell = fit_left(&container.port_public, widths[5]);
@@ -477,40 +489,6 @@ fn render_group_name_cell_with_dot(
     queue!(stdout, SetForegroundColor(Color::Yellow), Print(name_display), ResetColor)?;
 
     let remaining = name_width.saturating_sub(name_len);
-    if remaining > 0 {
-        queue!(stdout, Print(" ".repeat(remaining)))?;
-    }
-    Ok(())
-}
-
-fn _render_group_name_cell(stdout: &mut io::Stdout, label: &str, width: usize) -> io::Result<()> {
-    let display = truncate_str(label, width);
-    if is_dim_mode() {
-        let display_len = display.chars().count();
-        queue!(
-            stdout,
-            SetForegroundColor(Color::DarkGrey),
-            Print(&display),
-            ResetColor
-        )?;
-        let remaining = width.saturating_sub(display_len);
-        if remaining > 0 {
-            queue!(stdout, Print(" ".repeat(remaining)))?;
-        }
-        return Ok(());
-    }
-    let prefix = "";
-    let prefix_len = prefix.chars().count();
-    let display_len = display.chars().count();
-    let prefix_visible = prefix_len.min(display_len);
-    let (prefix_part, name_part) = split_at_chars(&display, prefix_visible);
-
-    queue!(stdout, Print(prefix_part))?;
-    if !name_part.is_empty() {
-        queue!(stdout, SetForegroundColor(Color::Yellow), Print(name_part), ResetColor)?;
-    }
-
-    let remaining = width.saturating_sub(display_len);
     if remaining > 0 {
         queue!(stdout, Print(" ".repeat(remaining)))?;
     }
@@ -723,4 +701,72 @@ fn format_docker_header(widths: &[usize]) -> String {
         "│{}│{}│{}│{}│{}│{}│{}│{}│",
         cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7]
     )
+}
+
+fn render_context_menu(stdout: &mut io::Stdout, menu: &ContextMenu) -> io::Result<()> {
+    const MENU_WIDTH: usize = 16;
+    const PADDING: u16 = 1;
+
+    let x = menu.x;
+    let y = menu.y;
+    let item_count = menu.items.len();
+    let menu_height = item_count as u16 + PADDING * 2;
+
+    // Draw border and background
+    let top_border = format!("┌{}┐", "─".repeat(MENU_WIDTH - 2));
+    let bottom_border = format!("└{}┘", "─".repeat(MENU_WIDTH - 2));
+
+    // Top border
+    queue!(
+        stdout,
+        MoveTo(x, y),
+        SetBackgroundColor(Color::DarkGrey),
+        SetForegroundColor(Color::White),
+        Print(&top_border),
+        ResetColor
+    )?;
+
+    // Menu items
+    for (idx, action) in menu.items.iter().enumerate() {
+        let row_y = y + PADDING + idx as u16;
+        let label = action.label(menu.is_group);
+        let padded = format!(" {:<width$}", label, width = MENU_WIDTH - 3);
+        let is_hovered = menu.hover == Some(idx);
+
+        queue!(stdout, MoveTo(x, row_y))?;
+
+        if is_hovered {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Cyan),
+                SetForegroundColor(Color::Black),
+                Print("│"),
+                Print(&padded),
+                Print("│"),
+                ResetColor
+            )?;
+        } else {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::DarkGrey),
+                SetForegroundColor(Color::White),
+                Print("│"),
+                Print(&padded),
+                Print("│"),
+                ResetColor
+            )?;
+        }
+    }
+
+    // Bottom border
+    queue!(
+        stdout,
+        MoveTo(x, y + menu_height - 1),
+        SetBackgroundColor(Color::DarkGrey),
+        SetForegroundColor(Color::White),
+        Print(&bottom_border),
+        ResetColor
+    )?;
+
+    Ok(())
 }

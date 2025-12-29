@@ -6,12 +6,19 @@ use crate::app::actions::{
     kill_selected_in_docker, kill_selected_port_process, kill_selected_process, open_selected_container,
     open_selected_container_logs, open_selected_env,
 };
-use crate::app::state::{view_for_sidebar_index, Focus, InputMode, SortBy, ViewMode};
+use crate::app::state::{view_for_sidebar_index, ContextMenu, ContextMenuAction, ContextMenuTarget, Focus, InputMode, OperationComplete, SortBy, ViewMode};
 use crate::app::AppState;
+use crate::system::docker::{ContainerInfo, DockerRow};
 
 pub(crate) fn handle_key_event(key: KeyEvent, state: &mut AppState, system: &mut System) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
+    }
+
+    // Close context menu on Escape
+    if state.context_menu.is_some() && key.code == KeyCode::Esc {
+        state.context_menu = None;
+        return false;
     }
 
     if state.view_mode == ViewMode::DockerEnv {
@@ -362,13 +369,49 @@ fn view_label(mode: ViewMode) -> &'static str {
 const SIDEBAR_WIDTH: u16 = 20;
 const SIDEBAR_MENU_START_ROW: u16 = 10; // After logo, title, separator
 
-pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState) {
+/// Returns true if a re-render is needed
+pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState, containers: &[crate::system::docker::ContainerInfo]) -> bool {
     let (width, height) = terminal::size().unwrap_or((80, 24));
     let x = mouse.column;
     let y = mouse.row;
 
     // Check if sidebar is visible
     let show_sidebar = width >= SIDEBAR_WIDTH + 1 + 40; // sidebar + gap + min main
+
+    // If context menu is open, handle it first
+    if let Some(ref menu) = state.context_menu {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Check if click is inside menu
+                if let Some(action) = get_menu_action_at(menu, x, y) {
+                    let target = menu.target.clone();
+                    state.context_menu = None;
+                    execute_context_action(state, action, &target, containers);
+                    return true;
+                }
+                // Click outside menu - close it
+                state.context_menu = None;
+                return true;
+            }
+            MouseEventKind::Moved => {
+                // Update menu hover only if it changed
+                let new_hover = get_menu_item_at(menu, x, y);
+                if let Some(menu) = state.context_menu.as_mut() {
+                    if menu.hover != new_hover {
+                        menu.hover = new_hover;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right-click closes menu
+                state.context_menu = None;
+                return true;
+            }
+            _ => return false,
+        }
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -382,28 +425,45 @@ pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState) {
                 let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
                 handle_main_click(state, x.saturating_sub(main_x), y, height);
             }
+            true
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Right-click to open context menu (Docker view only)
+            if state.view_mode == ViewMode::Docker {
+                let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
+                handle_docker_right_click(state, x, y, height, main_x, containers);
+                true
+            } else {
+                false
+            }
         }
         MouseEventKind::Moved => {
             // Update hover state
             if show_sidebar && x < SIDEBAR_WIDTH {
                 // Hovering over sidebar
+                let old_hover = state.sidebar_hover;
                 state.hover_row = None;
                 handle_sidebar_hover(state, y);
+                state.sidebar_hover != old_hover
             } else {
+                let old_hover = state.hover_row;
                 state.sidebar_hover = None;
                 let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
                 handle_main_hover(state, x.saturating_sub(main_x), y, height);
+                state.hover_row != old_hover
             }
         }
         MouseEventKind::ScrollUp => {
             // Scroll up = move selection up
             handle_scroll(state, -1);
+            true
         }
         MouseEventKind::ScrollDown => {
             // Scroll down = move selection down
             handle_scroll(state, 1);
+            true
         }
-        _ => {}
+        _ => false
     }
 }
 
@@ -688,5 +748,196 @@ fn handle_main_hover(state: &mut AppState, _x: u16, y: u16, height: u16) {
             }
         }
         ViewMode::DockerEnv => {}
+    }
+}
+
+// Context menu constants
+const MENU_WIDTH: u16 = 16;
+const MENU_PADDING: u16 = 1;
+
+fn handle_docker_right_click(
+    state: &mut AppState,
+    x: u16,
+    y: u16,
+    height: u16,
+    main_x: u16,
+    containers: &[crate::system::docker::ContainerInfo],
+) {
+    let list_start: u16 = 13;
+    if y < list_start {
+        return;
+    }
+
+    let clicked_visual_row = (y - list_start) as usize;
+    let footer_lines = 5usize;
+    let max_rows = (height as usize).saturating_sub(list_start as usize + footer_lines);
+    if max_rows == 0 {
+        return;
+    }
+
+    // Calculate scroll
+    let total = state.docker_rows.len();
+    let half = max_rows / 2;
+    let scroll = if state.docker_selected_row <= half {
+        0
+    } else if state.docker_selected_row + half >= total {
+        total.saturating_sub(max_rows)
+    } else {
+        state.docker_selected_row - half
+    };
+
+    let target_row = scroll + clicked_visual_row;
+    if target_row >= state.docker_rows.len() {
+        return;
+    }
+
+    // Determine target and menu items based on row type
+    let (target, items, is_group) = match &state.docker_rows[target_row] {
+        DockerRow::Group { name, path, .. } => {
+            let target = ContextMenuTarget::Group {
+                name: name.clone(),
+                path: path.clone(),
+            };
+            // Groups get start/stop/restart all
+            let items = vec![
+                ContextMenuAction::Start,
+                ContextMenuAction::Stop,
+                ContextMenuAction::Restart,
+            ];
+            (target, items, true)
+        }
+        DockerRow::Item { index, .. } => {
+            let container = &containers[*index];
+            let target = ContextMenuTarget::Container {
+                id: container.id.clone(),
+                name: container.name.clone(),
+                running: container.running,
+            };
+            // Single container - show relevant actions
+            let items = if container.running {
+                vec![ContextMenuAction::Stop, ContextMenuAction::Restart]
+            } else {
+                vec![ContextMenuAction::Start]
+            };
+            (target, items, false)
+        }
+        DockerRow::Separator => return,
+    };
+
+    // Position menu at click location, adjust if near edges
+    let menu_height = items.len() as u16 + MENU_PADDING * 2;
+    let menu_x = x.min((main_x + 80).saturating_sub(MENU_WIDTH));
+    let menu_y = if y + menu_height >= height {
+        y.saturating_sub(menu_height)
+    } else {
+        y
+    };
+
+    state.context_menu = Some(ContextMenu {
+        x: menu_x,
+        y: menu_y,
+        items,
+        hover: Some(0),
+        target,
+        is_group,
+    });
+}
+
+fn get_menu_item_at(menu: &ContextMenu, x: u16, y: u16) -> Option<usize> {
+    let menu_x = menu.x;
+    let menu_y = menu.y + MENU_PADDING;
+    let menu_width = MENU_WIDTH;
+
+    if x < menu_x || x >= menu_x + menu_width {
+        return None;
+    }
+
+    if y < menu_y || y >= menu_y + menu.items.len() as u16 {
+        return None;
+    }
+
+    Some((y - menu_y) as usize)
+}
+
+fn get_menu_action_at(menu: &ContextMenu, x: u16, y: u16) -> Option<ContextMenuAction> {
+    get_menu_item_at(menu, x, y).map(|idx| menu.items[idx])
+}
+
+fn execute_context_action(
+    state: &mut AppState,
+    action: ContextMenuAction,
+    target: &ContextMenuTarget,
+    containers: &[ContainerInfo],
+) {
+    let action_name = match action {
+        ContextMenuAction::Start => "Starting",
+        ContextMenuAction::Stop => "Stopping",
+        ContextMenuAction::Restart => "Restarting",
+    };
+
+    match target {
+        ContextMenuTarget::Container { id, name, .. } => {
+            state.set_message(format!("{} {}...", action_name, name));
+            // Track expected state: Start/Restart -> running, Stop -> stopped
+            let expected_running = !matches!(action, ContextMenuAction::Stop);
+            state.pending_operations.insert(id.clone(), expected_running);
+
+            let id = id.clone();
+            let tx = state.operation_tx.clone();
+            std::thread::spawn(move || {
+                let result = match action {
+                    ContextMenuAction::Start => crate::system::docker::start_container(&id),
+                    ContextMenuAction::Stop => crate::system::docker::stop_container(&id),
+                    ContextMenuAction::Restart => crate::system::docker::restart_container(&id),
+                };
+                let _ = tx.send(OperationComplete {
+                    container_id: id,
+                    success: result.is_ok(),
+                    message: result.err().map(|e| e.to_string()).unwrap_or_default(),
+                });
+            });
+        }
+        ContextMenuTarget::Group { name, path } => {
+            // Find all containers in this group
+            let group_containers: Vec<_> = containers
+                .iter()
+                .filter(|c| c.group_path.as_deref() == path.as_deref())
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect();
+
+            if group_containers.is_empty() {
+                state.set_message(format!("No containers found in {}", name));
+                return;
+            }
+
+            let count = group_containers.len();
+            state.set_message(format!("{} {} containers in {}...", action_name, count, name));
+
+            // Track expected state: Start/Restart -> running, Stop -> stopped
+            let expected_running = !matches!(action, ContextMenuAction::Stop);
+
+            // Mark all containers as pending with expected state
+            for (id, _) in &group_containers {
+                state.pending_operations.insert(id.clone(), expected_running);
+            }
+
+            // Start operations for each container
+            for (id, _name) in group_containers {
+                let tx = state.operation_tx.clone();
+                let container_id = id.clone();
+                std::thread::spawn(move || {
+                    let result = match action {
+                        ContextMenuAction::Start => crate::system::docker::start_container(&container_id),
+                        ContextMenuAction::Stop => crate::system::docker::stop_container(&container_id),
+                        ContextMenuAction::Restart => crate::system::docker::restart_container(&container_id),
+                    };
+                    let _ = tx.send(OperationComplete {
+                        container_id,
+                        success: result.is_ok(),
+                        message: result.err().map(|e| e.to_string()).unwrap_or_default(),
+                    });
+                });
+            }
+        }
     }
 }
