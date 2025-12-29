@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal;
 
 use crate::app::{AppState, InputMode};
@@ -109,10 +109,15 @@ pub fn render_ports(
                 width_usize,
             )?;
         } else {
-            let scroll = if state.selected >= max_rows {
-                state.selected - max_rows + 1
-            } else {
+            // Keep selection centered when possible
+            let total = rows.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
                 0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
             };
             let end = (scroll + max_rows).min(rows.len());
             let mut rendered = 0usize;
@@ -120,6 +125,7 @@ pub fn render_ports(
                 let line_index = scroll + idx;
                 let y = list_start + idx;
                 let selected = line_index == state.selected && !dim;
+                let hovered = state.hover_row == Some(line_index) && !selected && !dim;
                 match row {
                     PortRow::Group { name, count } => {
                         render_port_group_row_at(
@@ -131,6 +137,7 @@ pub fn render_ports(
                             name,
                             *count,
                             selected,
+                            hovered,
                         )?;
                     }
                     PortRow::Item { index } => {
@@ -150,6 +157,14 @@ pub fn render_ports(
                                 SetAttribute(Attribute::Reverse),
                                 Print(fit_left(&line, width_usize)),
                                 SetAttribute(Attribute::Reset)
+                            )?;
+                        } else if hovered {
+                            queue!(
+                                stdout,
+                                MoveTo(main_x, y as u16),
+                                SetBackgroundColor(Color::DarkGrey),
+                                Print(fit_left(&line, width_usize)),
+                                ResetColor
                             )?;
                         } else {
                             render_line_at(stdout, main_x, y as u16, &line, width_usize)?;
@@ -334,6 +349,7 @@ fn render_port_group_row_at(
     name: &str,
     count: usize,
     selected: bool,
+    hovered: bool,
 ) -> io::Result<()> {
     let label = name;
     let count_label = format!("{count} ports");
@@ -352,6 +368,18 @@ fn render_port_group_row_at(
             SetAttribute(Attribute::Reverse),
             Print(fit_left(&line, table_width)),
             SetAttribute(Attribute::Reset)
+        )?;
+        return Ok(());
+    }
+
+    if hovered && !is_dim_mode() {
+        let line = format_ports_group_line(label, count, widths);
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetBackgroundColor(Color::DarkGrey),
+            Print(fit_left(&line, table_width)),
+            ResetColor
         )?;
         return Ok(());
     }

@@ -130,10 +130,15 @@ pub fn render_containers(
             )?;
         } else {
             let selected_row = state.docker_selected_row;
-            let scroll = if selected_row >= max_rows {
-                selected_row.saturating_sub(max_rows - 1)
-            } else {
+            // Keep selection centered when possible
+            let total = rows.len();
+            let half = max_rows / 2;
+            let scroll = if selected_row <= half {
                 0
+            } else if selected_row + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                selected_row - half
             };
             let end = (scroll + max_rows).min(rows.len());
             let mut rendered = 0usize;
@@ -141,6 +146,7 @@ pub fn render_containers(
                 let line_index = scroll + idx;
                 let y = list_start + idx;
                 let is_selected = line_index == selected_row && !dim;
+                let is_hovered = state.hover_row == Some(line_index) && !is_selected && !dim;
                 match row {
                     DockerRow::Group { name, path, count, running_count } => {
                         render_group_row_at(
@@ -153,6 +159,7 @@ pub fn render_containers(
                             *count,
                             *running_count,
                             is_selected,
+                            is_hovered,
                         )?;
                     }
                     DockerRow::Separator => {
@@ -171,6 +178,14 @@ pub fn render_containers(
                                 SetAttribute(Attribute::Reverse),
                                 Print(fit_left(&line, width_usize)),
                                 SetAttribute(Attribute::Reset)
+                            )?;
+                        } else if is_hovered {
+                            queue!(
+                                stdout,
+                                MoveTo(main_x, y as u16),
+                                SetBackgroundColor(Color::DarkGrey),
+                                Print(fit_left(&line, width_usize)),
+                                ResetColor
                             )?;
                         } else if !container.running {
                             // Grey out stopped containers
@@ -339,6 +354,7 @@ fn render_group_row_at(
     count: usize,
     running_count: usize,
     selected: bool,
+    hovered: bool,
 ) -> io::Result<()> {
     // Status dot: ● green if all running, ○ gray if none, ◐ yellow if partial
     let (dot, dot_color) = if running_count == 0 {
@@ -373,6 +389,19 @@ fn render_group_row_at(
             MoveTo(x, y),
             SetBackgroundColor(Color::Yellow),
             SetForegroundColor(Color::Black),
+            Print(fit_left(&line, total_width)),
+            ResetColor
+        )?;
+    } else if hovered {
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        let total_width: usize = widths.iter().sum::<usize>() + 9;
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetBackgroundColor(Color::DarkGrey),
             Print(fit_left(&line, total_width)),
             ResetColor
         )?;
