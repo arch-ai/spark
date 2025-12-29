@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal;
 
 use crate::app::{AppState, InputMode};
@@ -130,10 +130,15 @@ pub fn render_node_processes(
                 width_usize,
             )?;
         } else {
-            let scroll = if state.selected >= max_rows {
-                state.selected - max_rows + 1
-            } else {
+            // Keep selection centered when possible
+            let total = rows.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
                 0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
             };
             let end = (scroll + max_rows).min(rows.len());
             let mut rendered = 0usize;
@@ -141,6 +146,7 @@ pub fn render_node_processes(
                 let line_index = scroll + idx;
                 let y = list_start + idx;
                 let is_selected = line_index == state.selected && !dim;
+                let is_hovered = state.hover_row == Some(line_index) && !is_selected && !dim;
 
                 match row {
                     NodeRow::Group { name, count } => {
@@ -178,6 +184,7 @@ pub fn render_node_processes(
                             pm2_available,
                             &name,
                             is_selected,
+                            is_hovered,
                         )?;
                     }
                     NodeRow::UtilsSpacer => {
@@ -408,6 +415,7 @@ fn render_node_line(
     pm2_available: bool,
     display_name: &str,
     selected: bool,
+    hovered: bool,
 ) -> io::Result<()> {
     queue!(stdout, MoveTo(x, y))?;
 
@@ -459,6 +467,16 @@ fn render_node_line(
                 SetAttribute(Attribute::Reverse),
                 Print(fit_left(&line, width)),
                 SetAttribute(Attribute::Reset)
+            )?;
+            return Ok(());
+        }
+
+        if hovered {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::DarkGrey),
+                Print(fit_left(&line, width)),
+                ResetColor
             )?;
             return Ok(());
         }
@@ -516,6 +534,16 @@ fn render_node_line(
             SetAttribute(Attribute::Reverse),
             Print(fit_left(&line, width)),
             SetAttribute(Attribute::Reset)
+        )?;
+        return Ok(());
+    }
+
+    if hovered {
+        queue!(
+            stdout,
+            SetBackgroundColor(Color::DarkGrey),
+            Print(fit_left(&line, width)),
+            ResetColor
         )?;
         return Ok(());
     }

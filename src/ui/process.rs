@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
-use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor};
 use crossterm::terminal;
 
 use crate::app::{AppState, InputMode, SortBy, SortOrder};
@@ -134,10 +134,15 @@ pub fn render_processes(
                 width_usize,
             )?;
         } else {
-            let scroll = if state.selected >= max_rows {
-                state.selected - max_rows + 1
-            } else {
+            // Keep selection centered when possible
+            let total = rows.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
                 0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
             };
             let end = (scroll + max_rows).min(rows.len());
             let mut rendered = 0usize;
@@ -148,13 +153,23 @@ pub fn render_processes(
                     continue;
                 };
                 let line = format_process_line(proc_info, &proc_widths, &row.prefix);
-                if line_index == state.selected && !dim {
+                let is_selected = line_index == state.selected && !dim;
+                let is_hovered = state.hover_row == Some(line_index) && !is_selected && !dim;
+                if is_selected {
                     queue!(
                         stdout,
                         MoveTo(main_x, y as u16),
                         SetAttribute(Attribute::Reverse),
                         Print(fit_left(&line, width_usize)),
                         SetAttribute(Attribute::Reset)
+                    )?;
+                } else if is_hovered {
+                    queue!(
+                        stdout,
+                        MoveTo(main_x, y as u16),
+                        SetBackgroundColor(Color::DarkGrey),
+                        Print(fit_left(&line, width_usize)),
+                        ResetColor
                     )?;
                 } else {
                     render_line_at(stdout, main_x, y as u16, &line, width_usize)?;

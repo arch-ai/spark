@@ -1,6 +1,6 @@
 use std::io;
 
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::{cursor::MoveTo, queue};
 
 use crate::app::{AppState, Focus, ViewMode};
@@ -120,6 +120,7 @@ pub(crate) fn render_sidebar(
             let label = format!(" {}", items[item_idx]);
             let is_active = item_idx == active_index;
             let is_selected = item_idx == state.sidebar_index;
+            let is_hovered = state.sidebar_hover == Some(item_idx);
             render_sidebar_item(
                 stdout,
                 0,
@@ -128,6 +129,7 @@ pub(crate) fn render_sidebar(
                 &label,
                 is_active,
                 is_selected,
+                is_hovered,
                 state.focus == Focus::Sidebar,
             )?;
             item_idx += 1;
@@ -164,6 +166,7 @@ fn render_sidebar_item(
     label: &str,
     is_active: bool,
     is_selected: bool,
+    is_hovered: bool,
     focus_sidebar: bool,
 ) -> io::Result<()> {
     let inner = width.saturating_sub(2);
@@ -178,6 +181,13 @@ fn render_sidebar_item(
             SetAttribute(Attribute::Reverse),
             Print(text),
             SetAttribute(Attribute::Reset)
+        )?;
+    } else if is_hovered {
+        queue!(
+            stdout,
+            SetBackgroundColor(Color::DarkGrey),
+            Print(text),
+            ResetColor
         )?;
     } else if is_active {
         queue!(stdout, SetForegroundColor(Color::Cyan), Print(text), ResetColor)?;

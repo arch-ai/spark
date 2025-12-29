@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal;
 use sysinfo::System;
 
@@ -363,11 +363,6 @@ const SIDEBAR_WIDTH: u16 = 20;
 const SIDEBAR_MENU_START_ROW: u16 = 10; // After logo, title, separator
 
 pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState) {
-    // Only handle left click
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return;
-    }
-
     let (width, height) = terminal::size().unwrap_or((80, 24));
     let x = mouse.column;
     let y = mouse.row;
@@ -375,13 +370,40 @@ pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState) {
     // Check if sidebar is visible
     let show_sidebar = width >= SIDEBAR_WIDTH + 1 + 40; // sidebar + gap + min main
 
-    if show_sidebar && x < SIDEBAR_WIDTH {
-        // Click in sidebar
-        handle_sidebar_click(state, y);
-    } else {
-        // Click in main area
-        let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
-        handle_main_click(state, x.saturating_sub(main_x), y, height);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Clear hover on click
+            state.hover_row = None;
+            state.sidebar_hover = None;
+
+            if show_sidebar && x < SIDEBAR_WIDTH {
+                handle_sidebar_click(state, y);
+            } else {
+                let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
+                handle_main_click(state, x.saturating_sub(main_x), y, height);
+            }
+        }
+        MouseEventKind::Moved => {
+            // Update hover state
+            if show_sidebar && x < SIDEBAR_WIDTH {
+                // Hovering over sidebar
+                state.hover_row = None;
+                handle_sidebar_hover(state, y);
+            } else {
+                state.sidebar_hover = None;
+                let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
+                handle_main_hover(state, x.saturating_sub(main_x), y, height);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            // Scroll up = move selection up
+            handle_scroll(state, -1);
+        }
+        MouseEventKind::ScrollDown => {
+            // Scroll down = move selection down
+            handle_scroll(state, 1);
+        }
+        _ => {}
     }
 }
 
@@ -402,7 +424,55 @@ fn handle_sidebar_click(state: &mut AppState, y: u16) {
     }
 }
 
-fn handle_main_click(state: &mut AppState, _x: u16, y: u16, _height: u16) {
+fn handle_sidebar_hover(state: &mut AppState, y: u16) {
+    if y < SIDEBAR_MENU_START_ROW {
+        state.sidebar_hover = None;
+        return;
+    }
+
+    let menu_index = (y - SIDEBAR_MENU_START_ROW) as usize;
+    if menu_index < 4 {
+        state.sidebar_hover = Some(menu_index);
+    } else {
+        state.sidebar_hover = None;
+    }
+}
+
+fn handle_scroll(state: &mut AppState, direction: isize) {
+    // Skip if in filter mode
+    if state.input_mode == InputMode::Filter {
+        return;
+    }
+
+    match state.view_mode {
+        ViewMode::Process => {
+            let len = state.visible_pids.len();
+            if direction < 0 && state.selected > 0 {
+                state.selected -= 1;
+            } else if direction > 0 && state.selected + 1 < len {
+                state.selected += 1;
+            }
+        }
+        ViewMode::Docker => {
+            move_docker_selection(state, direction);
+        }
+        ViewMode::Ports => {
+            move_ports_selection(state, direction);
+        }
+        ViewMode::Node => {
+            move_node_selection(state, direction);
+        }
+        ViewMode::DockerEnv => {
+            if direction < 0 && state.env_selected > 0 {
+                state.env_selected -= 1;
+            } else if direction > 0 && state.env_selected + 1 < state.env_vars.len() {
+                state.env_selected += 1;
+            }
+        }
+    }
+}
+
+fn handle_main_click(state: &mut AppState, _x: u16, y: u16, height: u16) {
     // Skip if in filter mode or DockerEnv view
     if state.input_mode == InputMode::Filter {
         return;
@@ -432,36 +502,189 @@ fn handle_main_click(state: &mut AppState, _x: u16, y: u16, _height: u16) {
         return;
     }
 
-    let clicked_row = (y - list_start) as usize;
+    let clicked_visual_row = (y - list_start) as usize;
+
+    // Calculate max visible rows based on terminal height
+    let footer_lines = 5usize;
+    let max_rows = (height as usize).saturating_sub(list_start as usize + footer_lines);
+    if max_rows == 0 {
+        return;
+    }
 
     match state.view_mode {
         ViewMode::Process => {
-            if clicked_row < state.visible_pids.len() {
-                state.selected = clicked_row;
+            // Calculate centered scroll offset
+            let total = state.visible_pids.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
+                0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
+            };
+            let target_row = scroll + clicked_visual_row;
+            if target_row < total {
+                state.selected = target_row;
             }
         }
         ViewMode::Docker => {
-            // Need to account for scroll and find the actual row
-            let max_visible = 20usize; // Approximate, depends on terminal height
-            let scroll = if state.docker_selected_row >= max_visible {
-                state.docker_selected_row.saturating_sub(max_visible - 1)
-            } else {
+            // Calculate centered scroll for docker view
+            let total = state.docker_rows.len();
+            let half = max_rows / 2;
+            let scroll = if state.docker_selected_row <= half {
                 0
+            } else if state.docker_selected_row + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.docker_selected_row - half
             };
-            let target_row = scroll + clicked_row;
-            if target_row < state.docker_rows.len() && state.is_docker_selectable_row(target_row) {
+            let target_row = scroll + clicked_visual_row;
+            if target_row < total && state.is_docker_selectable_row(target_row) {
                 state.docker_selected_row = target_row;
             }
         }
         ViewMode::Ports => {
-            let target = clicked_row;
-            if target < state.visible_ports.len() && !state.is_ports_group_row(target) {
-                state.selected = target;
+            let total = state.visible_ports.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
+                0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
+            };
+            let target_row = scroll + clicked_visual_row;
+            if target_row < total && !state.is_ports_group_row(target_row) {
+                state.selected = target_row;
             }
         }
         ViewMode::Node => {
-            if clicked_row < state.visible_pids.len() && state.is_node_selectable_row(clicked_row) {
-                state.selected = clicked_row;
+            let total = state.visible_pids.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
+                0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
+            };
+            let target_row = scroll + clicked_visual_row;
+            if target_row < total && state.is_node_selectable_row(target_row) {
+                state.selected = target_row;
+            }
+        }
+        ViewMode::DockerEnv => {}
+    }
+}
+
+fn handle_main_hover(state: &mut AppState, _x: u16, y: u16, height: u16) {
+    // Skip if in filter mode
+    if state.input_mode == InputMode::Filter {
+        state.hover_row = None;
+        return;
+    }
+
+    let list_start: u16 = match state.view_mode {
+        ViewMode::Process => 13,
+        ViewMode::Docker => 13,
+        ViewMode::Ports => 13,
+        ViewMode::Node => 13,
+        ViewMode::DockerEnv => {
+            if y >= 6 {
+                let hover = (y - 6) as usize;
+                if hover < state.env_vars.len() {
+                    state.hover_row = Some(hover);
+                    return;
+                }
+            }
+            state.hover_row = None;
+            return;
+        }
+    };
+
+    if y < list_start {
+        state.hover_row = None;
+        return;
+    }
+
+    let hovered_visual_row = (y - list_start) as usize;
+
+    // Calculate max visible rows based on terminal height
+    let footer_lines = 5usize;
+    let max_rows = (height as usize).saturating_sub(list_start as usize + footer_lines);
+    if max_rows == 0 {
+        state.hover_row = None;
+        return;
+    }
+
+    match state.view_mode {
+        ViewMode::Process => {
+            let total = state.visible_pids.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
+                0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
+            };
+            let target_row = scroll + hovered_visual_row;
+            if target_row < total {
+                state.hover_row = Some(target_row);
+            } else {
+                state.hover_row = None;
+            }
+        }
+        ViewMode::Docker => {
+            let total = state.docker_rows.len();
+            let half = max_rows / 2;
+            let scroll = if state.docker_selected_row <= half {
+                0
+            } else if state.docker_selected_row + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.docker_selected_row - half
+            };
+            let target_row = scroll + hovered_visual_row;
+            if target_row < total && state.is_docker_selectable_row(target_row) {
+                state.hover_row = Some(target_row);
+            } else {
+                state.hover_row = None;
+            }
+        }
+        ViewMode::Ports => {
+            let total = state.visible_ports.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
+                0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
+            };
+            let target_row = scroll + hovered_visual_row;
+            if target_row < total && !state.is_ports_group_row(target_row) {
+                state.hover_row = Some(target_row);
+            } else {
+                state.hover_row = None;
+            }
+        }
+        ViewMode::Node => {
+            let total = state.visible_pids.len();
+            let half = max_rows / 2;
+            let scroll = if state.selected <= half {
+                0
+            } else if state.selected + half >= total {
+                total.saturating_sub(max_rows)
+            } else {
+                state.selected - half
+            };
+            let target_row = scroll + hovered_visual_row;
+            if target_row < total && state.is_node_selectable_row(target_row) {
+                state.hover_row = Some(target_row);
+            } else {
+                state.hover_row = None;
             }
         }
         ViewMode::DockerEnv => {}
