@@ -1,4 +1,5 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
+use crossterm::terminal;
 use sysinfo::System;
 
 use crate::app::actions::{
@@ -355,5 +356,114 @@ fn view_label(mode: ViewMode) -> &'static str {
         ViewMode::DockerEnv => "Env",
         ViewMode::Ports => "Ports",
         ViewMode::Node => "Node.js",
+    }
+}
+
+const SIDEBAR_WIDTH: u16 = 20;
+const SIDEBAR_MENU_START_ROW: u16 = 10; // After logo, title, separator
+
+pub(crate) fn handle_mouse_event(mouse: MouseEvent, state: &mut AppState) {
+    // Only handle left click
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+
+    let (width, height) = terminal::size().unwrap_or((80, 24));
+    let x = mouse.column;
+    let y = mouse.row;
+
+    // Check if sidebar is visible
+    let show_sidebar = width >= SIDEBAR_WIDTH + 1 + 40; // sidebar + gap + min main
+
+    if show_sidebar && x < SIDEBAR_WIDTH {
+        // Click in sidebar
+        handle_sidebar_click(state, y);
+    } else {
+        // Click in main area
+        let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
+        handle_main_click(state, x.saturating_sub(main_x), y, height);
+    }
+}
+
+fn handle_sidebar_click(state: &mut AppState, y: u16) {
+    // Menu items start after logo (7 lines), title (1), separator (1) = row 9
+    // But there's also top border at row 0, so items are at rows 9, 10, 11, 12
+    // Actually looking at the render code: logo takes ~7 rows (1-7), title at 8, sep at 9, items start at 10
+    if y < SIDEBAR_MENU_START_ROW {
+        return;
+    }
+
+    let menu_index = (y - SIDEBAR_MENU_START_ROW) as usize;
+    if menu_index < 4 {
+        // 4 menu items: Processes, Ports, Docker, Node JS
+        state.sidebar_index = menu_index;
+        state.set_view(view_for_sidebar_index(menu_index));
+        state.focus = Focus::Main;
+    }
+}
+
+fn handle_main_click(state: &mut AppState, _x: u16, y: u16, _height: u16) {
+    // Skip if in filter mode or DockerEnv view
+    if state.input_mode == InputMode::Filter {
+        return;
+    }
+
+    // The list starts at different rows depending on the view
+    // Generally: title area + header + system bars + table header
+    // For most views, list content starts around row 13-15
+    let list_start: u16 = match state.view_mode {
+        ViewMode::Process => 13,  // After title, header, cpu/mem/swap bars, table header
+        ViewMode::Docker => 13,
+        ViewMode::Ports => 13,
+        ViewMode::Node => 13,
+        ViewMode::DockerEnv => {
+            // Env view has its own scroll
+            if y >= 6 {
+                let clicked_row = (y - 6) as usize;
+                if clicked_row < state.env_vars.len() {
+                    state.env_selected = clicked_row;
+                }
+            }
+            return;
+        }
+    };
+
+    if y < list_start {
+        return;
+    }
+
+    let clicked_row = (y - list_start) as usize;
+
+    match state.view_mode {
+        ViewMode::Process => {
+            if clicked_row < state.visible_pids.len() {
+                state.selected = clicked_row;
+            }
+        }
+        ViewMode::Docker => {
+            // Need to account for scroll and find the actual row
+            let max_visible = 20usize; // Approximate, depends on terminal height
+            let scroll = if state.docker_selected_row >= max_visible {
+                state.docker_selected_row.saturating_sub(max_visible - 1)
+            } else {
+                0
+            };
+            let target_row = scroll + clicked_row;
+            if target_row < state.docker_rows.len() && state.is_docker_selectable_row(target_row) {
+                state.docker_selected_row = target_row;
+            }
+        }
+        ViewMode::Ports => {
+            let target = clicked_row;
+            if target < state.visible_ports.len() && !state.is_ports_group_row(target) {
+                state.selected = target;
+            }
+        }
+        ViewMode::Node => {
+            if clicked_row < state.visible_pids.len() && state.is_node_selectable_row(clicked_row) {
+                state.selected = clicked_row;
+            }
+        }
+        ViewMode::DockerEnv => {}
     }
 }
