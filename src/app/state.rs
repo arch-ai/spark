@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, Uid};
 
+use crate::system::docker::DockerRow;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -68,6 +70,8 @@ pub struct AppState {
     pub visible_container_ports_internal: Vec<String>,
     pub visible_container_group_name: Vec<String>,
     pub visible_container_group_path: Vec<String>,
+    pub docker_selected_row: usize,
+    pub docker_rows: Vec<DockerRow>,
     pub visible_ports: Vec<Pid>,
     pub visible_ports_container_ids: Vec<Option<String>>,
     pub visible_node_selectable: Vec<bool>,
@@ -116,6 +120,8 @@ impl AppState {
             visible_container_ports_internal: Vec::new(),
             visible_container_group_name: Vec::new(),
             visible_container_group_path: Vec::new(),
+            docker_selected_row: 0,
+            docker_rows: Vec::new(),
             visible_ports: Vec::new(),
             visible_ports_container_ids: Vec::new(),
             visible_node_selectable: Vec::new(),
@@ -207,6 +213,13 @@ impl AppState {
             .get(index)
             .copied()
             .unwrap_or(false)
+    }
+
+    pub(crate) fn is_docker_selectable_row(&self, index: usize) -> bool {
+        matches!(
+            self.docker_rows.get(index),
+            Some(DockerRow::Group { .. }) | Some(DockerRow::Item { .. })
+        )
     }
 }
 

@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sysinfo::System;
 
 use crate::app::actions::{
-    kill_selected_container, kill_selected_port_process, kill_selected_process, open_selected_container,
+    kill_selected_in_docker, kill_selected_port_process, kill_selected_process, open_selected_container,
     open_selected_container_logs, open_selected_env,
 };
 use crate::app::state::{view_for_sidebar_index, Focus, InputMode, SortBy, ViewMode};
@@ -136,7 +136,7 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
             if state.view_mode == ViewMode::Process || state.view_mode == ViewMode::Node {
                 kill_selected_process(state, system);
             } else if state.view_mode == ViewMode::Docker {
-                kill_selected_container(state);
+                kill_selected_in_docker(state);
             } else if state.view_mode == ViewMode::Ports {
                 kill_selected_port_process(state, system);
             } else {
@@ -163,6 +163,8 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                 move_ports_selection(state, -1);
             } else if state.view_mode == ViewMode::Node {
                 move_node_selection(state, -1);
+            } else if state.view_mode == ViewMode::Docker {
+                move_docker_selection(state, -1);
             } else if state.selected > 0 {
                 state.selected -= 1;
             }
@@ -172,6 +174,8 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                 move_ports_selection(state, 1);
             } else if state.view_mode == ViewMode::Node {
                 move_node_selection(state, 1);
+            } else if state.view_mode == ViewMode::Docker {
+                move_docker_selection(state, 1);
             } else if state.selected + 1 < list_len {
                 state.selected += 1;
             }
@@ -189,6 +193,12 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                         break;
                     }
                 }
+            } else if state.view_mode == ViewMode::Docker {
+                for _ in 0..10 {
+                    if !move_docker_selection(state, -1) {
+                        break;
+                    }
+                }
             } else {
                 state.selected = state.selected.saturating_sub(10);
             }
@@ -203,6 +213,12 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
             } else if state.view_mode == ViewMode::Node {
                 for _ in 0..10 {
                     if !move_node_selection(state, 1) {
+                        break;
+                    }
+                }
+            } else if state.view_mode == ViewMode::Docker {
+                for _ in 0..10 {
+                    if !move_docker_selection(state, 1) {
                         break;
                     }
                 }
@@ -305,6 +321,28 @@ fn move_node_selection(state: &mut AppState, direction: isize) -> bool {
         let next = idx as usize;
         if state.is_node_selectable_row(next) {
             state.selected = next;
+            return true;
+        }
+    }
+}
+
+fn move_docker_selection(state: &mut AppState, direction: isize) -> bool {
+    if direction == 0 {
+        return false;
+    }
+    let len = state.docker_rows.len() as isize;
+    if len == 0 {
+        return false;
+    }
+    let mut idx = state.docker_selected_row as isize;
+    loop {
+        idx += direction;
+        if idx < 0 || idx >= len {
+            return false;
+        }
+        let next = idx as usize;
+        if state.is_docker_selectable_row(next) {
+            state.docker_selected_row = next;
             return true;
         }
     }
