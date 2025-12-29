@@ -142,7 +142,7 @@ pub fn render_containers(
                 let y = list_start + idx;
                 let is_selected = line_index == selected_row && !dim;
                 match row {
-                    DockerRow::Group { name, path, count } => {
+                    DockerRow::Group { name, path, count, running_count } => {
                         render_group_row_at(
                             stdout,
                             main_x,
@@ -151,6 +151,7 @@ pub fn render_containers(
                             name,
                             path.as_deref(),
                             *count,
+                            *running_count,
                             is_selected,
                         )?;
                     }
@@ -170,6 +171,15 @@ pub fn render_containers(
                                 SetAttribute(Attribute::Reverse),
                                 Print(fit_left(&line, width_usize)),
                                 SetAttribute(Attribute::Reset)
+                            )?;
+                        } else if !container.running {
+                            // Grey out stopped containers
+                            queue!(
+                                stdout,
+                                MoveTo(main_x, y as u16),
+                                SetForegroundColor(Color::DarkGrey),
+                                Print(fit_left(&line, width_usize)),
+                                ResetColor
                             )?;
                         } else {
                             render_line_at(stdout, main_x, y as u16, &line, width_usize)?;
@@ -327,11 +337,21 @@ fn render_group_row_at(
     name: &str,
     path: Option<&str>,
     count: usize,
+    running_count: usize,
     selected: bool,
 ) -> io::Result<()> {
-    let label = format!("{name}");
+    // Status dot: ● green if all running, ○ gray if none, ◐ yellow if partial
+    let (dot, dot_color) = if running_count == 0 {
+        ("○", Color::DarkGrey)
+    } else if running_count == count {
+        ("●", Color::Green)
+    } else {
+        ("◐", Color::Yellow)
+    };
+    let label = format!("{} {name}", dot);
     let path_label = path.unwrap_or("-");
-    let status_label = format!("{count} containers");
+    let status_label = format!("{}/{} running", running_count, count);
+    let all_stopped = running_count == 0;
 
     let id_cell = fit_right("", widths[0]);
     let cpu_cell = fit_right("", widths[1]);
@@ -356,6 +376,20 @@ fn render_group_row_at(
             Print(fit_left(&line, total_width)),
             ResetColor
         )?;
+    } else if all_stopped {
+        // Grey out entire group if all containers stopped
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        let total_width: usize = widths.iter().sum::<usize>() + 9;
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(fit_left(&line, total_width)),
+            ResetColor
+        )?;
     } else {
         queue!(stdout, MoveTo(x, y))?;
         print_table_bar(stdout)?;
@@ -365,7 +399,8 @@ fn render_group_row_at(
         print_table_bar(stdout)?;
         print_dim_cell(stdout, &mem_cell)?;
         print_table_bar(stdout)?;
-        render_group_name_cell(stdout, &label, widths[3])?;
+        // Render name with colored dot
+        render_group_name_cell_with_dot(stdout, name, dot, dot_color, widths[3])?;
         print_table_bar(stdout)?;
         print_dim_cell(stdout, &image_cell)?;
         print_table_bar(stdout)?;
@@ -379,7 +414,47 @@ fn render_group_row_at(
     Ok(())
 }
 
-fn render_group_name_cell(stdout: &mut io::Stdout, label: &str, width: usize) -> io::Result<()> {
+fn render_group_name_cell_with_dot(
+    stdout: &mut io::Stdout,
+    name: &str,
+    dot: &str,
+    dot_color: Color,
+    width: usize,
+) -> io::Result<()> {
+    if is_dim_mode() {
+        let display = truncate_str(&format!("{} {}", dot, name), width);
+        let display_len = display.chars().count();
+        queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print(&display),
+            ResetColor
+        )?;
+        let remaining = width.saturating_sub(display_len);
+        if remaining > 0 {
+            queue!(stdout, Print(" ".repeat(remaining)))?;
+        }
+        return Ok(());
+    }
+
+    // Print colored dot
+    queue!(stdout, SetForegroundColor(dot_color), Print(dot), ResetColor)?;
+    queue!(stdout, Print(" "))?;
+
+    // Print name in yellow
+    let name_width = width.saturating_sub(2); // dot + space
+    let name_display = truncate_str(name, name_width);
+    let name_len = name_display.chars().count();
+    queue!(stdout, SetForegroundColor(Color::Yellow), Print(name_display), ResetColor)?;
+
+    let remaining = name_width.saturating_sub(name_len);
+    if remaining > 0 {
+        queue!(stdout, Print(" ".repeat(remaining)))?;
+    }
+    Ok(())
+}
+
+fn _render_group_name_cell(stdout: &mut io::Stdout, label: &str, width: usize) -> io::Result<()> {
     let display = truncate_str(label, width);
     if is_dim_mode() {
         let display_len = display.chars().count();
