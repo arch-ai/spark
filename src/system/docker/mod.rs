@@ -9,6 +9,19 @@ use std::time::Duration;
 
 use crate::util::{contains_lower, Filterable};
 
+/// Container health status from Docker healthcheck
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HealthStatus {
+    /// No healthcheck configured
+    None,
+    /// Container is starting, healthcheck not yet run
+    Starting,
+    /// Healthcheck is passing
+    Healthy,
+    /// Healthcheck is failing
+    Unhealthy,
+}
+
 pub use container::{
     container_label_for, kill_container, kill_containers, load_container_env,
     load_docker_container_cache, restart_container, start_container, stop_container,
@@ -33,6 +46,8 @@ pub struct ContainerInfo {
     pub running: bool,
     /// Seconds since last activity (lower = more recent)
     pub activity_secs: u64,
+    /// Container health status from healthcheck
+    pub health: HealthStatus,
 }
 
 impl Filterable for ContainerInfo {
