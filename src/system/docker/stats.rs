@@ -14,12 +14,15 @@ const OTHER: &str = "Other";
 
 /// Load docker stats using a single combined command.
 /// This reduces process spawning from 2 calls to 1 per refresh cycle.
+/// Includes stopped containers with -a flag.
 pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
     // Combined format: stats data + metadata in single command
     // Format: ID|Name|CPU|MemUsage|Image|Ports|Status|Labels
+    // Use -a to include stopped containers
     let output = Command::new("docker")
         .args([
             "ps",
+            "-a",
             "--no-trunc",
             "--format",
             "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}|{{.Status}}|{{.Labels}}",
@@ -122,6 +125,11 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             .copied()
             .unwrap_or((0.0, 0));
 
+        // Determine if container is running from status
+        // Status starts with "Up" for running containers
+        let running = status.starts_with("Up");
+        let activity_secs = parse_activity_time(status);
+
         containers.push(ContainerInfo {
             id: id.to_string(),
             name: name.to_string(),
@@ -144,6 +152,8 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
                 .map(|g| Cow::Owned(g.name.clone()))
                 .unwrap_or(Cow::Borrowed(OTHER)),
             group_path: group.and_then(|g| g.path),
+            running,
+            activity_secs,
         });
     }
 
@@ -158,13 +168,14 @@ struct ComposeGroup {
 
 pub fn group_containers(
     containers: Vec<ContainerInfo>,
-    sort_by: SortBy,
-    sort_order: SortOrder,
+    _sort_by: SortBy,
+    _sort_order: SortOrder,
 ) -> (Vec<ContainerInfo>, Vec<DockerRow>) {
     struct GroupBucket {
         name: Cow<'static, str>,
         path: Option<String>,
         containers: Vec<ContainerInfo>,
+        min_activity: u64, // Most recent activity in group
     }
 
     let mut grouped: BTreeMap<String, GroupBucket> = BTreeMap::new();
@@ -178,25 +189,37 @@ pub fn group_containers(
             name: container.group_name.clone(),
             path: container.group_path.clone(),
             containers: Vec::new(),
+            min_activity: u64::MAX,
         });
+        // Track the most recent activity in the group
+        bucket.min_activity = bucket.min_activity.min(container.activity_secs);
         bucket.containers.push(container);
     }
 
     let other = grouped.remove("Other");
 
+    // Convert to vec and sort by activity (most recent first)
+    let mut buckets: Vec<_> = grouped.into_values().collect();
+    buckets.sort_by_key(|b| b.min_activity);
+
     let mut flat = Vec::new();
     let mut rows = Vec::new();
     let mut first_group = true;
-    for (_key, mut bucket) in grouped {
-        sort_containers(&mut bucket.containers, sort_by, sort_order);
+
+    for mut bucket in buckets {
+        // Sort containers within group by activity (most recent first)
+        bucket.containers.sort_by_key(|c| c.activity_secs);
+
         if !first_group {
             rows.push(DockerRow::Separator);
         }
         first_group = false;
+        let running_count = bucket.containers.iter().filter(|c| c.running).count();
         rows.push(DockerRow::Group {
             name: bucket.name.to_string(),
             path: bucket.path.clone(),
             count: bucket.containers.len(),
+            running_count,
         });
         let total = bucket.containers.len();
         for (idx, container) in bucket.containers.into_iter().enumerate() {
@@ -211,15 +234,19 @@ pub fn group_containers(
         }
     }
 
+    // "Other" group always goes last
     if let Some(mut bucket) = other {
-        sort_containers(&mut bucket.containers, sort_by, sort_order);
+        bucket.containers.sort_by_key(|c| c.activity_secs);
+
         if !rows.is_empty() {
             rows.push(DockerRow::Separator);
         }
+        let running_count = bucket.containers.iter().filter(|c| c.running).count();
         rows.push(DockerRow::Group {
             name: bucket.name.to_string(),
             path: bucket.path.clone(),
             count: bucket.containers.len(),
+            running_count,
         });
         let total = bucket.containers.len();
         for (idx, container) in bucket.containers.into_iter().enumerate() {
@@ -424,4 +451,73 @@ fn extract_unbound_port(input: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Parse activity time from Docker status string.
+/// Returns seconds since last activity (lower = more recent).
+/// Examples:
+///   "Up 2 hours" -> ~7200
+///   "Up About an hour" -> ~3600
+///   "Exited (0) 3 days ago" -> ~259200
+///   "Created" -> very high value (least recent)
+fn parse_activity_time(status: &str) -> u64 {
+    let status_lower = status.to_lowercase();
+
+    // Handle "Created" status (no time info, treat as very old)
+    if status_lower.starts_with("created") {
+        return u64::MAX / 2;
+    }
+
+    // Extract time portion
+    // For "Up X time" or "Up About X time"
+    // For "Exited (code) X time ago"
+    let time_str = if status_lower.starts_with("up") {
+        status_lower.trim_start_matches("up").trim()
+    } else if let Some(pos) = status_lower.find(')') {
+        status_lower[pos + 1..].trim().trim_end_matches("ago").trim()
+    } else {
+        &status_lower
+    };
+
+    parse_duration_string(time_str)
+}
+
+/// Parse a duration string like "2 hours", "About an hour", "3 days", "45 seconds"
+fn parse_duration_string(input: &str) -> u64 {
+    let input = input.trim().to_lowercase();
+    let input = input.trim_start_matches("about").trim();
+
+    // Handle special cases
+    if input.starts_with("a ") || input.starts_with("an ") {
+        // "a minute", "an hour", etc.
+        let unit = input.trim_start_matches("a ").trim_start_matches("an ").trim();
+        return match unit {
+            s if s.starts_with("second") => 1,
+            s if s.starts_with("minute") => 60,
+            s if s.starts_with("hour") => 3600,
+            s if s.starts_with("day") => 86400,
+            s if s.starts_with("week") => 604800,
+            s if s.starts_with("month") => 2592000,
+            s if s.starts_with("year") => 31536000,
+            _ => u64::MAX / 2,
+        };
+    }
+
+    // Parse "N units" format
+    let mut parts = input.split_whitespace();
+    let number = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+    let unit = parts.next().unwrap_or("");
+
+    let multiplier = match unit {
+        s if s.starts_with("second") => 1,
+        s if s.starts_with("minute") => 60,
+        s if s.starts_with("hour") => 3600,
+        s if s.starts_with("day") => 86400,
+        s if s.starts_with("week") => 604800,
+        s if s.starts_with("month") => 2592000,
+        s if s.starts_with("year") => 31536000,
+        _ => 1,
+    };
+
+    number.saturating_mul(multiplier)
 }

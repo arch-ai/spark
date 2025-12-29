@@ -27,6 +27,9 @@ pub struct ContainerInfo {
     pub memory_bytes: u64,
     pub group_name: Cow<'static, str>,
     pub group_path: Option<String>,
+    pub running: bool,
+    /// Seconds since last activity (lower = more recent)
+    pub activity_secs: u64,
 }
 
 impl Filterable for ContainerInfo {
@@ -48,6 +51,7 @@ pub enum DockerRow {
         name: String,
         path: Option<String>,
         count: usize,
+        running_count: usize,
     },
     Item { index: usize, prefix: String },
     Separator,
