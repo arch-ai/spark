@@ -333,13 +333,6 @@ pub(crate) fn format_top_border(widths: &[usize]) -> String {
     line
 }
 
-pub(crate) fn split_at_chars(input: &str, count: usize) -> (String, String) {
-    let mut iter = input.chars();
-    let left: String = iter.by_ref().take(count).collect();
-    let right: String = iter.collect();
-    (left, right)
-}
-
 pub(crate) fn print_table_bar(stdout: &mut io::Stdout) -> io::Result<()> {
     queue!(
         stdout,

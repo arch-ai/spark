@@ -92,7 +92,7 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
             if let Event::Mouse(mouse) = ev {
                 let prev_view = state.view_mode;
 
-                handle_mouse_event(mouse, &mut state);
+                let mouse_needs_render = handle_mouse_event(mouse, &mut state, &docker_view);
 
                 let view_changed = state.view_mode != prev_view;
                 if view_changed {
@@ -102,7 +102,9 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     node_dirty = true;
                 }
 
-                needs_render = true;
+                if mouse_needs_render || view_changed {
+                    needs_render = true;
+                }
             }
         }
 
@@ -123,6 +125,16 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
         }
 
         if state.clear_expired_message() {
+            needs_render = true;
+        }
+
+        // Check for completed container operations
+        if state.check_completed_operations() {
+            needs_render = true;
+        }
+
+        // Animate spinner if there are pending operations
+        if state.tick_spinner() {
             needs_render = true;
         }
 
@@ -168,13 +180,18 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     docker_raw = docker_worker.snapshot();
                     docker_dirty = true;
                     last_docker_pull = Instant::now();
+
+                    // Check if any pending operations have completed (state now matches expected)
+                    if state.update_pending_with_containers(&docker_raw) {
+                        needs_render = true;
+                    }
                 }
 
                 if docker_dirty {
                     docker_view = docker_raw.clone();
                     docker::apply_container_filter(&mut docker_view, &state.docker_filter);
                     let (grouped, rows) =
-                        docker::group_containers(docker_view, state.sort_by, state.sort_order);
+                        docker::group_containers(docker_view);
                     docker_view = grouped;
                     docker_rows = rows.clone();
                     state.docker_rows = rows;

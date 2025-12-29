@@ -3,9 +3,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use crate::app::{SortBy, SortOrder};
-use crate::util::cmp_f32;
-
 use super::{ContainerInfo, DockerRow};
 
 /// Static string constants to avoid repeated allocations
@@ -168,8 +165,6 @@ struct ComposeGroup {
 
 pub fn group_containers(
     containers: Vec<ContainerInfo>,
-    _sort_by: SortBy,
-    _sort_order: SortOrder,
 ) -> (Vec<ContainerInfo>, Vec<DockerRow>) {
     struct GroupBucket {
         name: Cow<'static, str>,
@@ -266,18 +261,6 @@ pub fn group_containers(
 
 pub fn apply_container_filter(containers: &mut Vec<ContainerInfo>, filter: &str) {
     crate::util::apply_filter(containers, filter);
-}
-
-pub fn sort_containers(containers: &mut [ContainerInfo], sort_by: SortBy, sort_order: SortOrder) {
-    match sort_by {
-        SortBy::Cpu => containers.sort_by(|a, b| cmp_f32(a.cpu, b.cpu)),
-        SortBy::Memory => containers.sort_by(|a, b| a.memory_bytes.cmp(&b.memory_bytes)),
-        SortBy::Name => containers.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-    }
-
-    if sort_order == SortOrder::Desc {
-        containers.reverse();
-    }
 }
 
 fn compose_group_from_labels(labels: &str) -> Option<ComposeGroup> {

@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use crate::util::{contains_lower, Filterable};
 
-pub use container::{container_label_for, kill_container, kill_containers, load_container_env, load_docker_container_cache};
+pub use container::{
+    container_label_for, kill_container, kill_containers, load_container_env,
+    load_docker_container_cache, restart_container, start_container, stop_container,
+};
 pub use stats::{apply_container_filter, group_containers, load_docker_stats};
 pub use terminal::{open_container_logs, open_container_shell};
 
