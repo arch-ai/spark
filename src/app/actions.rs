@@ -64,29 +64,99 @@ pub(crate) fn kill_selected_port_process(state: &mut AppState, system: &mut Syst
     }
 }
 
-pub(crate) fn kill_selected_container(state: &mut AppState) {
-    let Some(container_id) = state.visible_containers.get(state.selected).cloned() else {
-        state.set_message("No container selected");
+pub(crate) fn kill_selected_in_docker(state: &mut AppState) {
+    use crate::system::docker::DockerRow;
+
+    let Some(row) = state.docker_rows.get(state.docker_selected_row) else {
+        state.set_message("No selection");
         return;
     };
-    let name = state
-        .visible_container_names
-        .get(state.selected)
-        .cloned()
-        .unwrap_or_else(|| container_id.clone());
 
-    match docker::kill_container(&container_id) {
-        Ok(()) => {
-            state.set_message(format!("Killed container {}", name));
+    match row {
+        DockerRow::Group { name, path, .. } => {
+            // Kill all containers in this group
+            let group_path = path.clone();
+            let group_name = name.clone();
+            let mut container_ids = Vec::new();
+
+            for (i, container_group_path) in state.visible_container_group_path.iter().enumerate() {
+                let matches = match &group_path {
+                    Some(gp) => container_group_path == gp,
+                    None => container_group_path == "-" || container_group_path.is_empty(),
+                };
+                if matches {
+                    if let Some(id) = state.visible_containers.get(i) {
+                        container_ids.push(id.clone());
+                    }
+                }
+            }
+
+            if container_ids.is_empty() {
+                state.set_message("No containers in group");
+                return;
+            }
+
+            let (success, failed) = docker::kill_containers(&container_ids);
+            if failed == 0 {
+                state.set_message(format!("Killed {} containers in {}", success, group_name));
+            } else {
+                state.set_message(format!(
+                    "Killed {}/{} containers in {} ({} failed)",
+                    success,
+                    success + failed,
+                    group_name,
+                    failed
+                ));
+            }
         }
-        Err(err) => {
-            state.set_message(format!("Failed to kill container: {err}"));
+        DockerRow::Item { index, .. } => {
+            // Kill single container
+            let Some(container_id) = state.visible_containers.get(*index).cloned() else {
+                state.set_message("No container selected");
+                return;
+            };
+            let name = state
+                .visible_container_names
+                .get(*index)
+                .cloned()
+                .unwrap_or_else(|| container_id.clone());
+
+            match docker::kill_container(&container_id) {
+                Ok(()) => {
+                    state.set_message(format!("Killed container {}", name));
+                }
+                Err(err) => {
+                    state.set_message(format!("Failed to kill container: {err}"));
+                }
+            }
+        }
+        DockerRow::Separator => {
+            state.set_message("Cannot kill separator");
         }
     }
 }
 
 pub(crate) fn open_selected_container(state: &mut AppState) {
-    let Some(container_id) = state.visible_containers.get(state.selected) else {
+    use crate::system::docker::DockerRow;
+
+    let Some(row) = state.docker_rows.get(state.docker_selected_row) else {
+        state.set_message("No container selected");
+        return;
+    };
+
+    let container_index = match row {
+        DockerRow::Item { index, .. } => *index,
+        DockerRow::Group { .. } => {
+            state.set_message("Select a container to open shell");
+            return;
+        }
+        DockerRow::Separator => {
+            state.set_message("No container selected");
+            return;
+        }
+    };
+
+    let Some(container_id) = state.visible_containers.get(container_index) else {
         state.set_message("No container selected");
         return;
     };
@@ -102,7 +172,26 @@ pub(crate) fn open_selected_container(state: &mut AppState) {
 }
 
 pub(crate) fn open_selected_container_logs(state: &mut AppState) {
-    let Some(container_id) = state.visible_containers.get(state.selected) else {
+    use crate::system::docker::DockerRow;
+
+    let Some(row) = state.docker_rows.get(state.docker_selected_row) else {
+        state.set_message("No container selected");
+        return;
+    };
+
+    let container_index = match row {
+        DockerRow::Item { index, .. } => *index,
+        DockerRow::Group { .. } => {
+            state.set_message("Select a container to view logs");
+            return;
+        }
+        DockerRow::Separator => {
+            state.set_message("No container selected");
+            return;
+        }
+    };
+
+    let Some(container_id) = state.visible_containers.get(container_index) else {
         state.set_message("No container selected");
         return;
     };
@@ -128,33 +217,52 @@ pub(crate) fn open_selected_env(state: &mut AppState, system: &System) {
 }
 
 fn open_selected_container_env(state: &mut AppState, return_view: ViewMode) {
-    let Some(container_id) = state.visible_containers.get(state.selected).cloned() else {
+    use crate::system::docker::DockerRow;
+
+    let Some(row) = state.docker_rows.get(state.docker_selected_row) else {
+        state.set_message("No container selected");
+        return;
+    };
+
+    let container_index = match row {
+        DockerRow::Item { index, .. } => *index,
+        DockerRow::Group { .. } => {
+            state.set_message("Select a container to view env");
+            return;
+        }
+        DockerRow::Separator => {
+            state.set_message("No container selected");
+            return;
+        }
+    };
+
+    let Some(container_id) = state.visible_containers.get(container_index).cloned() else {
         state.set_message("No container selected");
         return;
     };
     let name = state
         .visible_container_names
-        .get(state.selected)
+        .get(container_index)
         .cloned()
         .unwrap_or_else(|| container_id.clone());
     let compose_name = state
         .visible_container_group_name
-        .get(state.selected)
+        .get(container_index)
         .cloned()
         .unwrap_or_else(|| "-".to_string());
     let compose_path = state
         .visible_container_group_path
-        .get(state.selected)
+        .get(container_index)
         .cloned()
         .unwrap_or_else(|| "-".to_string());
     let port_public = state
         .visible_container_ports_public
-        .get(state.selected)
+        .get(container_index)
         .cloned()
         .unwrap_or_else(|| "-".to_string());
     let port_internal = state
         .visible_container_ports_internal
-        .get(state.selected)
+        .get(container_index)
         .cloned()
         .unwrap_or_else(|| "-".to_string());
 

@@ -47,6 +47,18 @@ pub fn kill_container(container_id: &str) -> io::Result<()> {
     }
 }
 
+pub fn kill_containers(container_ids: &[String]) -> (usize, usize) {
+    let mut success = 0;
+    let mut failed = 0;
+    for id in container_ids {
+        match kill_container(id) {
+            Ok(()) => success += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    (success, failed)
+}
+
 pub fn load_docker_container_cache() -> Option<HashMap<String, String>> {
     let output = Command::new("docker")
         .args(["ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}"])

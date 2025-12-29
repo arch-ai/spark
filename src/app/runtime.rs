@@ -158,11 +158,12 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                     let (grouped, rows) =
                         docker::group_containers(docker_view, state.sort_by, state.sort_order);
                     docker_view = grouped;
-                    docker_rows = rows;
+                    docker_rows = rows.clone();
+                    state.docker_rows = rows;
                     state.docker_total = docker_raw.len();
                     state.docker_filtered_out =
                         state.docker_total.saturating_sub(docker_view.len());
-                    clamp_selection(&mut state, docker_view.len());
+                    clamp_docker_selection(&mut state);
 
                     // Pre-allocate and fill all vectors in a single iteration
                     let len = docker_view.len();
@@ -442,6 +443,43 @@ fn find_next_node_row(state: &AppState, start: usize, direction: isize) -> Optio
         }
         let next = idx as usize;
         if state.is_node_selectable_row(next) {
+            return Some(next);
+        }
+    }
+}
+
+fn clamp_docker_selection(state: &mut AppState) {
+    let len = state.docker_rows.len();
+    if len == 0 {
+        state.docker_selected_row = 0;
+        return;
+    }
+    if state.docker_selected_row >= len {
+        state.docker_selected_row = len - 1;
+    }
+    // If currently on a separator, move to next selectable row
+    if !state.is_docker_selectable_row(state.docker_selected_row) {
+        if let Some(next) = find_next_docker_row(state, state.docker_selected_row, 1) {
+            state.docker_selected_row = next;
+        } else if let Some(prev) = find_next_docker_row(state, state.docker_selected_row, -1) {
+            state.docker_selected_row = prev;
+        }
+    }
+}
+
+fn find_next_docker_row(state: &AppState, start: usize, direction: isize) -> Option<usize> {
+    if direction == 0 {
+        return None;
+    }
+    let len = state.docker_rows.len() as isize;
+    let mut idx = start as isize;
+    loop {
+        idx += direction;
+        if idx < 0 || idx >= len {
+            return None;
+        }
+        let next = idx as usize;
+        if state.is_docker_selectable_row(next) {
             return Some(next);
         }
     }

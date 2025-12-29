@@ -129,7 +129,7 @@ pub fn render_containers(
                 width_usize,
             )?;
         } else {
-            let selected_row = find_selected_row(rows, state.selected).unwrap_or(0);
+            let selected_row = state.docker_selected_row;
             let scroll = if selected_row >= max_rows {
                 selected_row.saturating_sub(max_rows - 1)
             } else {
@@ -140,6 +140,7 @@ pub fn render_containers(
             for (idx, row) in rows[scroll..end].iter().enumerate() {
                 let line_index = scroll + idx;
                 let y = list_start + idx;
+                let is_selected = line_index == selected_row && !dim;
                 match row {
                     DockerRow::Group { name, path, count } => {
                         render_group_row_at(
@@ -150,6 +151,7 @@ pub fn render_containers(
                             name,
                             path.as_deref(),
                             *count,
+                            is_selected,
                         )?;
                     }
                     DockerRow::Separator => {
@@ -161,7 +163,7 @@ pub fn render_containers(
                             continue;
                         };
                         let line = format_container_line(container, width_usize, prefix);
-                        if line_index == selected_row && !dim {
+                        if is_selected {
                             queue!(
                                 stdout,
                                 MoveTo(main_x, y as u16),
@@ -315,6 +317,7 @@ fn render_group_row_at(
     name: &str,
     path: Option<&str>,
     count: usize,
+    selected: bool,
 ) -> io::Result<()> {
     let label = format!("{name}");
     let path_label = path.unwrap_or("-");
@@ -323,29 +326,45 @@ fn render_group_row_at(
     let id_cell = fit_right("", widths[0]);
     let cpu_cell = fit_right("", widths[1]);
     let mem_cell = fit_right("", widths[2]);
+    let name_cell = fit_left(&label, widths[3]);
     let image_cell = fit_left(path_label, widths[4]);
     let port_cell = fit_left("-", widths[5]);
     let int_port_cell = fit_left("-", widths[6]);
     let status_cell = fit_left(&status_label, widths[7]);
 
-    queue!(stdout, MoveTo(x, y))?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &id_cell)?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &cpu_cell)?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &mem_cell)?;
-    print_table_bar(stdout)?;
-    render_group_name_cell(stdout, &label, widths[3])?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &image_cell)?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &port_cell)?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &int_port_cell)?;
-    print_table_bar(stdout)?;
-    print_dim_cell(stdout, &status_cell)?;
-    print_table_bar(stdout)?;
+    if selected {
+        let line = format!(
+            "│{}│{}│{}│{}│{}│{}│{}│{}│",
+            id_cell, cpu_cell, mem_cell, name_cell, image_cell, port_cell, int_port_cell, status_cell
+        );
+        let total_width: usize = widths.iter().sum::<usize>() + 9; // 9 separators
+        queue!(
+            stdout,
+            MoveTo(x, y),
+            SetAttribute(Attribute::Reverse),
+            Print(fit_left(&line, total_width)),
+            SetAttribute(Attribute::Reset)
+        )?;
+    } else {
+        queue!(stdout, MoveTo(x, y))?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &id_cell)?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &cpu_cell)?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &mem_cell)?;
+        print_table_bar(stdout)?;
+        render_group_name_cell(stdout, &label, widths[3])?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &image_cell)?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &port_cell)?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &int_port_cell)?;
+        print_table_bar(stdout)?;
+        print_dim_cell(stdout, &status_cell)?;
+        print_table_bar(stdout)?;
+    }
     Ok(())
 }
 
@@ -477,17 +496,6 @@ fn print_dim_cell(stdout: &mut io::Stdout, text: &str) -> io::Result<()> {
         queue!(stdout, Print(text))?;
     }
     Ok(())
-}
-
-fn find_selected_row(rows: &[DockerRow], selected_container: usize) -> Option<usize> {
-    for (idx, row) in rows.iter().enumerate() {
-        if let DockerRow::Item { index, .. } = row {
-            if *index == selected_container {
-                return Some(idx);
-            }
-        }
-    }
-    None
 }
 
 fn docker_column_widths(width: usize) -> Vec<usize> {
