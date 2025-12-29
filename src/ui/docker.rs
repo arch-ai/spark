@@ -238,6 +238,15 @@ pub fn render_containers(
                 ],
             ]
         } else {
+            let is_group_selected = matches!(
+                state.docker_rows.get(state.docker_selected_row),
+                Some(DockerRow::Group { .. })
+            );
+            let kill_label = if is_group_selected {
+                " stop all"
+            } else {
+                " kill"
+            };
             vec![
                 vec![
                     HelpSegment::plain("Filters: "),
@@ -259,7 +268,8 @@ pub fn render_containers(
                     HelpSegment::key("e"),
                     HelpSegment::plain(" env | "),
                     HelpSegment::key("k"),
-                    HelpSegment::plain(" kill | "),
+                    HelpSegment::plain(kill_label),
+                    HelpSegment::plain(" | "),
                     HelpSegment::key("q"),
                     HelpSegment::plain(" quit | "),
                     HelpSegment::key("arrows"),
@@ -341,9 +351,10 @@ fn render_group_row_at(
         queue!(
             stdout,
             MoveTo(x, y),
-            SetAttribute(Attribute::Reverse),
+            SetBackgroundColor(Color::Yellow),
+            SetForegroundColor(Color::Black),
             Print(fit_left(&line, total_width)),
-            SetAttribute(Attribute::Reset)
+            ResetColor
         )?;
     } else {
         queue!(stdout, MoveTo(x, y))?;
