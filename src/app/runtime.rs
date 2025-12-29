@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event};
 use sysinfo::{Pid, System, Users};
 
-use crate::app::input::handle_key_event;
+use crate::app::input::{handle_key_event, handle_mouse_event};
 use crate::app::{AppState, ViewMode};
 use crate::system::{docker, node, ports, process};
 use crate::ui;
@@ -44,7 +44,9 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
 
     loop {
         if event::poll(input_poll)? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            if let Event::Key(key) = ev {
                 let prev_filter = state.active_filter().to_string();
                 let prev_sort_by = state.sort_by;
                 let prev_sort_order = state.sort_order;
@@ -77,6 +79,22 @@ pub fn run(stdout: &mut io::Stdout) -> io::Result<()> {
                 if zoom_changed {
                     process_dirty = true;
                 }
+                if view_changed {
+                    process_dirty = true;
+                    docker_dirty = true;
+                    ports_dirty = true;
+                    node_dirty = true;
+                }
+
+                needs_render = true;
+            }
+
+            if let Event::Mouse(mouse) = ev {
+                let prev_view = state.view_mode;
+
+                handle_mouse_event(mouse, &mut state);
+
+                let view_changed = state.view_mode != prev_view;
                 if view_changed {
                     process_dirty = true;
                     docker_dirty = true;
