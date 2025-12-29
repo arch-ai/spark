@@ -2,8 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sysinfo::System;
 
 use crate::app::actions::{
-    kill_selected_port_process, kill_selected_process, open_selected_container, open_selected_container_logs,
-    open_selected_env,
+    kill_selected_container, kill_selected_port_process, kill_selected_process, open_selected_container,
+    open_selected_container_logs, open_selected_env,
 };
 use crate::app::state::{view_for_sidebar_index, Focus, InputMode, SortBy, ViewMode};
 use crate::app::AppState;
@@ -135,6 +135,8 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
         KeyCode::Char('k') => {
             if state.view_mode == ViewMode::Process || state.view_mode == ViewMode::Node {
                 kill_selected_process(state, system);
+            } else if state.view_mode == ViewMode::Docker {
+                kill_selected_container(state);
             } else if state.view_mode == ViewMode::Ports {
                 kill_selected_port_process(state, system);
             } else {

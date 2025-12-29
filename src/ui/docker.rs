@@ -256,6 +256,8 @@ pub fn render_containers(
                     HelpSegment::plain(" logs | "),
                     HelpSegment::key("e"),
                     HelpSegment::plain(" env | "),
+                    HelpSegment::key("k"),
+                    HelpSegment::plain(" kill | "),
                     HelpSegment::key("q"),
                     HelpSegment::plain(" quit | "),
                     HelpSegment::key("arrows"),

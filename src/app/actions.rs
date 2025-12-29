@@ -64,6 +64,27 @@ pub(crate) fn kill_selected_port_process(state: &mut AppState, system: &mut Syst
     }
 }
 
+pub(crate) fn kill_selected_container(state: &mut AppState) {
+    let Some(container_id) = state.visible_containers.get(state.selected).cloned() else {
+        state.set_message("No container selected");
+        return;
+    };
+    let name = state
+        .visible_container_names
+        .get(state.selected)
+        .cloned()
+        .unwrap_or_else(|| container_id.clone());
+
+    match docker::kill_container(&container_id) {
+        Ok(()) => {
+            state.set_message(format!("Killed container {}", name));
+        }
+        Err(err) => {
+            state.set_message(format!("Failed to kill container: {err}"));
+        }
+    }
+}
+
 pub(crate) fn open_selected_container(state: &mut AppState) {
     let Some(container_id) = state.visible_containers.get(state.selected) else {
         state.set_message("No container selected");
