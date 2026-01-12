@@ -39,17 +39,18 @@ pub fn load_docker_port_bindings() -> Vec<PortInfo> {
         let group_name = compose_group_from_labels(labels);
         for binding in parse_docker_port_bindings(ports_raw) {
             let label = format!("docker:{name}");
-            let path = if binding.container_port > 0 {
-                format!("image:{image} int:{}", binding.container_port)
+            let internal = if binding.container_port > 0 {
+                Some(binding.container_port)
             } else {
-                format!("image:{image}")
+                None
             };
             rows.push(PortInfo {
                 proto: binding.proto,
                 port: binding.port,
+                internal_port: internal,
                 pid: Pid::from_u32(0),
                 name: label,
-                exe_path: path,
+                exe_path: format!("image:{image}"),
                 container_id: Some(id.to_string()),
                 group_name: group_name.clone(),
                 project_name: group_name.clone(),

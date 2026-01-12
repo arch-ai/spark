@@ -17,7 +17,6 @@ pub struct NodeProcessInfo {
     pub script: String,
     pub project_name: Option<String>,
     pub uses_nvm: bool,
-    pub node_version: Option<String>,
     pub cpu: f32,
     pub memory_bytes: u64,
     pub uptime_secs: Option<u64>,
@@ -31,11 +30,8 @@ pub struct NodeProcessInfo {
 #[derive(Clone, Debug)]
 pub struct Pm2Info {
     pub pm_id: u32,
-    pub name: String,
     pub mode: String,       // "fork" or "cluster"
     pub status: String,     // "online", "stopped", "errored"
-    pub restarts: u32,
-    pub pm2_uptime: Option<u64>,
 }
 
 pub enum NodeRow {
@@ -72,11 +68,8 @@ pub fn collect_node_processes(
             node_proc.name = pm2_proc.name.clone();
             node_proc.pm2 = Some(Pm2Info {
                 pm_id: pm2_proc.pm_id,
-                name: pm2_proc.name.clone(),
                 mode: pm2_proc.mode.clone(),
                 status: pm2_proc.status.clone(),
-                restarts: pm2_proc.restarts,
-                pm2_uptime: pm2_proc.uptime_ms.map(|ms| ms / 1000),
             });
             if let Some(uptime_ms) = pm2_proc.uptime_ms {
                 node_proc.uptime_secs = Some(uptime_ms / 1000);
@@ -104,17 +97,13 @@ pub fn collect_node_processes(
                 script,
                 project_name,
                 uses_nvm: false,
-                node_version: None,
                 cpu: pm2_proc.cpu.unwrap_or(0.0),
                 memory_bytes: pm2_proc.memory_bytes.unwrap_or(0),
                 uptime_secs: pm2_proc.uptime_ms.map(|ms| ms / 1000),
                 pm2: Some(Pm2Info {
                     pm_id: pm2_proc.pm_id,
-                    name: pm2_proc.name.clone(),
                     mode: pm2_proc.mode.clone(),
                     status: pm2_proc.status.clone(),
-                    restarts: pm2_proc.restarts,
-                    pm2_uptime: pm2_proc.uptime_ms.map(|ms| ms / 1000),
                 }),
                 worker_count: 1,
             });
@@ -351,27 +340,4 @@ fn contains_token(text: &str, token: &str) -> bool {
         return current == token;
     }
     false
-}
-
-/// Format uptime as human-readable string.
-pub fn format_uptime(secs: Option<u64>) -> String {
-    match secs {
-        None => "-".to_string(),
-        Some(0) => "-".to_string(),
-        Some(s) => {
-            let days = s / 86400;
-            let hours = (s % 86400) / 3600;
-            let mins = (s % 3600) / 60;
-
-            if days > 0 {
-                format!("{}d {}h", days, hours)
-            } else if hours > 0 {
-                format!("{}h {}m", hours, mins)
-            } else if mins > 0 {
-                format!("{}m", mins)
-            } else {
-                format!("{}s", s)
-            }
-        }
-    }
 }

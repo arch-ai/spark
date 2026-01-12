@@ -10,7 +10,6 @@ pub struct Pm2Process {
     pub pid: Option<u32>,
     pub cpu: Option<f32>,
     pub memory_bytes: Option<u64>,
-    pub restarts: u32,
     pub uptime_ms: Option<u64>,
     pub script: Option<String>,
 }
@@ -182,9 +181,6 @@ fn parse_pm2_object(json: &str) -> Option<Pm2Process> {
         })
         .unwrap_or_else(|| "fork".to_string());
 
-    // Restarts count
-    let restarts = extract_nested_u32(json, "pm2_env", "restart_time").unwrap_or(0);
-
     // Uptime in pm2_env.pm_uptime (timestamp when started)
     let uptime_ms = extract_nested_u64(json, "pm2_env", "pm_uptime").and_then(|start_time| {
         let now = std::time::SystemTime::now()
@@ -213,7 +209,6 @@ fn parse_pm2_object(json: &str) -> Option<Pm2Process> {
         pid,
         cpu,
         memory_bytes,
-        restarts,
         uptime_ms,
         script,
     })
@@ -330,38 +325,6 @@ fn extract_nested_string(json: &str, parent: &str, key: &str) -> Option<String> 
 
     let nested = &parent_content[..end];
     extract_string(nested, key)
-}
-
-/// Extract a nested u32 value from JSON.
-fn extract_nested_u32(json: &str, parent: &str, key: &str) -> Option<u32> {
-    let parent_pattern = format!("\"{}\":{{", parent);
-    let alt_pattern = format!("\"{}\" : {{", parent);
-
-    let parent_start = json
-        .find(&parent_pattern)
-        .or_else(|| json.find(&alt_pattern))?;
-
-    let parent_content = &json[parent_start..];
-
-    let mut brace_depth = 0;
-    let mut started = false;
-    let mut end = parent_content.len();
-
-    for (i, ch) in parent_content.chars().enumerate() {
-        if ch == '{' {
-            brace_depth += 1;
-            started = true;
-        } else if ch == '}' {
-            brace_depth -= 1;
-            if started && brace_depth == 0 {
-                end = i + 1;
-                break;
-            }
-        }
-    }
-
-    let nested = &parent_content[..end];
-    extract_u32(nested, key)
 }
 
 /// Extract a nested u64 value from JSON.

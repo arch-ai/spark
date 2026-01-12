@@ -7,19 +7,15 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, System, Uid};
 
 use crate::app::{SortBy, SortOrder};
-use super::docker;
 use crate::util::cmp_f32;
 
 pub struct ProcInfo {
-    pub pid: Pid,
     pub name: String,
     pub name_lower: String,
     pub cpu: f32,
     pub memory_bytes: u64,
     pub user: String,
-    pub exe_path: String,
     pub parent: Option<Pid>,
-    pub container: Option<String>,
     pub is_thread: bool,
 }
 
@@ -34,7 +30,6 @@ const DASH: &str = "-";
 pub fn collect_processes(
     system: &System,
     filter: &str,
-    container_cache: &HashMap<String, String>,
     user_cache: &HashMap<Uid, String>,
     skip_threads: bool,
 ) -> HashMap<Pid, ProcInfo> {
@@ -66,30 +61,21 @@ pub fn collect_processes(
         let name = name_ref.to_string();
         let name_lower = name.to_lowercase();
         let is_thread = process.thread_kind().is_some();
-        let container = docker::container_label_for(*pid, container_cache);
         let user = process
             .user_id()
             .and_then(|uid| user_cache.get(uid))
             .cloned()
             .unwrap_or_else(|| DASH.to_string());
 
-        let exe_path = process
-            .exe()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| DASH.to_string());
-
         processes.insert(
             *pid,
             ProcInfo {
-                pid: *pid,
                 name,
                 name_lower,
                 cpu: process.cpu_usage(),
                 memory_bytes: process.memory(),
                 user,
-                exe_path,
                 parent: process.parent(),
-                container,
                 is_thread,
             },
         );

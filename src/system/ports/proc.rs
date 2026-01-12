@@ -163,6 +163,7 @@ fn parse_socket_table(
         out.push(PortInfo {
             proto: proto.to_string(),
             port,
+            internal_port: None,
             pid: *pid,
             name,
             exe_path,

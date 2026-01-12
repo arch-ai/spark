@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-use sysinfo::{Pid, Process, System};
+use sysinfo::{Process, System};
 
 use super::NodeProcessInfo;
 
@@ -22,7 +21,6 @@ pub fn detect_node_processes(system: &System) -> Vec<NodeProcessInfo> {
                 continue;
             }
 
-            let node_version = detect_node_version(*pid);
             let project_name = project_name_from_process_with_script(process, &script);
 
             let uses_nvm = process_uses_nvm(process, &script);
@@ -33,7 +31,6 @@ pub fn detect_node_processes(system: &System) -> Vec<NodeProcessInfo> {
                 script,
                 project_name,
                 uses_nvm,
-                node_version,
                 cpu: process.cpu_usage(),
                 memory_bytes: process.memory(),
                 uptime_secs: Some(process.run_time()),
@@ -577,85 +574,4 @@ fn is_script_path(script: &str) -> bool {
         || lower.ends_with(".mts")
         || lower.ends_with(".tsx")
         || lower.ends_with(".jsx")
-}
-
-/// Try to detect the Node.js version for a process.
-fn detect_node_version(pid: Pid) -> Option<String> {
-    // Try to read from /proc/[pid]/exe symlink to find the node binary
-    let exe_path = format!("/proc/{}/exe", pid.as_u32());
-
-    if let Ok(exe) = fs::read_link(&exe_path) {
-        let exe_str = exe.to_string_lossy();
-
-        // Try to extract version from path (common with nvm/fnm/volta)
-        // e.g., /home/user/.nvm/versions/node/v20.10.0/bin/node
-        if let Some(version) = extract_version_from_path(&exe_str) {
-            return Some(version);
-        }
-
-        // Try to run node --version (cached per binary path)
-        if let Some(version) = get_node_version_cached(&exe_str) {
-            return Some(version);
-        }
-    }
-
-    None
-}
-
-/// Extract version from node binary path (nvm/fnm/volta style).
-fn extract_version_from_path(path: &str) -> Option<String> {
-    // Look for version patterns like v20.10.0 or 20.10.0
-    let parts: Vec<&str> = path.split('/').collect();
-
-    for part in parts {
-        if part.starts_with('v') && part.len() > 1 {
-            let rest = &part[1..];
-            if rest.chars().next().map_or(false, |c| c.is_ascii_digit()) {
-                // Looks like a version
-                return Some(part.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Get node version by running node --version (with simple caching).
-fn get_node_version_cached(node_path: &str) -> Option<String> {
-    use std::sync::Mutex;
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-
-    static VERSION_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
-
-    let cache = VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    // Check cache
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.get(node_path) {
-            return cached.clone();
-        }
-    }
-
-    // Run node --version
-    let version = Command::new(node_path)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        });
-
-    // Update cache
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(node_path.to_string(), version.clone());
-    }
-
-    version
 }

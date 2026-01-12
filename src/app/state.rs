@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, Uid};
 
-use crate::system::docker::DockerRow;
+use crate::system::docker::{DockerRow, DockerSystemDf};
 
 /// Message sent when a container operation completes
 #[derive(Debug)]
@@ -12,6 +13,7 @@ pub struct OperationComplete {
     pub container_id: String,
     pub success: bool,
     pub message: String,
+    pub output: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -29,6 +31,9 @@ pub enum ContextMenuAction {
     Shell,
     Env,
     Kill,
+    PruneBuildCache,
+    PruneDanglingImages,
+    PruneVolumes,
 }
 
 impl ContextMenuAction {
@@ -41,6 +46,9 @@ impl ContextMenuAction {
             ContextMenuAction::Shell => "$ Shell",
             ContextMenuAction::Env => "# Env",
             ContextMenuAction::Kill => "x Kill",
+            ContextMenuAction::PruneBuildCache => "P Prune Cache",
+            ContextMenuAction::PruneDanglingImages => "P Prune Images",
+            ContextMenuAction::PruneVolumes => "P Prune Volumes",
         }
     }
 
@@ -56,6 +64,19 @@ pub enum ContextMenuTarget {
     Container { id: String, name: String, running: bool },
     Group { name: String, path: Option<String> },
     Process { pid: u32, name: String },
+    DockerDf,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PruneConfirmChoice {
+    Yes,
+    No,
+}
+
+#[derive(Clone, Debug)]
+pub struct PruneOutput {
+    pub label: String,
+    pub output: String,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +87,7 @@ pub struct ContextMenu {
     pub hover: Option<usize>,
     pub target: ContextMenuTarget,
     pub is_group: bool,
+    pub header: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -123,20 +145,26 @@ pub struct AppState {
     pub visible_pids: Vec<Pid>,
     pub visible_containers: Vec<String>,
     pub visible_container_names: Vec<String>,
-    pub visible_container_ports_public: Vec<String>,
-    pub visible_container_ports_internal: Vec<String>,
-    pub visible_container_group_name: Vec<String>,
+    /// Uses Cow to avoid allocation when port is static "-"
+    pub visible_container_ports_public: Vec<Cow<'static, str>>,
+    /// Uses Cow to avoid allocation when port is static "-"
+    pub visible_container_ports_internal: Vec<Cow<'static, str>>,
+    /// Uses Cow to avoid allocation when group is static "Other"
+    pub visible_container_group_name: Vec<Cow<'static, str>>,
     pub visible_container_group_path: Vec<String>,
     pub docker_selected_row: usize,
     pub docker_rows: Vec<DockerRow>,
     pub hover_row: Option<usize>,
+    // Scroll offsets - tracked to avoid re-centering on click
+    pub process_scroll: usize,
+    pub docker_scroll: usize,
+    pub ports_scroll: usize,
+    pub node_scroll: usize,
     pub sidebar_hover: Option<usize>,
     pub context_menu: Option<ContextMenu>,
     pub visible_ports: Vec<Pid>,
     pub visible_ports_container_ids: Vec<Option<String>>,
     pub visible_node_selectable: Vec<bool>,
-    pub container_cache: HashMap<String, String>,
-    pub container_last_refresh: Instant,
     pub user_cache: HashMap<Uid, String>,
     pub user_last_refresh: Instant,
     pub docker_filtered_out: usize,
@@ -154,12 +182,37 @@ pub struct AppState {
     pub mem_available: u64,
     pub swap_total: u64,
     pub swap_used: u64,
+    pub disk_total: u64,
+    pub disk_available: u64,
     /// Maps container ID -> expected running state (true = should be running, false = should be stopped)
     pub pending_operations: HashMap<String, bool>,
     pub operation_tx: Sender<OperationComplete>,
     pub operation_rx: Receiver<OperationComplete>,
     /// Frame counter for animated spinner
     pub spinner_frame: usize,
+    /// Last time spinner was ticked
+    pub spinner_last_tick: Instant,
+    /// Cached PM2 availability status
+    pub pm2_available: bool,
+    /// Last time PM2 availability was checked
+    pub pm2_last_check: Instant,
+    /// Docker system disk usage from `docker system df`
+    pub docker_system_df: DockerSystemDf,
+    /// Last time hover was rendered (for throttling)
+    pub last_hover_render: Instant,
+    /// Pending hover row that needs rendering
+    /// Hover state for docker df stats rows (0-3 for Images, Containers, Volumes, Build Cache)
+    pub docker_df_hover: Option<usize>,
+    /// Pending prune confirmation action
+    pub pending_prune: Option<ContextMenuAction>,
+    /// Hovered choice in prune confirmation modal
+    pub pending_prune_hover: Option<PruneConfirmChoice>,
+    /// Active prune job label (shows progress spinner)
+    pub prune_in_progress: Option<String>,
+    /// Prune output modal contents
+    pub prune_output: Option<PruneOutput>,
+    /// Hover state for prune output modal close button
+    pub prune_output_hover: bool,
 }
 
 impl AppState {
@@ -190,13 +243,15 @@ impl AppState {
             docker_selected_row: 0,
             docker_rows: Vec::new(),
             hover_row: None,
+            process_scroll: 0,
+            docker_scroll: 0,
+            ports_scroll: 0,
+            node_scroll: 0,
             sidebar_hover: None,
             context_menu: None,
             visible_ports: Vec::new(),
             visible_ports_container_ids: Vec::new(),
             visible_node_selectable: Vec::new(),
-            container_cache: HashMap::new(),
-            container_last_refresh: Instant::now() - Duration::from_secs(60),
             user_cache: HashMap::new(),
             user_last_refresh: Instant::now() - Duration::from_secs(60),
             docker_filtered_out: 0,
@@ -214,18 +269,38 @@ impl AppState {
             mem_available: 0,
             swap_total: 0,
             swap_used: 0,
+            disk_total: 0,
+            disk_available: 0,
             pending_operations: HashMap::new(),
             operation_tx,
             operation_rx,
             spinner_frame: 0,
+            spinner_last_tick: Instant::now(),
+            pm2_available: false,
+            // Set to past time so first check happens immediately
+            pm2_last_check: Instant::now() - Duration::from_secs(60),
+            docker_system_df: DockerSystemDf::default(),
+            last_hover_render: Instant::now(),
+            docker_df_hover: None,
+            pending_prune: None,
+            pending_prune_hover: None,
+            prune_in_progress: None,
+            prune_output: None,
+            prune_output_hover: false,
         }
     }
 
-    /// Advance spinner animation frame, returns true if there are pending operations
+    /// Advance spinner animation frame, returns true if spinner actually changed
     pub fn tick_spinner(&mut self) -> bool {
-        if !self.pending_operations.is_empty() {
-            self.spinner_frame = self.spinner_frame.wrapping_add(1);
-            true
+        if !self.pending_operations.is_empty() || self.prune_in_progress.is_some() {
+            // Rate limit spinner updates to ~8 fps (125ms interval)
+            if self.spinner_last_tick.elapsed() >= Duration::from_millis(125) {
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                self.spinner_last_tick = Instant::now();
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -240,9 +315,22 @@ impl AppState {
     pub fn check_completed_operations(&mut self) -> bool {
         let mut any_completed = false;
         while let Ok(msg) = self.operation_rx.try_recv() {
+            if msg.container_id.starts_with("prune-") {
+                self.prune_in_progress = None;
+                if let Some(output) = msg.output.clone() {
+                    let label = msg
+                        .container_id
+                        .trim_start_matches("prune-")
+                        .replace('-', " ");
+                    self.prune_output = Some(PruneOutput { label, output });
+                    self.prune_output_hover = false;
+                }
+            }
             // Only remove from pending on failure - success keeps it pending until state matches
             if !msg.success {
                 self.pending_operations.remove(&msg.container_id);
+            }
+            if !msg.message.is_empty() {
                 self.set_message(msg.message);
             }
             any_completed = true;
@@ -274,6 +362,7 @@ impl AppState {
         any_removed
     }
 
+    #[allow(dead_code)]
     pub fn is_container_pending(&self, container_id: &str) -> bool {
         self.pending_operations.contains_key(container_id)
     }
@@ -307,6 +396,44 @@ impl AppState {
         self.view_mode = view;
         self.selected = 0;
         self.sidebar_index = sidebar_index_for_view(view);
+    }
+
+    /// Adjust scroll to keep selection visible without centering
+    pub fn adjust_scroll(&mut self, visible_height: usize, total: usize) {
+        let (scroll, selected) = match self.view_mode {
+            ViewMode::Process => (&mut self.process_scroll, self.selected),
+            ViewMode::Docker => (&mut self.docker_scroll, self.docker_selected_row),
+            ViewMode::Ports => (&mut self.ports_scroll, self.selected),
+            ViewMode::Node => (&mut self.node_scroll, self.selected),
+            ViewMode::DockerEnv => return,
+        };
+
+        // Clamp scroll to valid range
+        let max_scroll = total.saturating_sub(visible_height);
+        if *scroll > max_scroll {
+            *scroll = max_scroll;
+        }
+
+        // Scroll up if selection is above visible area
+        if selected < *scroll {
+            *scroll = selected;
+        }
+        // Scroll down if selection is below visible area
+        else if selected >= *scroll + visible_height {
+            *scroll = selected.saturating_sub(visible_height) + 1;
+        }
+    }
+
+    /// Get current scroll offset for the active view
+    #[allow(dead_code)]
+    pub fn current_scroll(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Process => self.process_scroll,
+            ViewMode::Docker => self.docker_scroll,
+            ViewMode::Ports => self.ports_scroll,
+            ViewMode::Node => self.node_scroll,
+            ViewMode::DockerEnv => 0,
+        }
     }
 
     pub(crate) fn active_filter(&self) -> &str {
