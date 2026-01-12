@@ -248,7 +248,7 @@ fn open_selected_container_env(state: &mut AppState, return_view: ViewMode) {
     let compose_name = state
         .visible_container_group_name
         .get(container_index)
-        .cloned()
+        .map(|c| c.to_string())
         .unwrap_or_else(|| "-".to_string());
     let compose_path = state
         .visible_container_group_path
@@ -258,12 +258,12 @@ fn open_selected_container_env(state: &mut AppState, return_view: ViewMode) {
     let port_public = state
         .visible_container_ports_public
         .get(container_index)
-        .cloned()
+        .map(|c| c.to_string())
         .unwrap_or_else(|| "-".to_string());
     let port_internal = state
         .visible_container_ports_internal
         .get(container_index)
-        .cloned()
+        .map(|c| c.to_string())
         .unwrap_or_else(|| "-".to_string());
 
     enter_env_view(

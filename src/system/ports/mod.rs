@@ -2,14 +2,19 @@ mod docker;
 mod proc;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::Duration;
 
 use sysinfo::{Pid, System};
 
 use crate::util::{contains_lower, Filterable};
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct PortInfo {
     pub proto: String,
     pub port: u16,
+    pub internal_port: Option<u16>,
     pub pid: Pid,
     pub name: String,
     pub exe_path: String,
@@ -18,9 +23,21 @@ pub struct PortInfo {
     pub project_name: Option<String>,
 }
 
+impl PortInfo {
+    /// Returns the port binding display string (ext:int or just port)
+    pub fn binding_display(&self) -> String {
+        match self.internal_port {
+            Some(int_port) if int_port > 0 && int_port != self.port => {
+                format!("{}:{}", self.port, int_port)
+            }
+            _ => format!("{}", self.port),
+        }
+    }
+}
+
 pub enum PortRow {
-    Group { name: String, count: usize },
-    Item { index: usize },
+    Group { name: String },
+    Item { index: usize, prefix: String },
 }
 
 impl Filterable for PortInfo {
@@ -52,13 +69,21 @@ pub fn collect_ports(system: &System) -> Vec<PortInfo> {
     }
     rows = deduped;
 
-    let mut seen_ports = HashSet::new();
+    let mut seen_ports: HashSet<(String, u16)> = HashSet::new();
     for row in &rows {
         seen_ports.insert((row.proto.clone(), row.port));
     }
 
+    // Deduplicate docker ports by (proto, port, container_id)
+    let mut seen_docker: HashSet<(String, u16, String)> = HashSet::new();
     for docker_row in docker::load_docker_port_bindings() {
+        // Skip if proc already has this port
         if seen_ports.contains(&(docker_row.proto.clone(), docker_row.port)) {
+            continue;
+        }
+        // Skip duplicate docker entries for same container+port
+        let container_id = docker_row.container_id.clone().unwrap_or_default();
+        if !seen_docker.insert((docker_row.proto.clone(), docker_row.port, container_id)) {
             continue;
         }
         rows.push(docker_row);
@@ -134,10 +159,15 @@ pub fn group_ports(ports: &[PortInfo]) -> Vec<PortRow> {
     for group in groups {
         rows.push(PortRow::Group {
             name: group.name,
-            count: group.items.len(),
         });
-        for index in group.items {
-            rows.push(PortRow::Item { index });
+        let item_count = group.items.len();
+        for (i, index) in group.items.into_iter().enumerate() {
+            let prefix = if i + 1 == item_count {
+                "  └─ ".to_string()
+            } else {
+                "  ├─ ".to_string()
+            };
+            rows.push(PortRow::Item { index, prefix });
         }
     }
 
@@ -193,4 +223,43 @@ fn display_group_label(name: &str) -> String {
     } else {
         after_colon.to_string()
     }
+}
+
+/// Background worker for collecting ports data
+pub struct PortsWorker {
+    data: Arc<RwLock<Arc<Vec<PortInfo>>>>,
+}
+
+impl PortsWorker {
+    /// Get a snapshot of the current ports data (thread-safe, no cloning)
+    pub fn snapshot(&self) -> Arc<Vec<PortInfo>> {
+        let guard = self.data.read().unwrap();
+        guard.clone()
+    }
+}
+
+/// Start a background worker that collects ports at the given interval
+pub fn start_ports_worker(interval: Duration) -> PortsWorker {
+    let data = Arc::new(RwLock::new(Arc::new(Vec::new())));
+    let thread_data = Arc::clone(&data);
+
+    thread::spawn(move || loop {
+        let mut system = System::new();
+        system.refresh_processes();
+        let new_ports = collect_ports(&system);
+
+        // Only update if data changed (avoid creating new Arc if unchanged)
+        let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
+        let current_ports: &Vec<PortInfo> = &guard;
+
+        // Simple length check first (fast), then deep compare if needed
+        if current_ports.len() != new_ports.len() || current_ports != &new_ports {
+            *guard = Arc::new(new_ports);
+        }
+
+        drop(guard);
+        thread::sleep(interval);
+    });
+
+    PortsWorker { data }
 }

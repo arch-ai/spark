@@ -3,30 +3,21 @@ mod stats;
 mod terminal;
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use crate::util::{contains_lower, Filterable};
 
-/// Container health status from Docker healthcheck
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HealthStatus {
-    /// No healthcheck configured
-    None,
-    /// Container is starting, healthcheck not yet run
-    Starting,
-    /// Healthcheck is passing
-    Healthy,
-    /// Healthcheck is failing
-    Unhealthy,
-}
-
 pub use container::{
-    container_label_for, kill_container, kill_containers, load_container_env,
-    load_docker_container_cache, restart_container, start_container, stop_container,
+    kill_container, kill_containers, load_container_env, prune_build_cache, prune_dangling_images,
+    prune_volumes, restart_container,
+    start_container, stop_container,
 };
-pub use stats::{apply_container_filter, group_containers, load_docker_stats};
+pub use stats::{
+    apply_container_filter, group_containers, load_docker_stats, load_docker_system_df,
+    DockerSystemDf,
+};
 pub use terminal::{open_container_logs, open_container_shell};
 
 /// Container information with optimized string storage.
@@ -39,15 +30,11 @@ pub struct ContainerInfo {
     pub port_public: Cow<'static, str>,
     pub port_internal: Cow<'static, str>,
     pub status: Cow<'static, str>,
-    pub cpu: f32,
-    pub memory_bytes: u64,
     pub group_name: Cow<'static, str>,
     pub group_path: Option<String>,
     pub running: bool,
     /// Seconds since last activity (lower = more recent)
     pub activity_secs: u64,
-    /// Container health status from healthcheck
-    pub health: HealthStatus,
 }
 
 impl Filterable for ContainerInfo {
@@ -76,27 +63,62 @@ pub enum DockerRow {
 }
 
 pub struct DockerStatsWorker {
-    data: Arc<Mutex<Vec<ContainerInfo>>>,
+    /// Uses RwLock for reader-priority access - main thread reads frequently,
+    /// worker thread writes infrequently
+    /// Inner Arc allows snapshot() to return without cloning the vector data
+    data: Arc<RwLock<Arc<Vec<ContainerInfo>>>>,
 }
 
 impl DockerStatsWorker {
-    pub fn snapshot(&self) -> Vec<ContainerInfo> {
-        let guard = self.data.lock().unwrap_or_else(|err| err.into_inner());
-        guard.clone()
+    /// Returns an Arc-wrapped snapshot of container data.
+    /// This is a cheap pointer clone, not a full data clone.
+    pub fn snapshot(&self) -> Arc<Vec<ContainerInfo>> {
+        // Use read lock - allows multiple concurrent readers
+        let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
+        Arc::clone(&guard)
     }
 }
 
 pub fn start_docker_stats_worker(interval: Duration) -> DockerStatsWorker {
-    let data = Arc::new(Mutex::new(Vec::new()));
+    let data = Arc::new(RwLock::new(Arc::new(Vec::new())));
     let thread_data = Arc::clone(&data);
 
     thread::spawn(move || loop {
         if let Some(stats) = load_docker_stats() {
-            let mut guard = thread_data.lock().unwrap_or_else(|err| err.into_inner());
-            *guard = stats;
+            // Use write lock - only held briefly while replacing the Arc pointer
+            let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
+            *guard = Arc::new(stats);
         }
         thread::sleep(interval);
     });
 
     DockerStatsWorker { data }
+}
+
+/// Background worker for docker system df data
+pub struct DockerSystemDfWorker {
+    data: Arc<RwLock<DockerSystemDf>>,
+}
+
+impl DockerSystemDfWorker {
+    /// Returns the current docker system df data
+    pub fn snapshot(&self) -> DockerSystemDf {
+        let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
+        guard.clone()
+    }
+}
+
+pub fn start_docker_df_worker(interval: Duration) -> DockerSystemDfWorker {
+    let data = Arc::new(RwLock::new(DockerSystemDf::default()));
+    let thread_data = Arc::clone(&data);
+
+    thread::spawn(move || loop {
+        if let Some(df) = load_docker_system_df() {
+            let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
+            *guard = df;
+        }
+        thread::sleep(interval);
+    });
+
+    DockerSystemDfWorker { data }
 }

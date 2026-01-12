@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use super::{ContainerInfo, DockerRow, HealthStatus};
+use super::{ContainerInfo, DockerRow};
 
 /// Static string constants to avoid repeated allocations
 const DASH: &str = "-";
@@ -49,43 +49,6 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
         return Some(Vec::new());
     }
 
-    // Get stats for all containers in a single call
-    let stats_output = Command::new("docker")
-        .args([
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.ID}}|{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}",
-        ])
-        .output()
-        .ok()?;
-
-    if !stats_output.status.success() {
-        return None;
-    }
-
-    // Build stats map (ID -> (cpu, mem))
-    let stats_stdout = String::from_utf8_lossy(&stats_output.stdout);
-    let mut stats_map: std::collections::HashMap<&str, (f32, u64)> =
-        std::collections::HashMap::with_capacity(container_ids.len());
-
-    for raw_line in stats_stdout.lines() {
-        let line = raw_line.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut parts = line.splitn(4, '|');
-        let id = parts.next().unwrap_or("").trim();
-        let _name = parts.next();
-        let cpu_raw = parts.next().unwrap_or("").trim();
-        let mem_raw = parts.next().unwrap_or("").trim();
-        if !id.is_empty() {
-            let cpu = parse_cpu_percent(cpu_raw).unwrap_or(0.0);
-            let mem = parse_mem_usage(mem_raw).unwrap_or(0);
-            stats_map.insert(id, (cpu, mem));
-        }
-    }
-
     // Parse metadata and combine with stats
     let mut containers = Vec::with_capacity(container_ids.len());
     for raw_line in stdout.lines() {
@@ -109,24 +72,10 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
         let (ports_public, ports_internal) = parse_docker_ports(ports_raw);
         let group = compose_group_from_labels(labels);
 
-        // Lookup stats by full ID or short ID
-        let (cpu, memory_bytes) = stats_map
-            .get(id)
-            .or_else(|| {
-                if id.len() >= 12 {
-                    stats_map.get(&id[..12])
-                } else {
-                    None
-                }
-            })
-            .copied()
-            .unwrap_or((0.0, 0));
-
         // Determine if container is running from status
         // Status starts with "Up" for running containers
         let running = status.starts_with("Up");
         let activity_secs = parse_activity_time(status);
-        let health = parse_health_status(status);
 
         containers.push(ContainerInfo {
             id: id.to_string(),
@@ -143,8 +92,6 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             } else {
                 Cow::Owned(status.to_string())
             },
-            cpu,
-            memory_bytes,
             group_name: group
                 .as_ref()
                 .map(|g| Cow::Owned(g.name.clone()))
@@ -152,7 +99,6 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             group_path: group.and_then(|g| g.path),
             running,
             activity_secs,
-            health,
         });
     }
 
@@ -303,56 +249,6 @@ fn compose_group_from_labels(labels: &str) -> Option<ComposeGroup> {
     }
 
     project.map(|name| ComposeGroup { name, path: None })
-}
-
-fn parse_cpu_percent(input: &str) -> Option<f32> {
-    let trimmed = input.trim().trim_end_matches('%').replace(',', ".");
-    trimmed.parse::<f32>().ok()
-}
-
-fn parse_mem_usage(input: &str) -> Option<u64> {
-    let mut parts = input.splitn(2, '/');
-    let used = parts.next()?.trim();
-    parse_docker_size(used)
-}
-
-fn parse_docker_size(input: &str) -> Option<u64> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut number = String::new();
-    let mut unit = String::new();
-    for ch in trimmed.chars() {
-        if ch.is_ascii_digit() || ch == '.' || ch == ',' {
-            number.push(ch);
-        } else if !ch.is_whitespace() {
-            unit.push(ch);
-        }
-    }
-
-    if number.is_empty() {
-        return None;
-    }
-
-    let normalized = number.replace(',', ".");
-    let value: f64 = normalized.parse().ok()?;
-    let unit_norm = unit.to_ascii_lowercase();
-    let multiplier = match unit_norm.as_str() {
-        "" | "b" => 1.0,
-        "kb" => 1_000.0,
-        "mb" => 1_000_000.0,
-        "gb" => 1_000_000_000.0,
-        "tb" => 1_000_000_000_000.0,
-        "kib" => 1024.0,
-        "mib" => 1024.0 * 1024.0,
-        "gib" => 1024.0 * 1024.0 * 1024.0,
-        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-
-    Some((value * multiplier) as u64)
 }
 
 fn parse_docker_ports(raw: &str) -> (Cow<'static, str>, Cow<'static, str>) {
@@ -507,18 +403,100 @@ fn parse_duration_string(input: &str) -> u64 {
     number.saturating_mul(multiplier)
 }
 
-/// Parse health status from Docker status string.
-/// Status contains "(healthy)", "(unhealthy)", "(health: starting)" when healthcheck is configured.
-fn parse_health_status(status: &str) -> HealthStatus {
-    let status_lower = status.to_lowercase();
+/// Docker system disk usage information from `docker system df`
+#[derive(Clone, Debug, Default)]
+pub struct DockerSystemDf {
+    pub images_total: u32,
+    pub images_active: u32,
+    pub images_size: String,
+    pub images_reclaimable: String,
+    pub images_reclaimable_pct: String,
+    pub containers_total: u32,
+    pub containers_active: u32,
+    pub containers_size: String,
+    pub containers_reclaimable: String,
+    pub containers_reclaimable_pct: String,
+    pub volumes_total: u32,
+    pub volumes_active: u32,
+    pub volumes_size: String,
+    pub volumes_reclaimable: String,
+    pub volumes_reclaimable_pct: String,
+    pub build_cache_total: u64,
+    pub build_cache_size: String,
+    pub build_cache_reclaimable: String,
+    pub build_cache_reclaimable_pct: String,
+}
 
-    if status_lower.contains("(healthy)") {
-        HealthStatus::Healthy
-    } else if status_lower.contains("(unhealthy)") {
-        HealthStatus::Unhealthy
-    } else if status_lower.contains("(health: starting)") || status_lower.contains("(starting)") {
-        HealthStatus::Starting
+/// Load docker system disk usage using `docker system df`
+pub fn load_docker_system_df() -> Option<DockerSystemDf> {
+    let output = Command::new("docker")
+        .args(["system", "df", "--format", "{{.Type}}|{{.TotalCount}}|{{.Active}}|{{.Size}}|{{.Reclaimable}}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut df = DockerSystemDf::default();
+
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let mut parts = line.splitn(5, '|');
+        let type_ = parts.next().unwrap_or("").trim();
+        let total = parts.next().unwrap_or("").trim();
+        let active = parts.next().unwrap_or("").trim();
+        let size = parts.next().unwrap_or("").trim();
+        let reclaimable = parts.next().unwrap_or("").trim();
+
+        // Parse reclaimable to get percentage (e.g., "19.87GB (41%)")
+        let (reclaimable_val, reclaimable_pct) = parse_reclaimable(reclaimable);
+
+        match type_ {
+            "Images" => {
+                df.images_total = total.parse().unwrap_or(0);
+                df.images_active = active.parse().unwrap_or(0);
+                df.images_size = size.to_string();
+                df.images_reclaimable = reclaimable_val.to_string();
+                df.images_reclaimable_pct = reclaimable_pct.to_string();
+            }
+            "Containers" => {
+                df.containers_total = total.parse().unwrap_or(0);
+                df.containers_active = active.parse().unwrap_or(0);
+                df.containers_size = size.to_string();
+                df.containers_reclaimable = reclaimable_val.to_string();
+                df.containers_reclaimable_pct = reclaimable_pct.to_string();
+            }
+            "Local Volumes" => {
+                df.volumes_total = total.parse().unwrap_or(0);
+                df.volumes_active = active.parse().unwrap_or(0);
+                df.volumes_size = size.to_string();
+                df.volumes_reclaimable = reclaimable_val.to_string();
+                df.volumes_reclaimable_pct = reclaimable_pct.to_string();
+            }
+            "Build Cache" => {
+                df.build_cache_total = total.parse().unwrap_or(0);
+                df.build_cache_size = size.to_string();
+                df.build_cache_reclaimable = reclaimable_val.to_string();
+                df.build_cache_reclaimable_pct = reclaimable_pct.to_string();
+            }
+            _ => {}
+        }
+    }
+
+    Some(df)
+}
+
+fn parse_reclaimable(input: &str) -> (&str, &str) {
+    // Input format: "19.87GB (41%)" or just "19.87GB"
+    if let Some(idx) = input.find('(') {
+        (&input[..idx].trim(), &input[idx + 1..].trim_end_matches(')'))
     } else {
-        HealthStatus::None
+        (input.trim(), "")
     }
 }
