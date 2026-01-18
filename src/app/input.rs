@@ -2,14 +2,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use sysinfo::System;
 
 use crate::app::actions::{
-    kill_selected_in_docker, kill_selected_port_process, kill_selected_process, open_selected_container,
-    open_selected_container_logs, open_selected_env,
+    enter_env_view, kill_selected_in_docker, kill_selected_port_process, kill_selected_process,
+    open_selected_container, open_selected_container_logs, open_selected_env, start_log_fetch,
 };
-use crate::app::state::{view_for_sidebar_index, ContextMenu, ContextMenuAction, ContextMenuTarget, Focus, InputMode, OperationComplete, PruneConfirmChoice, SortBy, ViewMode};
+use crate::app::state::{view_for_sidebar_index, ContextMenu, ContextMenuAction, ContextMenuTarget, Focus, InputMode, LogSource, OperationComplete, PruneConfirmChoice, SortBy, ViewMode};
 use crate::app::AppState;
 use crate::system::docker::{ContainerInfo, DockerRow};
+use crate::system::node::open_path_location;
+use crate::system::process::{self, load_process_logs};
 
-pub(crate) fn handle_key_event(key: KeyEvent, state: &mut AppState, system: &mut System) -> bool {
+pub(crate) fn handle_key_event(
+    key: KeyEvent,
+    state: &mut AppState,
+    system: &mut System,
+    pm2_view: &[crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
+) -> bool {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
@@ -37,6 +45,46 @@ pub(crate) fn handle_key_event(key: KeyEvent, state: &mut AppState, system: &mut
         }
         return false;
     }
+    if state.log_output.is_some() {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            state.clear_log_state();
+        } else if let Some((viewport_w, viewport_h)) = log_modal_inner_size(state) {
+            match key.code {
+                KeyCode::Up => {
+                    apply_log_scroll(state, -1, viewport_w, viewport_h);
+                }
+                KeyCode::Down => {
+                    apply_log_scroll(state, 1, viewport_w, viewport_h);
+                }
+                KeyCode::PageUp => {
+                    let delta = viewport_h.saturating_sub(1) as i32;
+                    apply_log_scroll(state, -(delta.max(1)), viewport_w, viewport_h);
+                }
+                KeyCode::PageDown => {
+                    let delta = viewport_h.saturating_sub(1) as i32;
+                    apply_log_scroll(state, delta.max(1), viewport_w, viewport_h);
+                }
+                KeyCode::Home => {
+                    state.log_scroll = 0;
+                    state.log_follow = false;
+                    state.log_last_scroll = std::time::Instant::now();
+                }
+                KeyCode::End => {
+                    state.log_follow = true;
+                    state.log_scroll = state.log_max_scroll(viewport_w, viewport_h);
+                    state.log_last_scroll = std::time::Instant::now();
+                }
+                _ => {}
+            }
+        }
+        return false;
+    }
+    if state.env_modal_open {
+        return handle_env_modal_mode(key, state);
+    }
+    if state.log_in_progress.is_some() {
+        return false;
+    }
     // Close context menu on Escape
     if state.context_menu.is_some() && key.code == KeyCode::Esc {
         state.context_menu = None;
@@ -48,12 +96,18 @@ pub(crate) fn handle_key_event(key: KeyEvent, state: &mut AppState, system: &mut
     }
 
     match state.input_mode {
-        InputMode::Normal => handle_normal_mode(key, state, system),
+        InputMode::Normal => handle_normal_mode(key, state, system, pm2_view, pm2_rows),
         InputMode::Filter => handle_filter_mode(key, state),
     }
 }
 
-fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) -> bool {
+fn handle_normal_mode(
+    key: KeyEvent,
+    state: &mut AppState,
+    system: &mut System,
+    pm2_view: &[crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
+) -> bool {
     let list_len = match state.view_mode {
         ViewMode::Process => state.visible_pids.len(),
         ViewMode::Docker => state.visible_containers.len(),
@@ -75,6 +129,40 @@ fn handle_normal_mode(key: KeyEvent, state: &mut AppState, system: &mut System) 
                     request_prune_confirmation(state, ContextMenuAction::PruneVolumes);
                 }
                 _ => {}
+            }
+        } else if state.view_mode == ViewMode::Node && state.pm2_available {
+            if let Some(pm2_idx) = state.pm2_hover_row {
+                if let Some(proc) = pm2_rows.get(pm2_idx).and_then(|idx| pm2_view.get(*idx)) {
+                    match key.code {
+                        KeyCode::Char('r') => {
+                            state.set_message(format!("Restarting PM2 {}...", proc.name));
+                            let _ = crate::system::node::pm2_restart(proc.pm_id);
+                        }
+                        KeyCode::Char('s') => {
+                            state.set_message(format!("Stopping PM2 {}...", proc.name));
+                            let _ = crate::system::node::pm2_stop(proc.pm_id);
+                        }
+                        KeyCode::Char('t') => {
+                            state.set_message(format!("Starting PM2 {}...", proc.name));
+                            let _ = crate::system::node::pm2_start(proc.pm_id);
+                        }
+                        KeyCode::Char('o') => {
+                            if let Some(path) = proc.script.as_deref() {
+                                let dir = std::path::Path::new(path)
+                                    .parent()
+                                    .unwrap_or_else(|| std::path::Path::new(path));
+                                if let Err(err) = crate::system::node::open_path_location(dir) {
+                                    state.set_message(format!("Failed to open dir: {}", err));
+                                } else {
+                                    state.set_message("Opened script location.");
+                                }
+                            } else {
+                                state.set_message("No script path for this PM2 process.");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         return false;
@@ -330,6 +418,36 @@ fn handle_env_mode(key: KeyEvent, state: &mut AppState) -> bool {
     false
 }
 
+fn handle_env_modal_mode(key: KeyEvent, state: &mut AppState) -> bool {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            state.env_modal_open = false;
+            state.env_modal_hover = false;
+            state.input_mode = InputMode::Normal;
+        }
+        KeyCode::Up => {
+            if state.env_selected > 0 {
+                state.env_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if state.env_selected + 1 < state.env_vars.len() {
+                state.env_selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            state.env_selected = state.env_selected.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            if !state.env_vars.is_empty() {
+                state.env_selected = (state.env_selected + 10).min(state.env_vars.len() - 1);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn move_ports_selection(state: &mut AppState, direction: isize) -> bool {
     if direction == 0 {
         return false;
@@ -416,6 +534,8 @@ pub(crate) fn handle_mouse_event(
     state: &mut AppState,
     containers: &[crate::system::docker::ContainerInfo],
     ports: &[crate::system::ports::PortInfo],
+    pm2_view: &[crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
     terminal_width: u16,
     terminal_height: u16,
 ) -> bool {
@@ -434,6 +554,15 @@ pub(crate) fn handle_mouse_event(
     if state.prune_output.is_some() {
         return handle_prune_output_mouse(mouse, state, main_x, main_width, height);
     }
+    if state.env_modal_open {
+        return handle_env_modal_mouse(mouse, state, main_x, main_width, height);
+    }
+    if state.log_output.is_some() {
+        return handle_log_output_mouse(mouse, state, main_x, main_width, height);
+    }
+    if state.log_in_progress.is_some() {
+        return true;
+    }
 
     // If context menu is open, handle it first
     if let Some(ref menu) = state.context_menu {
@@ -443,7 +572,7 @@ pub(crate) fn handle_mouse_event(
                 if let Some(action) = get_menu_action_at(menu, x, y) {
                     let target = menu.target.clone();
                     state.context_menu = None;
-                    execute_context_action(state, action, &target, containers);
+                    execute_context_action(state, action, &target, containers, pm2_view, pm2_rows);
                     return true;
                 }
                 // Click outside menu - close it
@@ -479,7 +608,7 @@ pub(crate) fn handle_mouse_event(
             if show_sidebar && x < SIDEBAR_WIDTH {
                 handle_sidebar_click(state, y);
             } else {
-                handle_main_click(state, x.saturating_sub(main_x), y, main_width, height);
+                handle_main_click(state, x.saturating_sub(main_x), y, main_width, height, pm2_rows);
             }
             true
         }
@@ -499,7 +628,7 @@ pub(crate) fn handle_mouse_event(
                     true
                 }
                 ViewMode::Node => {
-                    handle_node_right_click(state, x, y, width, height, main_x);
+                    handle_node_right_click(state, x, y, width, height, main_x, pm2_view, pm2_rows);
                     true
                 }
                 _ => false
@@ -508,7 +637,7 @@ pub(crate) fn handle_mouse_event(
         MouseEventKind::Moved => {
             // Throttle hover re-renders to avoid excessive CPU usage
             use std::time::Duration;
-            const HOVER_RENDER_INTERVAL: Duration = Duration::from_millis(8); // ~60fps max
+            const HOVER_RENDER_INTERVAL: Duration = Duration::from_millis(4); // ~120fps max
 
             if state.last_hover_render.elapsed() < HOVER_RENDER_INTERVAL {
                 // Update pending hover row but don't trigger render yet
@@ -516,7 +645,7 @@ pub(crate) fn handle_mouse_event(
                     state.docker_df_hover = None;
                     handle_sidebar_hover(state, y);
                 } else {
-                    handle_main_hover(state, x.saturating_sub(main_x), y, height);
+                handle_main_hover(state, x.saturating_sub(main_x), y, height, pm2_rows);
                 }
                 // Don't trigger render, will happen on next tick or when interval expires
                 return false;
@@ -534,9 +663,12 @@ pub(crate) fn handle_mouse_event(
             } else {
                 let old_hover = state.hover_row;
                 let old_df_hover = state.docker_df_hover;
+                let old_pm2_hover = state.pm2_hover_row;
                 state.sidebar_hover = None;
-                handle_main_hover(state, x.saturating_sub(main_x), y, height);
-                state.hover_row != old_hover || state.docker_df_hover != old_df_hover
+                handle_main_hover(state, x.saturating_sub(main_x), y, height, pm2_rows);
+                state.hover_row != old_hover
+                    || state.docker_df_hover != old_df_hover
+                    || state.pm2_hover_row != old_pm2_hover
             }
         }
         MouseEventKind::ScrollUp => {
@@ -664,7 +796,14 @@ fn handle_scroll(state: &mut AppState, direction: isize) {
     }
 }
 
-fn handle_main_click(state: &mut AppState, x: u16, y: u16, width: u16, height: u16) {
+fn handle_main_click(
+    state: &mut AppState,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    pm2_rows: &[usize],
+) {
     // Dismiss context menu if clicking elsewhere
     if state.context_menu.is_some() {
         state.context_menu = None;
@@ -693,7 +832,21 @@ fn handle_main_click(state: &mut AppState, x: u16, y: u16, width: u16, height: u
         ViewMode::Process => 13,
         ViewMode::Docker => 16,
         ViewMode::Ports => 9,
-        ViewMode::Node => 9,
+        ViewMode::Node => {
+            if state.pm2_available {
+                let (pm2_start, pm2_height, node_start, node_height) = node_table_bounds(height);
+                if pm2_height > 0 && y >= pm2_start && y < pm2_start + pm2_height {
+                    return;
+                }
+                if node_height > 0 && y >= node_start && y < node_start + node_height {
+                    node_start + 2
+                } else {
+                    return;
+                }
+            } else {
+                9
+            }
+        }
         ViewMode::DockerEnv => {
             // EnvView: 3 (title) + 5 (info) + 2 (table border+header) = 10
             if y >= 10 {
@@ -762,6 +915,27 @@ fn handle_main_click(state: &mut AppState, x: u16, y: u16, width: u16, height: u
             }
         }
         ViewMode::Node => {
+            if state.pm2_available {
+                let (pm2_start, pm2_height, node_start, node_height) = node_table_bounds(height);
+                let pm2_list_start = pm2_start + 2;
+                if pm2_height > 0 && y >= pm2_list_start && y < pm2_start + pm2_height {
+                    let pm2_visible_height = pm2_height.saturating_sub(2) as usize;
+                    if pm2_visible_height == 0 {
+                        return;
+                    }
+                    let pm2_clicked_row = (y - pm2_list_start) as usize;
+                    let pm2_target = state.pm2_scroll + pm2_clicked_row;
+                    if pm2_target < pm2_rows.len() {
+                        state.pm2_hover_row = Some(pm2_target);
+                    } else {
+                        state.pm2_hover_row = None;
+                    }
+                    return;
+                }
+                if node_height == 0 || y < node_start + 2 {
+                    return;
+                }
+            }
             let total = state.visible_pids.len();
             let target_row = state.node_scroll + clicked_visual_row;
             if target_row < total && state.is_node_selectable_row(target_row) {
@@ -772,7 +946,13 @@ fn handle_main_click(state: &mut AppState, x: u16, y: u16, width: u16, height: u
     }
 }
 
-fn handle_main_hover(state: &mut AppState, _x: u16, y: u16, height: u16) {
+fn handle_main_hover(
+    state: &mut AppState,
+    _x: u16,
+    y: u16,
+    height: u16,
+    pm2_rows: &[usize],
+) {
     // Docker df stats area: title(3) + header(1) + search(3) = 7, df stats is 7 rows
     // Data rows start at row 9 (0-indexed: 9, 10, 11, 12 for Images, Containers, Volumes, Build Cache)
     if state.view_mode == ViewMode::Docker && y >= 9 && y < 13 {
@@ -784,6 +964,26 @@ fn handle_main_hover(state: &mut AppState, _x: u16, y: u16, height: u16) {
         }
     } else if state.docker_df_hover.is_some() {
         state.docker_df_hover = None;
+    }
+
+    if state.view_mode != ViewMode::Node || !state.pm2_available {
+        state.pm2_hover_row = None;
+    }
+
+    if state.view_mode == ViewMode::Node && state.pm2_available {
+        let (pm2_start, pm2_height, node_start, node_height) = node_table_bounds(height);
+        if pm2_height > 0 && y >= pm2_start && y < pm2_start + pm2_height {
+            handle_pm2_hover(state, y, pm2_start, pm2_height, pm2_rows);
+            state.hover_row = None;
+            return;
+        }
+        state.pm2_hover_row = None;
+        if node_height > 0 && y >= node_start && y < node_start + node_height {
+            handle_node_hover(state, y, node_start, node_height);
+            return;
+        }
+        state.hover_row = None;
+        return;
     }
 
     // Row offsets for ratatui layout:
@@ -862,6 +1062,64 @@ fn handle_main_hover(state: &mut AppState, _x: u16, y: u16, height: u16) {
             }
         }
         ViewMode::DockerEnv => {}
+    }
+}
+
+fn node_table_bounds(height: u16) -> (u16, u16, u16, u16) {
+    let table_top = 7u16; // title(3) + header(1) + search(3)
+    let help_height = 2u16;
+    let available = height.saturating_sub(table_top + help_height);
+    let mut pm2_height = available / 2;
+    if pm2_height < 5 {
+        pm2_height = available.min(5);
+    }
+    let mut node_height = available.saturating_sub(pm2_height);
+    if node_height < 5 {
+        let deficit = 5u16.saturating_sub(node_height);
+        if pm2_height > deficit {
+            pm2_height = pm2_height.saturating_sub(deficit);
+            node_height = node_height.saturating_add(deficit);
+        }
+    }
+    let pm2_start = table_top;
+    let node_start = table_top + pm2_height;
+    (pm2_start, pm2_height, node_start, node_height)
+}
+
+fn handle_pm2_hover(state: &mut AppState, y: u16, table_start: u16, table_height: u16, pm2_rows: &[usize]) {
+    let list_start = table_start + 2;
+    let visible_height = table_height.saturating_sub(2) as usize;
+    if y < list_start || visible_height == 0 {
+        state.pm2_hover_row = None;
+        return;
+    }
+    let hovered_visual_row = (y - list_start) as usize;
+    let target_row = state.pm2_scroll + hovered_visual_row;
+    if target_row < pm2_rows.len() {
+        state.pm2_hover_row = Some(target_row);
+    } else {
+        state.pm2_hover_row = None;
+    }
+}
+
+fn handle_node_hover(state: &mut AppState, y: u16, table_start: u16, table_height: u16) {
+    let list_start = table_start + 2;
+    if y < list_start {
+        state.hover_row = None;
+        return;
+    }
+    let hovered_visual_row = (y - list_start) as usize;
+    let visible_height = table_height.saturating_sub(2) as usize;
+    if visible_height == 0 {
+        state.hover_row = None;
+        return;
+    }
+    let total = state.visible_pids.len();
+    let target_row = state.node_scroll + hovered_visual_row;
+    if target_row < total && state.is_node_selectable_row(target_row) {
+        state.hover_row = Some(target_row);
+    } else {
+        state.hover_row = None;
     }
 }
 
@@ -983,8 +1241,13 @@ fn handle_docker_right_click(
                 name: container.name.clone(),
                 running: container.running,
             };
+            let has_compose_cwd = container
+                .group_path
+                .as_deref()
+                .map(|path| !path.is_empty())
+                .unwrap_or(false);
             // Single container - show relevant actions
-            let items = if container.running {
+            let mut items = if container.running {
                 vec![
                     ContextMenuAction::Shell,
                     ContextMenuAction::Logs,
@@ -999,6 +1262,10 @@ fn handle_docker_right_click(
                     ContextMenuAction::Start,
                 ]
             };
+            if has_compose_cwd {
+                let insert_idx = if container.running { 3 } else { 2 };
+                items.insert(insert_idx.min(items.len()), ContextMenuAction::OpenLocation);
+            }
             (target, items, false, Some(format!("Container: {}", container.name)))
         }
         DockerRow::Separator => return,
@@ -1066,6 +1333,7 @@ fn handle_process_right_click(
     let items = vec![
         ContextMenuAction::Kill,
         ContextMenuAction::Env,
+        ContextMenuAction::Logs,
     ];
 
     // Position menu within terminal bounds
@@ -1174,6 +1442,7 @@ fn handle_ports_right_click(
         let items = vec![
             ContextMenuAction::Kill,
             ContextMenuAction::Env,
+            ContextMenuAction::Logs,
         ];
 
         (target, items)
@@ -1224,9 +1493,67 @@ fn handle_node_right_click(
     width: u16,
     height: u16,
     _main_x: u16,
+    pm2_view: &[crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
 ) {
+    if state.pm2_available {
+        let (pm2_start, pm2_height, node_start, node_height) = node_table_bounds(height);
+        if pm2_height > 0 && y >= pm2_start && y < pm2_start + pm2_height {
+            let list_start = pm2_start + 2;
+            if y < list_start {
+                return;
+            }
+            let clicked_visual_row = (y - list_start) as usize;
+            let visible_height = pm2_height.saturating_sub(2) as usize;
+            if visible_height == 0 {
+                return;
+            }
+            let target_row = state.pm2_scroll + clicked_visual_row;
+            if target_row >= pm2_rows.len() {
+                return;
+            }
+            let proc = &pm2_view[pm2_rows[target_row]];
+            let target = ContextMenuTarget::Pm2 {
+                pm_id: proc.pm_id,
+                name: proc.name.clone(),
+            };
+            let status_lower = proc.status.to_lowercase();
+            let mut items = Vec::new();
+            if status_lower == "online" || status_lower == "launching" || status_lower == "starting" {
+                items.push(ContextMenuAction::Stop);
+                items.push(ContextMenuAction::Restart);
+            } else {
+                items.push(ContextMenuAction::Start);
+            }
+            items.push(ContextMenuAction::Logs);
+            if proc.pid.is_some() {
+                items.push(ContextMenuAction::Env);
+            }
+            items.push(ContextMenuAction::OpenLocation);
+            let (menu_x, menu_y) = position_context_menu(x, y, items.len(), width, height);
+            state.context_menu = Some(ContextMenu {
+                x: menu_x,
+                y: menu_y,
+                items,
+                hover: Some(0),
+                target,
+                is_group: false,
+                header: Some(format!("PM2: {}", proc.name)),
+            });
+            return;
+        }
+        if node_height == 0 || y < node_start || y >= node_start + node_height {
+            return;
+        }
+    }
+
     // Node view: 3 + 1 + 3 + 2 = 9
-    let list_start: u16 = 9;
+    let list_start: u16 = if state.pm2_available {
+        let (_, _, node_start, _) = node_table_bounds(height);
+        node_start + 2
+    } else {
+        9
+    };
     if y < list_start {
         return;
     }
@@ -1268,6 +1595,7 @@ fn handle_node_right_click(
     let items = vec![
         ContextMenuAction::Kill,
         ContextMenuAction::Env,
+        ContextMenuAction::Logs,
     ];
 
     // Position menu within terminal bounds
@@ -1309,17 +1637,88 @@ fn execute_context_action(
     action: ContextMenuAction,
     target: &ContextMenuTarget,
     containers: &[ContainerInfo],
+    pm2_view: &[crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
 ) {
     // Handle process-specific actions
     if let ContextMenuTarget::Process { pid, name } = target {
         match action {
             ContextMenuAction::Kill => {
                 use sysinfo::{Pid, Signal, System};
+
+                // Check if this process is managed by PM2
+                if crate::system::node::is_pm2_running() {
+                    if let Ok(pm2_procs) = crate::system::node::load_pm2_processes() {
+                        if let Some(pm2_proc) = pm2_procs.iter().find(|p| p.pid == Some(*pid)) {
+                            match crate::system::node::pm2_stop(pm2_proc.pm_id) {
+                                Ok(()) => {
+                                    state.set_message(format!("Stopped PM2 process {} ({})", pm2_proc.name, name));
+                                }
+                                Err(err) => {
+                                    state.set_message(format!("Failed to stop PM2 process: {}", err));
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+
                 let mut sys = System::new();
                 sys.refresh_processes();
                 let sysinfo_pid = Pid::from_u32(*pid);
+
+                // Check if this process is managed by nodemon/tsx/ts-node-dev
                 if let Some(process) = sys.process(sysinfo_pid) {
-                    if process.kill_with(Signal::Term).unwrap_or(false) {
+                    if let Some(parent_pid) = process.parent() {
+                        if let Some(parent) = sys.process(parent_pid) {
+                            let parent_name = parent.name().to_lowercase();
+                            if parent_name.contains("nodemon")
+                                || parent_name.contains("tsx")
+                                || parent_name.contains("ts-node-dev")
+                                || parent_name.contains("node-dev") {
+                                // Kill the supervisor parent instead
+                                let supervisor_name = parent.name().to_string();
+                                let mut killed = parent.kill_with(Signal::Term).unwrap_or(false);
+                                if !killed {
+                                    state.set_message(format!("Failed to signal {} (PID {})", supervisor_name, parent_pid));
+                                    return;
+                                }
+
+                                std::thread::sleep(std::time::Duration::from_millis(200));
+                                sys.refresh_processes();
+                                if sys.process(parent_pid).is_some() {
+                                    if let Some(process) = sys.process(parent_pid) {
+                                        killed = process.kill_with(Signal::Kill).unwrap_or(false);
+                                    }
+                                }
+
+                                if killed {
+                                    state.set_message(format!("Killed {} (PID {}) and child process", supervisor_name, parent_pid));
+                                } else {
+                                    state.set_message(format!("Failed to kill {} (PID {})", supervisor_name, parent_pid));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(process) = sys.process(sysinfo_pid) {
+                    let mut killed = process.kill_with(Signal::Term).unwrap_or(false);
+                    if !killed {
+                        state.set_message(format!("Failed to signal {}", name));
+                        return;
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    sys.refresh_processes();
+                    if sys.process(sysinfo_pid).is_some() {
+                        if let Some(process) = sys.process(sysinfo_pid) {
+                            killed = process.kill_with(Signal::Kill).unwrap_or(false);
+                        }
+                    }
+
+                    if killed {
                         state.set_message(format!("Killed {}", name));
                     } else {
                         state.set_message(format!("Failed to kill {}", name));
@@ -1329,28 +1728,45 @@ fn execute_context_action(
                 }
             }
             ContextMenuAction::Env => {
-                use std::fs;
-                let env_path = format!("/proc/{}/environ", pid);
-                match fs::read(&env_path) {
-                    Ok(data) => {
-                        let env_vars: Vec<String> = data
-                            .split(|&b| b == 0)
-                            .filter(|s| !s.is_empty())
-                            .filter_map(|s| String::from_utf8(s.to_vec()).ok())
-                            .collect();
-                        state.env_vars = env_vars;
-                        state.env_title = format!("ENV: {}", name);
-                        state.env_info_left1 = format!("Process: {}", name);
-                        state.env_info_right1 = format!("PID: {}", pid);
-                        state.env_info_left2 = "-".to_string();
-                        state.env_info_right2 = "-".to_string();
-                        state.env_selected = 0;
-                        // Return to the view we came from
-                        state.env_return_view = state.view_mode;
-                        state.view_mode = ViewMode::DockerEnv;
+                let title = "PROCESS ENV";
+                enter_env_view(
+                    state,
+                    state.view_mode,
+                    title,
+                    format!("Process: {}", name),
+                    format!("PID: {}", pid),
+                    "-".to_string(),
+                    "-".to_string(),
+                );
+                match process::load_process_env(sysinfo::Pid::from_u32(*pid)) {
+                    Ok(envs) => state.env_vars = envs,
+                    Err(err) => {
+                        state.env_vars = vec![format!("Failed to load env: {err}")];
+                    }
+                }
+            }
+            ContextMenuAction::Logs => {
+                let pid = *pid;
+                let title = format!("Process logs: {}", name);
+                start_log_fetch(
+                    state,
+                    title,
+                    LogSource::Process { pid },
+                    move || load_process_logs(pid),
+                );
+            }
+            ContextMenuAction::OpenLocation => {
+                let path = std::fs::read_link(format!("/proc/{}/cwd", pid));
+                match path {
+                    Ok(path) => {
+                        if let Err(err) = open_path_location(&path) {
+                            state.set_message(format!("Failed to open dir: {}", err));
+                        } else {
+                            state.set_message("Opened process directory.");
+                        }
                     }
                     Err(_) => {
-                        state.set_message(format!("Failed to read env for {}", name));
+                        state.set_message(format!("Failed to read cwd for {}", name));
                     }
                 }
             }
@@ -1359,13 +1775,82 @@ fn execute_context_action(
         return;
     }
 
+    if let ContextMenuTarget::Pm2 { pm_id, name } = target {
+        match action {
+            ContextMenuAction::Logs => {
+                let pm_id = *pm_id;
+                let title = format!("PM2 logs: {}", name);
+                start_log_fetch(
+                    state,
+                    title,
+                    LogSource::Pm2 { pm_id },
+                    move || crate::system::node::load_pm2_logs(pm_id),
+                );
+            }
+            ContextMenuAction::Env => {
+                if let Some(proc) = pm2_view_for_target(pm2_view, pm2_rows, *pm_id) {
+                    open_pm2_env(state, proc);
+                } else {
+                    state.set_message("PM2 process not found.");
+                }
+            }
+            ContextMenuAction::Start => {
+                state.set_message(format!("Starting PM2 {}...", name));
+                let _ = crate::system::node::pm2_start(*pm_id);
+            }
+            ContextMenuAction::Stop => {
+                state.set_message(format!("Stopping PM2 {}...", name));
+                let _ = crate::system::node::pm2_stop(*pm_id);
+            }
+            ContextMenuAction::Restart => {
+                state.set_message(format!("Restarting PM2 {}...", name));
+                let _ = crate::system::node::pm2_restart(*pm_id);
+            }
+            ContextMenuAction::OpenLocation => {
+                if let Some(proc) = pm2_view_for_target(pm2_view, pm2_rows, *pm_id) {
+                    open_pm2_location(state, proc);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if let ContextMenuTarget::Container { id, name, .. } = target {
+        if matches!(action, ContextMenuAction::OpenLocation) {
+            let compose_path = containers
+                .iter()
+                .find(|container| container.id == *id)
+                .and_then(|container| container.group_path.as_deref());
+
+            if let Some(path) = compose_path {
+                if let Err(err) = open_path_location(std::path::Path::new(path)) {
+                    state.set_message(format!("Failed to open dir: {}", err));
+                } else {
+                    state.set_message("Opened compose working directory.");
+                }
+            } else {
+                state.set_message(format!("No compose working directory for {}", name));
+            }
+            return;
+        }
+    }
+
     // Handle container-only actions
     if action.is_container_only() {
         if let ContextMenuTarget::Container { id, name, .. } = target {
             match action {
                 ContextMenuAction::Logs => {
-                    state.set_message(format!("Opening logs for {}...", name));
-                    let _ = crate::system::docker::open_container_logs(id);
+                    let title = format!("Docker logs: {}", name);
+                    let id = id.clone();
+                    start_log_fetch(
+                        state,
+                        title,
+                        LogSource::Docker {
+                            container_id: id.clone(),
+                        },
+                        move || crate::system::docker::load_container_logs(&id),
+                    );
                 }
                 ContextMenuAction::Shell => {
                     state.set_message(format!("Opening shell in {}...", name));
@@ -1375,14 +1860,15 @@ fn execute_context_action(
                     match crate::system::docker::load_container_env(id) {
                         Ok(env_vars) => {
                             state.env_vars = env_vars;
-                            state.env_title = format!("ENV: {}", name);
-                            state.env_info_left1 = format!("Container: {}", name);
-                            state.env_info_right1 = format!("ID: {}", &id[..12.min(id.len())]);
-                            state.env_info_left2 = "-".to_string();
-                            state.env_info_right2 = "-".to_string();
-                            state.env_selected = 0;
-                            state.env_return_view = ViewMode::Docker;
-                            state.view_mode = ViewMode::DockerEnv;
+                            enter_env_view(
+                                state,
+                                ViewMode::Docker,
+                                "CONTAINER ENV",
+                                format!("Container: {}", name),
+                                format!("ID: {}", &id[..12.min(id.len())]),
+                                "-".to_string(),
+                                "-".to_string(),
+                            );
                         }
                         Err(_) => {
                             state.set_message(format!("Failed to load env for {}", name));
@@ -1436,6 +1922,7 @@ fn execute_context_action(
             });
         });
         }
+        ContextMenuTarget::Pm2 { .. } => {}
         ContextMenuTarget::Group { name, path } => {
             // Find all containers in this group
             let group_containers: Vec<_> = containers
@@ -1484,6 +1971,99 @@ fn execute_context_action(
         ContextMenuTarget::Process { .. } => {}
         ContextMenuTarget::DockerDf => {}
     }
+}
+
+fn pm2_view_for_target<'a>(
+    pm2_view: &'a [crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
+    pm_id: u32,
+) -> Option<&'a crate::system::node::Pm2Process> {
+    pm2_rows
+        .iter()
+        .filter_map(|idx| pm2_view.get(*idx))
+        .find(|proc| proc.pm_id == pm_id)
+}
+
+fn open_pm2_env(state: &mut AppState, proc: &crate::system::node::Pm2Process) {
+    let pid = proc.pid;
+    let script = proc.script.as_deref().unwrap_or("-");
+    let cwd = proc.cwd.as_deref().unwrap_or("-");
+    let title = format!("PM2 ENV: {}", proc.name);
+    enter_env_view(
+        state,
+        ViewMode::Node,
+        &title,
+        format!("PM2: {}", proc.name),
+        if let Some(pid) = pid {
+            format!("PID: {} | PM2: {}", pid, proc.pm_id)
+        } else {
+            format!("PM2 ID: {}", proc.pm_id)
+        },
+        format!("Script: {}", script),
+        format!("CWD: {}", cwd),
+    );
+
+    if let Some(pid) = pid {
+        match process::load_process_env(sysinfo::Pid::from_u32(pid)) {
+            Ok(envs) => state.env_vars = envs,
+            Err(err) => {
+                state.env_vars = vec![format!("Failed to load env: {err}")];
+            }
+        }
+    } else {
+        match crate::system::node::load_pm2_env(proc.pm_id) {
+            Ok(envs) if envs.is_empty() => {
+                state.env_vars = vec!["No env data from PM2.".to_string()];
+            }
+            Ok(envs) => state.env_vars = envs,
+            Err(err) => {
+                state.env_vars = vec![format!("Failed to load PM2 env: {err}")];
+            }
+        }
+    }
+}
+
+fn open_pm2_location(state: &mut AppState, proc: &crate::system::node::Pm2Process) {
+    let script = proc.script.as_deref().unwrap_or("");
+    let cwd = proc.cwd.as_deref().unwrap_or("");
+
+    let mut target: Option<&std::path::Path> = None;
+    if !cwd.is_empty() && cwd != "-" {
+        target = Some(std::path::Path::new(cwd));
+    } else if !script.is_empty() && script != "-" {
+        let path = std::path::Path::new(script);
+        if !looks_like_node_binary(path) {
+            target = path.parent().or(Some(path));
+        }
+    }
+
+    if let Some(path) = target {
+        if let Err(err) = crate::system::node::open_path_location(path) {
+            state.set_message(format!("Failed to open dir: {}", err));
+        } else {
+            state.set_message("Opened PM2 working directory.");
+        }
+    } else {
+        state.set_message("No working directory for this PM2 process.");
+    }
+}
+
+fn looks_like_node_binary(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name == "node" || name == "nodejs" || name == "bun" || name == "deno" {
+        return true;
+    }
+    let path_lower = path.to_string_lossy().to_lowercase();
+    path_lower.contains("/nvm/")
+        || path_lower.contains("/volta/")
+        || path_lower.contains("/fnm/")
+        || path_lower.ends_with("/bin/node")
+        || path_lower.ends_with("/bin/nodejs")
+        || path_lower.ends_with("/bin/bun")
+        || path_lower.ends_with("/bin/deno")
 }
 
 fn request_prune_confirmation(state: &mut AppState, action: ContextMenuAction) {
@@ -1667,6 +2247,164 @@ fn handle_prune_output_mouse(
     }
 }
 
+fn handle_log_output_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> bool {
+    let x = mouse.column;
+    let y = mouse.row;
+    let (modal_x, modal_y, modal_w, modal_h, close_area) =
+        log_output_layout(state, main_x, main_width, height);
+    let inner_width = modal_w.saturating_sub(4);
+    let inner_height = modal_h.saturating_sub(6);
+
+    let in_modal = x >= modal_x
+        && x < modal_x + modal_w
+        && y >= modal_y
+        && y < modal_y + modal_h;
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if in_modal && inner_width > 0 && inner_height > 0 {
+                return apply_log_scroll(state, -3, inner_width, inner_height);
+            }
+            in_modal
+        }
+        MouseEventKind::ScrollDown => {
+            if in_modal && inner_width > 0 && inner_height > 0 {
+                return apply_log_scroll(state, 3, inner_width, inner_height);
+            }
+            in_modal
+        }
+        MouseEventKind::Moved => {
+            let hover = point_in_rect(x, y, close_area);
+            if state.log_output_hover != hover {
+                state.log_output_hover = hover;
+                return true;
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if point_in_rect(x, y, close_area) {
+                state.clear_log_state();
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            state.clear_log_state();
+            true
+        }
+        _ => in_modal,
+    }
+}
+
+fn handle_env_modal_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> bool {
+    let x = mouse.column;
+    let y = mouse.row;
+    let (modal_x, modal_y, modal_w, modal_h, close_area) =
+        env_modal_layout(state, main_x, main_width, height);
+
+    let in_modal = x >= modal_x
+        && x < modal_x + modal_w
+        && y >= modal_y
+        && y < modal_y + modal_h;
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if in_modal && state.env_selected > 0 {
+                state.env_selected -= 1;
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::ScrollDown => {
+            if in_modal && state.env_selected + 1 < state.env_vars.len() {
+                state.env_selected += 1;
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::Moved => {
+            let hover = point_in_rect(x, y, close_area);
+            if state.env_modal_hover != hover {
+                state.env_modal_hover = hover;
+                return true;
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if point_in_rect(x, y, close_area) {
+                state.env_modal_open = false;
+                state.env_modal_hover = false;
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            state.env_modal_open = false;
+            state.env_modal_hover = false;
+            true
+        }
+        _ => in_modal,
+    }
+}
+
+pub(crate) fn log_modal_inner_size(state: &AppState) -> Option<(u16, u16)> {
+    const SIDEBAR_WIDTH: u16 = 20;
+    const MIN_MAIN_WIDTH: u16 = 40;
+    let term_width = state.term_width;
+    let term_height = state.term_height;
+    if term_width == 0 || term_height == 0 {
+        return None;
+    }
+    let (main_x, main_width) = if term_width >= SIDEBAR_WIDTH + MIN_MAIN_WIDTH {
+        (SIDEBAR_WIDTH, term_width - SIDEBAR_WIDTH)
+    } else {
+        (0, term_width)
+    };
+    let (_, _, modal_w, modal_h, _) = log_output_layout(state, main_x, main_width, term_height);
+    let inner_w = modal_w.saturating_sub(4);
+    let inner_h = modal_h.saturating_sub(6);
+    if inner_w == 0 || inner_h == 0 {
+        return None;
+    }
+    Some((inner_w, inner_h))
+}
+
+fn apply_log_scroll(state: &mut AppState, delta: i32, viewport_w: u16, viewport_h: u16) -> bool {
+    let max_scroll = state.log_max_scroll(viewport_w, viewport_h);
+    if max_scroll == 0 {
+        return false;
+    }
+    let current = if state.log_follow {
+        max_scroll
+    } else {
+        state.log_scroll.min(max_scroll)
+    };
+    let next = if delta.is_negative() {
+        current.saturating_sub(delta.wrapping_abs() as u16)
+    } else {
+        current.saturating_add(delta as u16).min(max_scroll)
+    };
+    if next == current {
+        return false;
+    }
+    state.log_scroll = next;
+    state.log_follow = next == max_scroll;
+    state.log_last_scroll = std::time::Instant::now();
+    true
+}
+
 fn prune_confirm_layout(
     state: &AppState,
     main_x: u16,
@@ -1710,6 +2448,62 @@ fn prune_output_layout(
         .unwrap_or("");
     let width = (main_width.saturating_mul(85) / 100).max(72).max(label.len() as u16 + 32);
     let height_box = (height.saturating_mul(75) / 100).max(12);
+    let x = main_x + (main_width.saturating_sub(width)) / 2;
+    let y = (height.saturating_sub(height_box)) / 2;
+
+    let button_w = 10u16;
+    let button_h = 1u16;
+    let button_y = y + height_box - 3;
+    let button_x = x + (width.saturating_sub(button_w)) / 2;
+    let close_area = (button_x, button_y, button_w, button_h);
+
+    (x, y, width, height_box, close_area)
+}
+
+fn log_output_layout(
+    state: &AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> (u16, u16, u16, u16, (u16, u16, u16, u16)) {
+    let label = state
+        .log_output
+        .as_ref()
+        .map(|p| p.title.as_str())
+        .unwrap_or("");
+    let max_width = main_width.saturating_sub(2).max(4);
+    let max_height = height.saturating_sub(2).max(6);
+    let width = (main_width.saturating_mul(92) / 100)
+        .max(80)
+        .max(label.len() as u16 + 24)
+        .min(max_width);
+    let height_box = (height.saturating_mul(85) / 100).max(14).min(max_height);
+    let x = main_x + (main_width.saturating_sub(width)) / 2;
+    let y = (height.saturating_sub(height_box)) / 2;
+
+    let button_w = 10u16;
+    let button_h = 1u16;
+    let button_y = y + height_box - 3;
+    let button_x = x + (width.saturating_sub(button_w)) / 2;
+    let close_area = (button_x, button_y, button_w, button_h);
+
+    (x, y, width, height_box, close_area)
+}
+
+fn env_modal_layout(
+    state: &AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> (u16, u16, u16, u16, (u16, u16, u16, u16)) {
+    let label = state.env_title.as_str();
+    let max_width = main_width.saturating_sub(2).max(4);
+    let max_height = height.saturating_sub(2).max(6);
+    let width = (main_width.saturating_mul(90) / 100)
+        .max(70)
+        .max(label.len() as u16 + 24)
+        .min(max_width);
+    let height_box = (height.saturating_mul(85) / 100).max(14).min(max_height);
     let x = main_x + (main_width.saturating_sub(width)) / 2;
     let y = (height.saturating_sub(height_box)) / 2;
 

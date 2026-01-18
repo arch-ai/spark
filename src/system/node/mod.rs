@@ -1,16 +1,21 @@
 mod detect;
 mod pm2;
+mod terminal;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use sysinfo::Pid;
 
 pub use detect::detect_node_processes;
 pub(crate) use detect::project_name_from_process;
-pub use pm2::{is_pm2_running, load_pm2_processes, Pm2Process};
+pub use pm2::{is_pm2_running, load_pm2_env, load_pm2_logs, load_pm2_processes, pm2_restart, pm2_start, pm2_stop, Pm2Process};
+pub use terminal::open_path_location;
 
 /// Information about a Node.js process, optionally enriched with PM2 data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeProcessInfo {
     pub pid: Pid,
     pub name: String,
@@ -27,7 +32,7 @@ pub struct NodeProcessInfo {
 }
 
 /// PM2-specific information for a process.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pm2Info {
     pub pm_id: u32,
     pub mode: String,       // "fork" or "cluster"
@@ -44,25 +49,103 @@ pub enum NodeRow {
     UtilsSeparator,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeSnapshot {
+    pub node_procs: Vec<NodeProcessInfo>,
+    pub pm2_procs: Vec<Pm2Process>,
+    pub pm2_available: bool,
+}
+
+pub struct NodeWorker {
+    data: Arc<RwLock<Arc<NodeSnapshot>>>,
+    paused: Arc<AtomicBool>,
+}
+
+impl NodeWorker {
+    pub fn snapshot(&self) -> Arc<NodeSnapshot> {
+        let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
+        Arc::clone(&guard)
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+}
+
 /// Collect all Node.js processes, merging with PM2 data if available.
 /// Groups cluster workers together to avoid duplicates.
 pub fn collect_node_processes(
     system: &sysinfo::System,
     filter: &str,
 ) -> Vec<NodeProcessInfo> {
-    // First, detect all Node.js processes from the system
-    let mut node_procs = detect_node_processes(system);
-
-    // Try to load PM2 process list (gracefully handle errors)
     let pm2_procs = load_pm2_processes().unwrap_or_default();
+    let mut node_procs = collect_node_processes_unfiltered(system, &pm2_procs);
+    node_procs = filter_node_processes(&node_procs, filter);
+    node_procs
+}
 
-    // Build a PID -> PM2 info map for quick lookup
+pub fn filter_pm2_processes(pm2_procs: &[Pm2Process], filter: &str) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..pm2_procs.len()).collect();
+    }
+
+    let filter_lower = filter.to_lowercase();
+    pm2_procs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, proc)| {
+            let mut haystacks = vec![
+                proc.name.to_lowercase(),
+                proc.status.to_lowercase(),
+                proc.mode.to_lowercase(),
+                proc.script.clone().unwrap_or_default().to_lowercase(),
+                proc.pm_id.to_string(),
+            ];
+            if let Some(pid) = proc.pid {
+                haystacks.push(pid.to_string());
+            }
+            if haystacks.iter().any(|s| s.contains(&filter_lower)) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub fn filter_node_processes(processes: &[NodeProcessInfo], filter: &str) -> Vec<NodeProcessInfo> {
+    if filter.is_empty() {
+        return processes.to_vec();
+    }
+    let filter_lower = filter.to_lowercase();
+    processes
+        .iter()
+        .cloned()
+        .filter(|p| {
+            p.name.to_lowercase().contains(&filter_lower)
+                || p.script.to_lowercase().contains(&filter_lower)
+                || p.pid.to_string().contains(&filter_lower)
+                || p.project_name
+                    .as_deref()
+                    .map_or(false, |name| name.to_lowercase().contains(&filter_lower))
+                || p.pm2.as_ref().map_or(false, |pm2| {
+                    pm2.status.to_lowercase().contains(&filter_lower)
+                        || pm2.mode.to_lowercase().contains(&filter_lower)
+                })
+        })
+        .collect()
+}
+
+fn collect_node_processes_unfiltered(
+    system: &sysinfo::System,
+    pm2_procs: &[Pm2Process],
+) -> Vec<NodeProcessInfo> {
+    let mut node_procs = detect_node_processes(system);
     let pm2_by_pid: HashMap<Pid, &Pm2Process> = pm2_procs
         .iter()
         .filter_map(|p| p.pid.map(|pid| (Pid::from_u32(pid), p)))
         .collect();
 
-    // Enrich Node processes with PM2 data
     for node_proc in &mut node_procs {
         if let Some(pm2_proc) = pm2_by_pid.get(&node_proc.pid) {
             node_proc.name = pm2_proc.name.clone();
@@ -80,15 +163,13 @@ pub fn collect_node_processes(
         }
     }
 
-    // Add PM2 processes that might not be running (stopped/errored)
-    // but are still in PM2's process list
-    for pm2_proc in &pm2_procs {
-        let is_tracked = pm2_proc.pid
+    for pm2_proc in pm2_procs {
+        let is_tracked = pm2_proc
+            .pid
             .map(|pid| node_procs.iter().any(|n| n.pid.as_u32() == pid))
             .unwrap_or(false);
 
         if !is_tracked {
-            // This is a PM2 process that's not currently running
             let script = pm2_proc.script.clone().unwrap_or_else(|| "-".to_string());
             let project_name = detect::project_name_from_script(&script);
             node_procs.push(NodeProcessInfo {
@@ -110,38 +191,61 @@ pub fn collect_node_processes(
         }
     }
 
-    // Group cluster workers by script path (for non-PM2 processes)
-    // PM2 processes are already unique per pm_id
     node_procs = group_cluster_workers(node_procs);
+    sort_node_processes(&mut node_procs);
+    node_procs
+}
 
-    // Apply filter if provided
-    if !filter.is_empty() {
-        let filter_lower = filter.to_lowercase();
-        node_procs.retain(|p| {
-            p.name.to_lowercase().contains(&filter_lower)
-                || p.script.to_lowercase().contains(&filter_lower)
-                || p.pid.to_string().contains(&filter_lower)
-                || p.project_name
-                    .as_deref()
-                    .map_or(false, |name| name.to_lowercase().contains(&filter_lower))
-                || p.pm2.as_ref().map_or(false, |pm2| {
-                    pm2.status.to_lowercase().contains(&filter_lower)
-                        || pm2.mode.to_lowercase().contains(&filter_lower)
-                })
-        });
-    }
+fn sort_node_processes(node_procs: &mut Vec<NodeProcessInfo>) {
+    node_procs.sort_by(|a, b| match (&a.pm2, &b.pm2) {
+        (Some(a_pm2), Some(b_pm2)) => a_pm2.pm_id.cmp(&b_pm2.pm_id),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.pid.cmp(&b.pid),
+    });
+}
 
-    // Sort by PM2 ID if available, then by PID
-    node_procs.sort_by(|a, b| {
-        match (&a.pm2, &b.pm2) {
-            (Some(a_pm2), Some(b_pm2)) => a_pm2.pm_id.cmp(&b_pm2.pm_id),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.pid.cmp(&b.pid),
+pub fn start_node_worker(interval: Duration) -> NodeWorker {
+    let data = Arc::new(RwLock::new(Arc::new(NodeSnapshot::default())));
+    let thread_data = Arc::clone(&data);
+    let paused = Arc::new(AtomicBool::new(false));
+    let thread_paused = Arc::clone(&paused);
+
+    std::thread::spawn(move || {
+        let mut system = sysinfo::System::new();
+        loop {
+            if thread_paused.load(Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                continue;
+            }
+            system.refresh_processes();
+            system.refresh_cpu();
+
+            let pm2_result = load_pm2_processes();
+            let (pm2_available, pm2_procs) = match pm2_result {
+                Ok(list) => (true, list),
+                Err(_) => (false, Vec::new()),
+            };
+            let node_procs = collect_node_processes_unfiltered(&system, &pm2_procs);
+
+            let snapshot = NodeSnapshot {
+                node_procs,
+                pm2_procs,
+                pm2_available,
+            };
+            let should_update = {
+                let guard = thread_data.read().unwrap_or_else(|err| err.into_inner());
+                guard.as_ref() != &snapshot
+            };
+            if should_update {
+                let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
+                *guard = Arc::new(snapshot);
+            }
+            std::thread::sleep(interval);
         }
     });
 
-    node_procs
+    NodeWorker { data, paused }
 }
 
 pub fn is_node_util(proc: &NodeProcessInfo) -> bool {

@@ -17,7 +17,6 @@ pub struct EnvView<'a> {
     info_right2: &'a str,
     env_vars: &'a [String],
     selected_index: usize,
-    scroll_offset: usize,
 }
 
 impl<'a> EnvView<'a> {
@@ -33,7 +32,6 @@ impl<'a> EnvView<'a> {
             info_right2: "",
             env_vars,
             selected_index: 0,
-            scroll_offset: 0,
         }
     }
 
@@ -52,6 +50,15 @@ impl<'a> EnvView<'a> {
 
     fn split_env(line: &str) -> (&str, &str) {
         line.split_once('=').unwrap_or((line, ""))
+    }
+
+    fn calculate_scroll_offset(selected: usize, visible_height: usize, total: usize) -> usize {
+        if total <= visible_height {
+            return 0;
+        }
+        let max_offset = total.saturating_sub(visible_height);
+        let ideal = selected.saturating_sub(visible_height / 2);
+        ideal.min(max_offset)
     }
 }
 
@@ -97,12 +104,19 @@ impl Widget for EnvView<'_> {
         info_table.render(chunks[1], buf);
 
         // Environment variables table
+        let visible_height = chunks[2].height.saturating_sub(3) as usize;
+        let scroll_offset = Self::calculate_scroll_offset(
+            self.selected_index,
+            visible_height.max(1),
+            self.env_vars.len(),
+        );
+
         let env_rows: Vec<Row> = self.env_vars
             .iter()
-            .skip(self.scroll_offset)
+            .skip(scroll_offset)
             .enumerate()
             .map(|(i, line)| {
-                let actual_index = self.scroll_offset + i;
+                let actual_index = scroll_offset + i;
                 let (key, value) = Self::split_env(line);
                 let style = if actual_index == self.selected_index {
                     Style::default().add_modifier(Modifier::REVERSED)

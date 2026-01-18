@@ -36,37 +36,6 @@ pub fn open_container_shell(container_id: &str) -> io::Result<()> {
     }))
 }
 
-pub fn open_container_logs(container_id: &str) -> io::Result<()> {
-    let cmd = format!("docker logs -f --tail 200 {id}; exec bash", id = container_id);
-    if let Ok(term) = env::var("TERMINAL") {
-        if try_spawn_terminal(&term, TerminalMode::DashE, &cmd).is_ok() {
-            return Ok(());
-        }
-    }
-
-    let mut last_err = None;
-    let candidates = [
-        ("x-terminal-emulator", TerminalMode::DashE),
-        ("gnome-terminal", TerminalMode::DoubleDash),
-        ("konsole", TerminalMode::DashE),
-        ("xfce4-terminal", TerminalMode::DashE),
-        ("mate-terminal", TerminalMode::DoubleDash),
-        ("tilix", TerminalMode::DashE),
-        ("xterm", TerminalMode::DashE),
-    ];
-
-    for (name, mode) in candidates {
-        match try_spawn_terminal(name, mode, &cmd) {
-            Ok(()) => return Ok(()),
-            Err(err) => last_err = Some(err),
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "No supported terminal found")
-    }))
-}
-
 enum TerminalMode {
     DashE,
     DoubleDash,

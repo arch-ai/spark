@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use ratatui::text::Line;
 use sysinfo::{Pid, Uid};
 
 use crate::system::docker::{DockerRow, DockerSystemDf};
@@ -30,6 +31,7 @@ pub enum ContextMenuAction {
     Logs,
     Shell,
     Env,
+    OpenLocation,
     Kill,
     PruneBuildCache,
     PruneDanglingImages,
@@ -45,6 +47,7 @@ impl ContextMenuAction {
             ContextMenuAction::Logs => "] Logs",
             ContextMenuAction::Shell => "$ Shell",
             ContextMenuAction::Env => "# Env",
+            ContextMenuAction::OpenLocation => "O Open Dir",
             ContextMenuAction::Kill => "x Kill",
             ContextMenuAction::PruneBuildCache => "P Prune Cache",
             ContextMenuAction::PruneDanglingImages => "P Prune Images",
@@ -64,6 +67,7 @@ pub enum ContextMenuTarget {
     Container { id: String, name: String, running: bool },
     Group { name: String, path: Option<String> },
     Process { pid: u32, name: String },
+    Pm2 { pm_id: u32, name: String },
     DockerDf,
 }
 
@@ -77,6 +81,11 @@ pub enum PruneConfirmChoice {
 pub struct PruneOutput {
     pub label: String,
     pub output: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LogOutput {
+    pub title: String,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +169,7 @@ pub struct AppState {
     pub docker_scroll: usize,
     pub ports_scroll: usize,
     pub node_scroll: usize,
+    pub pm2_scroll: usize,
     pub sidebar_hover: Option<usize>,
     pub context_menu: Option<ContextMenu>,
     pub visible_ports: Vec<Pid>,
@@ -194,8 +204,6 @@ pub struct AppState {
     pub spinner_last_tick: Instant,
     /// Cached PM2 availability status
     pub pm2_available: bool,
-    /// Last time PM2 availability was checked
-    pub pm2_last_check: Instant,
     /// Docker system disk usage from `docker system df`
     pub docker_system_df: DockerSystemDf,
     /// Last time hover was rendered (for throttling)
@@ -213,6 +221,51 @@ pub struct AppState {
     pub prune_output: Option<PruneOutput>,
     /// Hover state for prune output modal close button
     pub prune_output_hover: bool,
+    /// Environment modal open
+    pub env_modal_open: bool,
+    /// Hover state for environment modal close button
+    pub env_modal_hover: bool,
+    /// Active log load label (shows progress spinner)
+    pub log_in_progress: Option<String>,
+    /// Log output modal contents
+    pub log_output: Option<LogOutput>,
+    /// Hover state for log output modal close button
+    pub log_output_hover: bool,
+    /// Normalized log text for rendering
+    pub log_text: String,
+    /// Cached wrapped lines for log output
+    pub log_lines: Vec<Line<'static>>,
+    /// Width used for cached log wrapping
+    pub log_wrap_width: u16,
+    /// Cached line count for current wrap width
+    pub log_line_count: usize,
+    /// Current vertical scroll offset for the log output modal
+    pub log_scroll: u16,
+    /// Auto-follow newest log output
+    pub log_follow: bool,
+    /// Last time the log scroll position changed
+    pub log_last_scroll: Instant,
+    /// Log source for periodic refresh
+    pub log_source: Option<LogSource>,
+    /// Last time logs were refreshed
+    pub log_last_refresh: Instant,
+    /// Whether a log refresh is currently in flight
+    pub log_refresh_in_progress: bool,
+    /// Last time disk stats were refreshed
+    pub last_disk_refresh: Instant,
+    /// Cached terminal width for modal sizing
+    pub term_width: u16,
+    /// Cached terminal height for modal sizing
+    pub term_height: u16,
+    /// Hovered PM2 row in the Node view
+    pub pm2_hover_row: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub enum LogSource {
+    Process { pid: u32 },
+    Pm2 { pm_id: u32 },
+    Docker { container_id: String },
 }
 
 impl AppState {
@@ -247,6 +300,7 @@ impl AppState {
             docker_scroll: 0,
             ports_scroll: 0,
             node_scroll: 0,
+            pm2_scroll: 0,
             sidebar_hover: None,
             context_menu: None,
             visible_ports: Vec::new(),
@@ -277,8 +331,6 @@ impl AppState {
             spinner_frame: 0,
             spinner_last_tick: Instant::now(),
             pm2_available: false,
-            // Set to past time so first check happens immediately
-            pm2_last_check: Instant::now() - Duration::from_secs(60),
             docker_system_df: DockerSystemDf::default(),
             last_hover_render: Instant::now(),
             docker_df_hover: None,
@@ -287,6 +339,25 @@ impl AppState {
             prune_in_progress: None,
             prune_output: None,
             prune_output_hover: false,
+            env_modal_open: false,
+            env_modal_hover: false,
+            log_in_progress: None,
+            log_output: None,
+            log_output_hover: false,
+            log_text: String::new(),
+            log_lines: Vec::new(),
+            log_wrap_width: 0,
+            log_line_count: 0,
+            log_scroll: 0,
+            log_follow: true,
+            log_last_scroll: Instant::now() - Duration::from_secs(60),
+            log_source: None,
+            log_last_refresh: Instant::now() - Duration::from_secs(60),
+            log_refresh_in_progress: false,
+            last_disk_refresh: Instant::now() - Duration::from_secs(60),
+            term_width: 0,
+            term_height: 0,
+            pm2_hover_row: None,
         }
     }
 
@@ -325,6 +396,24 @@ impl AppState {
                     self.prune_output = Some(PruneOutput { label, output });
                     self.prune_output_hover = false;
                 }
+                any_completed = true;
+                continue;
+            }
+            if let Some(title) = msg.container_id.strip_prefix("logs::") {
+                if self.log_source.is_none() && self.log_output.is_none() && self.log_in_progress.is_none() {
+                    self.log_refresh_in_progress = false;
+                    continue;
+                }
+                self.log_in_progress = None;
+                self.log_refresh_in_progress = false;
+                let output = msg.output.clone().unwrap_or_default();
+                self.set_log_output(title.to_string(), output);
+                self.log_output_hover = false;
+                if !msg.success && !msg.message.is_empty() {
+                    self.set_message(format!("Failed to load logs: {}", msg.message));
+                }
+                any_completed = true;
+                continue;
             }
             // Only remove from pending on failure - success keeps it pending until state matches
             if !msg.success {
@@ -336,6 +425,62 @@ impl AppState {
             any_completed = true;
         }
         any_completed
+    }
+
+    pub fn log_max_scroll(&self, viewport_width: u16, viewport_height: u16) -> u16 {
+        if self.log_output.is_none() || viewport_width == 0 || viewport_height == 0 {
+            return 0;
+        }
+        let total_lines = if self.log_wrap_width == viewport_width && self.log_line_count > 0 {
+            self.log_line_count
+        } else {
+            count_wrapped_lines(&self.log_text, viewport_width)
+        };
+        let max_scroll = total_lines.saturating_sub(viewport_height as usize);
+        max_scroll.min(u16::MAX as usize) as u16
+    }
+
+    pub fn log_display_text(&self) -> &str {
+        &self.log_text
+    }
+
+    pub fn ensure_log_lines(&mut self, width: u16) {
+        if self.log_output.is_none() || width == 0 {
+            return;
+        }
+        if self.log_wrap_width == width && !self.log_lines.is_empty() {
+            return;
+        }
+        self.log_lines = wrap_text_lines(&self.log_text, width);
+        self.log_line_count = self.log_lines.len();
+        self.log_wrap_width = width;
+    }
+
+    pub fn clear_log_state(&mut self) {
+        self.log_output = None;
+        self.log_output_hover = false;
+        self.log_source = None;
+        self.log_follow = true;
+        self.log_scroll = 0;
+        self.log_refresh_in_progress = false;
+        self.log_last_scroll = Instant::now();
+        self.log_text.clear();
+        self.log_lines.clear();
+        self.log_wrap_width = 0;
+        self.log_line_count = 0;
+    }
+
+    fn set_log_output(&mut self, title: String, output: String) {
+        self.log_output = Some(LogOutput { title });
+        let raw = if output.trim().is_empty() {
+            "No output.".to_string()
+        } else {
+            output
+        };
+        self.log_text = normalize_log_text(&raw);
+        self.log_lines.clear();
+        self.log_wrap_width = 0;
+        self.log_line_count = 0;
     }
 
     /// Check container states and remove from pending when state matches expected
@@ -479,6 +624,118 @@ impl AppState {
             Some(DockerRow::Group { .. }) | Some(DockerRow::Item { .. })
         )
     }
+}
+
+fn normalize_log_text(text: &str) -> String {
+    let stripped = strip_ansi(text);
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        match ch {
+            '\r' => {}
+            '\t' => out.push_str("    "),
+            '\x08' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.chars().peekable();
+    while let Some(ch) = iter.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        match iter.peek().copied() {
+            Some('[') => {
+                iter.next();
+                while let Some(c) = iter.next() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                iter.next();
+                loop {
+                    match iter.next() {
+                        Some('\x07') => break,
+                        Some('\x1b') => {
+                            if let Some('\\') = iter.peek().copied() {
+                                iter.next();
+                                break;
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn count_wrapped_lines(text: &str, width: u16) -> usize {
+    let width = width as usize;
+    if width == 0 {
+        return 0;
+    }
+    let mut total = 0usize;
+    for line in text.split('\n') {
+        if line.is_empty() {
+            total = total.saturating_add(1);
+            continue;
+        }
+        let mut count = 0usize;
+        let mut line_len = 0usize;
+        for _ch in line.chars() {
+            line_len += 1;
+            if line_len >= width {
+                count += 1;
+                line_len = 0;
+            }
+        }
+        if line_len > 0 {
+            count += 1;
+        }
+        total = total.saturating_add(count.max(1));
+    }
+    if text.ends_with('\n') {
+        total = total.saturating_add(1);
+    }
+    total
+}
+
+fn wrap_text_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let width = width as usize;
+    if width == 0 {
+        return vec![Line::from("")];
+    }
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            out.push(Line::from(""));
+            continue;
+        }
+        let mut buf = String::new();
+        let mut count = 0usize;
+        for ch in line.chars() {
+            buf.push(ch);
+            count += 1;
+            if count >= width {
+                out.push(Line::from(std::mem::take(&mut buf)));
+                count = 0;
+            }
+        }
+        if !buf.is_empty() {
+            out.push(Line::from(buf));
+        }
+    }
+    out
 }
 
 pub(crate) fn sidebar_index_for_view(view: ViewMode) -> usize {

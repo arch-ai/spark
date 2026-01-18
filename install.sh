@@ -36,9 +36,9 @@ if command -v gnome-terminal >/dev/null 2>&1; then
     FORCE_X11="1"
   fi
   if [ "${FORCE_X11}" = "1" ] || [ "${FORCE_X11}" = "true" ]; then
-    EXEC_CMD="env GDK_BACKEND=x11 gnome-terminal --class=${APP_NAME} --name=${APP_NAME} -- $BIN_DIR/$BIN_NAME"
+    EXEC_CMD="env GDK_BACKEND=x11 gnome-terminal --class=${APP_NAME} --name=${APP_NAME} -- $BIN_DIR/$BIN_NAME-launcher"
   else
-    EXEC_CMD="gnome-terminal --class=${APP_NAME} --name=${APP_NAME} -- $BIN_DIR/$BIN_NAME"
+    EXEC_CMD="gnome-terminal --class=${APP_NAME} --name=${APP_NAME} -- $BIN_DIR/$BIN_NAME-launcher"
   fi
   TERMINAL_ENTRY="false"
   STARTUP_WMCLASS_LINE="StartupWMClass=$APP_NAME"
@@ -49,7 +49,24 @@ cargo build --release
 
 echo "Installing to $BIN_DIR/$BIN_NAME"
 install -d "$BIN_DIR"
-install -m 755 "target/release/$BIN_NAME" "$BIN_DIR/$BIN_NAME"
+# Install the actual binary
+install -m 755 "target/release/$BIN_NAME" "$BIN_DIR/$BIN_NAME-bin"
+
+# Create a launcher script for desktop entry
+cat > "$BIN_DIR/$BIN_NAME-launcher" << LAUNCHER_EOF
+#!/usr/bin/env bash
+# Launcher script that ensures interactive shell env is loaded (nvm/pm2)
+exec bash -ic 'exec "\$1" "\$@"' _ "$BIN_DIR/$BIN_NAME-bin" "\$@"
+LAUNCHER_EOF
+chmod +x "$BIN_DIR/$BIN_NAME-launcher"
+
+# Create a wrapper script for command line use
+cat > "$BIN_DIR/$BIN_NAME" << 'WRAPPER_EOF'
+#!/usr/bin/env bash
+# Wrapper script to ensure interactive shell env is loaded (nvm/pm2)
+exec bash -ic 'exec "$1" "$@"' _ "$(dirname "$0")/spark-bin" "$@"
+WRAPPER_EOF
+chmod +x "$BIN_DIR/$BIN_NAME"
 
 echo "Installing desktop entry to $DESKTOP_DIR/$DESKTOP_FILE"
 install -d "$DESKTOP_DIR"

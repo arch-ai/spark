@@ -122,6 +122,29 @@ pub fn prune_build_cache() -> io::Result<String> {
     }
 }
 
+pub fn load_container_logs(container_id: &str) -> io::Result<String> {
+    let output = Command::new("docker")
+        .args(["logs", "--tail", "200", container_id])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        if stderr.trim().is_empty() {
+            Ok(stdout.to_string())
+        } else if stdout.trim().is_empty() {
+            Ok(stderr.to_string())
+        } else {
+            Ok(format!("{}\n{}", stdout, stderr))
+        }
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("docker logs failed: {}", stderr.trim()),
+        ))
+    }
+}
+
 pub fn prune_dangling_images() -> io::Result<String> {
     let output = Command::new("docker")
         .args(["image", "prune", "-f"])
