@@ -3,6 +3,7 @@ mod proc;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -228,6 +229,7 @@ fn display_group_label(name: &str) -> String {
 /// Background worker for collecting ports data
 pub struct PortsWorker {
     data: Arc<RwLock<Arc<Vec<PortInfo>>>>,
+    paused: Arc<AtomicBool>,
 }
 
 impl PortsWorker {
@@ -236,14 +238,24 @@ impl PortsWorker {
         let guard = self.data.read().unwrap();
         guard.clone()
     }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
 }
 
 /// Start a background worker that collects ports at the given interval
 pub fn start_ports_worker(interval: Duration) -> PortsWorker {
     let data = Arc::new(RwLock::new(Arc::new(Vec::new())));
     let thread_data = Arc::clone(&data);
+    let paused = Arc::new(AtomicBool::new(false));
+    let thread_paused = Arc::clone(&paused);
 
     thread::spawn(move || loop {
+        if thread_paused.load(Ordering::Relaxed) {
+            thread::sleep(interval);
+            continue;
+        }
         let mut system = System::new();
         system.refresh_processes();
         let new_ports = collect_ports(&system);
@@ -261,5 +273,5 @@ pub fn start_ports_worker(interval: Duration) -> PortsWorker {
         thread::sleep(interval);
     });
 
-    PortsWorker { data }
+    PortsWorker { data, paused }
 }

@@ -4,6 +4,7 @@ mod terminal;
 
 use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -11,14 +12,14 @@ use crate::util::{contains_lower, Filterable};
 
 pub use container::{
     kill_container, kill_containers, load_container_env, prune_build_cache, prune_dangling_images,
-    prune_volumes, restart_container,
+    prune_volumes, restart_container, load_container_logs,
     start_container, stop_container,
 };
 pub use stats::{
     apply_container_filter, group_containers, load_docker_stats, load_docker_system_df,
     DockerSystemDf,
 };
-pub use terminal::{open_container_logs, open_container_shell};
+pub use terminal::open_container_shell;
 
 /// Container information with optimized string storage.
 /// Uses Cow<'static, str> for fields that often contain static values like "-".
@@ -67,6 +68,7 @@ pub struct DockerStatsWorker {
     /// worker thread writes infrequently
     /// Inner Arc allows snapshot() to return without cloning the vector data
     data: Arc<RwLock<Arc<Vec<ContainerInfo>>>>,
+    paused: Arc<AtomicBool>,
 }
 
 impl DockerStatsWorker {
@@ -77,13 +79,23 @@ impl DockerStatsWorker {
         let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
         Arc::clone(&guard)
     }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
 }
 
 pub fn start_docker_stats_worker(interval: Duration) -> DockerStatsWorker {
     let data = Arc::new(RwLock::new(Arc::new(Vec::new())));
     let thread_data = Arc::clone(&data);
+    let paused = Arc::new(AtomicBool::new(false));
+    let thread_paused = Arc::clone(&paused);
 
     thread::spawn(move || loop {
+        if thread_paused.load(Ordering::Relaxed) {
+            thread::sleep(interval);
+            continue;
+        }
         if let Some(stats) = load_docker_stats() {
             // Use write lock - only held briefly while replacing the Arc pointer
             let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
@@ -92,12 +104,13 @@ pub fn start_docker_stats_worker(interval: Duration) -> DockerStatsWorker {
         thread::sleep(interval);
     });
 
-    DockerStatsWorker { data }
+    DockerStatsWorker { data, paused }
 }
 
 /// Background worker for docker system df data
 pub struct DockerSystemDfWorker {
     data: Arc<RwLock<DockerSystemDf>>,
+    paused: Arc<AtomicBool>,
 }
 
 impl DockerSystemDfWorker {
@@ -106,13 +119,23 @@ impl DockerSystemDfWorker {
         let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
         guard.clone()
     }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
 }
 
 pub fn start_docker_df_worker(interval: Duration) -> DockerSystemDfWorker {
     let data = Arc::new(RwLock::new(DockerSystemDf::default()));
     let thread_data = Arc::clone(&data);
+    let paused = Arc::new(AtomicBool::new(false));
+    let thread_paused = Arc::clone(&paused);
 
     thread::spawn(move || loop {
+        if thread_paused.load(Ordering::Relaxed) {
+            thread::sleep(interval);
+            continue;
+        }
         if let Some(df) = load_docker_system_df() {
             let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
             *guard = df;
@@ -120,5 +143,5 @@ pub fn start_docker_df_worker(interval: Duration) -> DockerSystemDfWorker {
         thread::sleep(interval);
     });
 
-    DockerSystemDfWorker { data }
+    DockerSystemDfWorker { data, paused }
 }

@@ -57,6 +57,8 @@ pub fn render_ratatui(
     ports_rows: &[ports::PortRow],
     node_view: &[node::NodeProcessInfo],
     node_rows: &[node::NodeRow],
+    pm2_view: &[node::Pm2Process],
+    pm2_rows: &[usize],
 ) {
     let area = frame.area();
 
@@ -96,7 +98,7 @@ pub fn render_ratatui(
             render_ports_view(frame, state, main_area, ports_cache, ports_rows);
         }
         ViewMode::Node => {
-            render_node_view(frame, state, main_area, node_view, node_rows);
+            render_node_view(frame, state, main_area, node_view, node_rows, pm2_view, pm2_rows);
         }
     }
 
@@ -105,10 +107,12 @@ pub fn render_ratatui(
         render_context_menu(frame, state, main_area);
     }
 
-    if state.pending_prune.is_some()
+    let other_modal_open = state.pending_prune.is_some()
         || state.prune_in_progress.is_some()
         || state.prune_output.is_some()
-    {
+        || state.log_in_progress.is_some()
+        || state.log_output.is_some();
+    if other_modal_open || state.env_modal_open {
         render_modal_overlay(frame, frame.area());
     }
 
@@ -124,6 +128,17 @@ pub fn render_ratatui(
         render_prune_output(frame, state, main_area);
     }
 
+    if let Some(label) = state.log_in_progress.as_deref() {
+        render_log_progress(frame, state, main_area, label);
+    }
+
+    if state.log_output.is_some() {
+        render_log_output(frame, state, main_area);
+    }
+
+    if state.env_modal_open && !other_modal_open {
+        render_env_modal(frame, state, main_area);
+    }
 }
 
 fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
@@ -682,49 +697,190 @@ fn render_node_view(
     area: Rect,
     node_view: &[node::NodeProcessInfo],
     node_rows: &[node::NodeRow],
+    pm2_view: &[node::Pm2Process],
+    pm2_rows: &[usize],
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(2),
-        ])
-        .split(area);
+    let title_height = 3u16;
+    let header_height = 1u16;
+    let search_height = 3u16;
+    let help_height = 2u16;
+
+    let title_area = Rect::new(area.x, area.y, area.width, title_height);
+    let header_area = Rect::new(area.x, area.y + title_height, area.width, header_height);
+    let search_area = Rect::new(
+        area.x,
+        area.y + title_height + header_height,
+        area.width,
+        search_height,
+    );
+    let table_top = area.y + title_height + header_height + search_height;
+    let available = area.height.saturating_sub(title_height + header_height + search_height + help_height);
+    let help_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(help_height),
+        area.width,
+        help_height,
+    );
+
+    let (pm2_area, node_area) = if state.pm2_available {
+        let mut pm2_height = available / 2;
+        if pm2_height < 5 {
+            pm2_height = available.min(5);
+        }
+        let mut node_height = available.saturating_sub(pm2_height);
+        if node_height < 5 {
+            let deficit = 5u16.saturating_sub(node_height);
+            if pm2_height > deficit {
+                pm2_height = pm2_height.saturating_sub(deficit);
+                node_height = node_height.saturating_add(deficit);
+            }
+        }
+        (
+            Rect::new(area.x, table_top, area.width, pm2_height),
+            Rect::new(area.x, table_top + pm2_height, area.width, node_height),
+        )
+    } else {
+        (
+            Rect::new(area.x, table_top, area.width, 0),
+            Rect::new(area.x, table_top, area.width, available),
+        )
+    };
 
     // Title
     let title = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .title(" NODE VIEW ");
-    frame.render_widget(title, chunks[0]);
+    frame.render_widget(title, title_area);
 
     // Header
     let pm2_status = if state.pm2_available { "available" } else { "not running" };
     let header_text = format!("Node processes: {} | PM2: {}", node_view.len(), pm2_status);
-    frame.render_widget(Paragraph::new(header_text), chunks[1]);
+    frame.render_widget(Paragraph::new(header_text), header_area);
 
     // Search
-    render_search_box(frame, chunks[2], &state.node_filter, state.input_mode == InputMode::Filter);
+    render_search_box(frame, search_area, &state.node_filter, state.input_mode == InputMode::Filter);
 
-    // Table
-    render_node_table(frame, state, chunks[3], node_view, node_rows);
+    // Tables
+    if state.pm2_available {
+        render_pm2_table(frame, state, pm2_area, pm2_view, pm2_rows);
+    }
+    render_node_table(frame, state, node_area, node_view, node_rows);
 
     // Help
-    let help_items = vec![
-        vec![
+    let help_items = if state.pm2_available {
+        vec![vec![
             HelpItem::key("j/k"),
             HelpItem::plain(" nav "),
             HelpItem::key("Enter"),
             HelpItem::plain(" kill "),
             HelpItem::key("e"),
             HelpItem::plain(" env "),
-            HelpItem::key("p"),
-            HelpItem::plain(" pm2 restart"),
+            HelpItem::key("Ctrl+R"),
+            HelpItem::plain(" pm2 restart "),
+            HelpItem::key("Ctrl+S"),
+            HelpItem::plain(" stop "),
+            HelpItem::key("Ctrl+T"),
+            HelpItem::plain(" start "),
+            HelpItem::key("Ctrl+O"),
+            HelpItem::plain(" open dir"),
+        ]]
+    } else {
+        vec![vec![
+            HelpItem::key("j/k"),
+            HelpItem::plain(" nav "),
+            HelpItem::key("Enter"),
+            HelpItem::plain(" kill "),
+            HelpItem::key("e"),
+            HelpItem::plain(" env "),
+        ]]
+    };
+    frame.render_widget(HelpBar::new(help_items), help_area);
+}
+
+fn render_pm2_table(
+    frame: &mut Frame,
+    state: &AppState,
+    area: Rect,
+    pm2_view: &[node::Pm2Process],
+    pm2_rows: &[usize],
+) {
+    if area.height < 3 {
+        return;
+    }
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let scroll_offset = state.pm2_scroll;
+
+    let table_rows: Vec<Row> = pm2_rows
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .map(|(idx, row_index)| {
+            let is_hovered = state.pm2_hover_row == Some(idx + scroll_offset);
+            let style = if is_hovered {
+                Style::default().bg(Color::Rgb(40, 40, 45))
+            } else {
+                Style::default()
+            };
+            let proc = &pm2_view[*row_index];
+            let status_color = match proc.status.to_lowercase().as_str() {
+                "online" => Color::Green,
+                "stopped" => Color::Red,
+                "errored" => Color::Red,
+                "starting" => Color::Yellow,
+                _ => Color::Cyan,
+            };
+            let pid = proc.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string());
+            let cpu = proc.cpu.map(|c| format!("{:.1}%", c)).unwrap_or_else(|| "-".to_string());
+            let mem = proc.memory_bytes.map(format_memory).unwrap_or_else(|| "-".to_string());
+            let uptime = proc
+                .uptime_ms
+                .map(|ms| format_uptime(ms / 1000))
+                .unwrap_or_else(|| "-".to_string());
+            Row::new(vec![
+                Cell::from(proc.pm_id.to_string()),
+                Cell::from(truncate(&proc.name, 20)),
+                Cell::from(proc.status.clone()).style(Style::default().fg(status_color)),
+                Cell::from(truncate(&proc.mode, 8)),
+                Cell::from(pid),
+                Cell::from(cpu),
+                Cell::from(mem),
+                Cell::from(uptime),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let header = Row::new(vec![
+        Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("STATUS").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("MODE").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("PID").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("CPU").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("MEM").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("UPTIME").style(Style::default().add_modifier(Modifier::BOLD)),
+    ]);
+
+    let table = Table::new(
+        table_rows,
+        [
+            Constraint::Length(4),
+            Constraint::Percentage(22),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(10),
         ],
-    ];
-    frame.render_widget(HelpBar::new(help_items), chunks[4]);
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(" PM2 "));
+
+    frame.render_widget(table, area);
+    render_nav_icons(frame, area, scroll_offset, pm2_rows.len(), visible_height);
 }
 
 fn render_node_table(
@@ -734,6 +890,9 @@ fn render_node_table(
     node_view: &[node::NodeProcessInfo],
     node_rows: &[node::NodeRow],
 ) {
+    if area.height < 3 {
+        return;
+    }
     let visible_height = area.height.saturating_sub(2) as usize;
     let scroll_offset = state.node_scroll;
 
@@ -1075,6 +1234,159 @@ fn render_prune_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
     frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
 }
 
+fn render_log_progress(frame: &mut Frame, state: &AppState, main_area: Rect, label: &str) {
+    let mut text = vec![Line::from(vec![
+        Span::styled("Loading logs for ", Style::default().fg(Color::White)),
+        Span::styled(label, Style::default().fg(Color::Yellow)),
+        Span::raw("..."),
+    ])];
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        format!("{}  working", state.spinner_char()),
+        Style::default().fg(Color::Cyan),
+    )));
+
+    let width = (main_area.width.saturating_mul(60) / 100).max(50);
+    let height = 6u16;
+    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
+    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Logs ");
+    frame.render_widget(block, area);
+
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 1,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    );
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn render_log_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
+    let output = match state.log_output.as_ref() {
+        Some(output) => output,
+        None => return,
+    };
+    let max_width = main_area.width.saturating_sub(2).max(4);
+    let max_height = main_area.height.saturating_sub(2).max(6);
+    let width = (main_area.width.saturating_mul(92) / 100)
+        .max(80)
+        .max(output.title.len() as u16 + 24)
+        .min(max_width);
+    let height = (main_area.height.saturating_mul(85) / 100)
+        .max(14)
+        .min(max_height);
+    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
+    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let title_max = width.saturating_sub(4) as usize;
+    let title = if title_max > 0 {
+        truncate(&output.title, title_max)
+    } else {
+        String::new()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", title));
+    frame.render_widget(block, area);
+
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 2,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(6),
+    );
+    let max_scroll = state.log_max_scroll(inner.width, inner.height);
+    let scroll_offset = if state.log_follow {
+        max_scroll
+    } else {
+        state.log_scroll.min(max_scroll)
+    };
+    let lines = if state.log_lines.is_empty() {
+        vec![Line::from(state.log_display_text().to_string())]
+    } else {
+        let start = scroll_offset as usize;
+        let end = (start + inner.height as usize).min(state.log_lines.len());
+        state.log_lines[start..end].to_vec()
+    };
+    frame.render_widget(ratatui::widgets::Clear, inner);
+    frame.render_widget(
+        Paragraph::new(lines),
+        inner,
+    );
+
+    let button_w = 10u16;
+    let button_y = area.y + area.height.saturating_sub(3);
+    let button_x = area.x + (area.width.saturating_sub(button_w)) / 2;
+    let hover = state.log_output_hover;
+    let style = if hover {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::Black).fg(Color::White)
+    };
+    let line = Line::from(Span::styled(" [ Close ] ", style));
+    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
+}
+
+fn render_env_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
+    use super::widgets::EnvView;
+
+    let max_width = main_area.width.saturating_sub(2).max(4);
+    let max_height = main_area.height.saturating_sub(2).max(6);
+    let width = (main_area.width.saturating_mul(90) / 100)
+        .max(70)
+        .max(state.env_title.len() as u16 + 24)
+        .min(max_width);
+    let height = (main_area.height.saturating_mul(85) / 100)
+        .max(14)
+        .min(max_height);
+    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
+    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL);
+    frame.render_widget(block, area);
+
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 2,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(6),
+    );
+    frame.render_widget(ratatui::widgets::Clear, inner);
+
+    let env_view = EnvView::new(&state.env_title, &state.env_vars)
+        .info(
+            &state.env_info_left1,
+            &state.env_info_right1,
+            &state.env_info_left2,
+            &state.env_info_right2,
+        )
+        .selected(state.env_selected);
+    frame.render_widget(env_view, inner);
+
+    let button_w = 10u16;
+    let button_y = area.y + area.height.saturating_sub(3);
+    let button_x = area.x + (area.width.saturating_sub(button_w)) / 2;
+    let hover = state.env_modal_hover;
+    let style = if hover {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::Black).fg(Color::White)
+    };
+    let line = Line::from(Span::styled(" [ Close ] ", style));
+    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
+}
+
 fn render_modal_overlay(frame: &mut Frame, area: Rect) {
     let style = Style::default()
         .fg(Color::DarkGray)
@@ -1197,6 +1509,19 @@ fn format_memory(bytes: u64) -> String {
         format!("{:.0}K", bytes as f64 / KB as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("{}d{}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h{}m", hours, mins)
+    } else {
+        format!("{}m", mins.max(1))
     }
 }
 

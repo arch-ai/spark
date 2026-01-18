@@ -1,7 +1,7 @@
 use std::process::Command;
 
 /// PM2 process information.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pm2Process {
     pub pm_id: u32,
     pub name: String,
@@ -12,12 +12,15 @@ pub struct Pm2Process {
     pub memory_bytes: Option<u64>,
     pub uptime_ms: Option<u64>,
     pub script: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// Check if PM2 daemon is running.
 pub fn is_pm2_running() -> bool {
-    Command::new("pm2")
-        .args(["ping"])
+    // Use bash -lc to ensure PM2 is in PATH (handles nvm, npm global installs, etc.)
+    // Use 'pm2 jlist' instead of 'pm2 ping' for more reliable detection
+    Command::new("bash")
+        .args(["-lc", "pm2 jlist"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -26,9 +29,9 @@ pub fn is_pm2_running() -> bool {
 /// Load PM2 process list using `pm2 jlist`.
 /// Returns an empty Vec on error (graceful degradation).
 pub fn load_pm2_processes() -> Result<Vec<Pm2Process>, Pm2Error> {
-    // Try to run pm2 jlist
-    let output = Command::new("pm2")
-        .args(["jlist"])
+    // Try to run pm2 jlist via bash -lc to ensure PM2 is in PATH
+    let output = Command::new("bash")
+        .args(["-lc", "pm2 jlist"])
         .output()
         .map_err(|e| Pm2Error::CommandFailed(e.to_string()))?;
 
@@ -48,6 +51,119 @@ pub fn load_pm2_processes() -> Result<Vec<Pm2Process>, Pm2Error> {
 
     // Parse JSON output
     parse_pm2_json(&stdout)
+}
+
+pub fn pm2_start(pm_id: u32) -> std::io::Result<()> {
+    let cmd = format!("pm2 start {}", pm_id);
+    let output = Command::new("bash")
+        .args(["-lc", &cmd])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("pm2 start failed: {}", stderr.trim()),
+        ))
+    }
+}
+
+pub fn pm2_stop(pm_id: u32) -> std::io::Result<()> {
+    let cmd = format!("pm2 stop {}", pm_id);
+    let output = Command::new("bash")
+        .args(["-lc", &cmd])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("pm2 stop failed: {}", stderr.trim()),
+        ))
+    }
+}
+
+pub fn pm2_restart(pm_id: u32) -> std::io::Result<()> {
+    let cmd = format!("pm2 restart {}", pm_id);
+    let output = Command::new("bash")
+        .args(["-lc", &cmd])
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("pm2 restart failed: {}", stderr.trim()),
+        ))
+    }
+}
+
+pub fn load_pm2_logs(pm_id: u32) -> std::io::Result<String> {
+    let cmd = format!("pm2 logs {} --lines 200 --nostream", pm_id);
+    let output = Command::new("bash")
+        .args(["-lc", &cmd])
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        if stderr.trim().is_empty() {
+            Ok(stdout.to_string())
+        } else if stdout.trim().is_empty() {
+            Ok(stderr.to_string())
+        } else {
+            Ok(format!("{}\n{}", stdout, stderr))
+        }
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("pm2 logs failed: {}", stderr.trim()),
+        ))
+    }
+}
+
+pub fn load_pm2_env(pm_id: u32) -> Result<Vec<String>, Pm2Error> {
+    let output = Command::new("bash")
+        .args(["-lc", "pm2 jlist"])
+        .output()
+        .map_err(|e| Pm2Error::CommandFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not found") || stderr.contains("command not found") {
+            return Err(Pm2Error::NotInstalled);
+        }
+        if stderr.contains("PM2 is not running") || stderr.contains("spawn pm2") {
+            return Err(Pm2Error::DaemonNotRunning);
+        }
+        return Err(Pm2Error::CommandFailed(stderr.to_string()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(|| Pm2Error::ParseError("Invalid JSON array".to_string()))?;
+
+    let objects = split_json_objects(inner);
+    for obj in objects {
+        if extract_u32(&obj, "pm_id") == Some(pm_id) {
+            if let Some(env_obj) = extract_nested_object(&obj, "pm2_env", "env") {
+                let envs = parse_env_object(&env_obj);
+                return Ok(envs);
+            }
+            return Ok(Vec::new());
+        }
+    }
+
+    Err(Pm2Error::ParseError("PM2 process not found".to_string()))
 }
 
 /// Errors that can occur when interacting with PM2.
@@ -198,8 +314,9 @@ fn parse_pm2_object(json: &str) -> Option<Pm2Process> {
     let memory_bytes = extract_nested_u64(json, "monit", "memory");
     let cpu = extract_nested_f32(json, "monit", "cpu");
 
-    // Script path
+    // Script path and cwd
     let script = extract_nested_string(json, "pm2_env", "pm_exec_path");
+    let cwd = extract_nested_string(json, "pm2_env", "pm_cwd");
 
     Some(Pm2Process {
         pm_id,
@@ -211,6 +328,7 @@ fn parse_pm2_object(json: &str) -> Option<Pm2Process> {
         memory_bytes,
         uptime_ms,
         script,
+        cwd,
     })
 }
 
@@ -389,6 +507,229 @@ fn extract_nested_f32(json: &str, parent: &str, key: &str) -> Option<f32> {
 
     let nested = &parent_content[..end];
     extract_f32(nested, key)
+}
+
+fn extract_object(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\":{{", key);
+    let alt_pattern = format!("\"{}\" : {{", key);
+    let start = json
+        .find(&pattern)
+        .or_else(|| json.find(&alt_pattern))?;
+    let brace_index = json[start..].find('{')? + start;
+    find_object_slice(json, brace_index)
+}
+
+fn extract_nested_object(json: &str, parent: &str, key: &str) -> Option<String> {
+    let parent_obj = extract_object(json, parent)?;
+    extract_object(&parent_obj, key)
+}
+
+fn find_object_slice(text: &str, start: usize) -> Option<String> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escape_next {
+                escape_next = false;
+            } else if ch == '\\' {
+                escape_next = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + 1;
+                    return Some(text[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn parse_env_object(raw: &str) -> Vec<String> {
+    let mut envs = Vec::new();
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    let mut iter = inner.chars().peekable();
+
+    loop {
+        // Skip whitespace and commas
+        while matches!(iter.peek(), Some(ch) if ch.is_whitespace() || *ch == ',') {
+            iter.next();
+        }
+        match iter.peek() {
+            None => break,
+            Some('}') => {
+                iter.next();
+                break;
+            }
+            _ => {}
+        }
+
+        let key = match parse_json_string(&mut iter) {
+            Some(key) => key,
+            None => break,
+        };
+
+        while matches!(iter.peek(), Some(ch) if ch.is_whitespace()) {
+            iter.next();
+        }
+        if iter.next() != Some(':') {
+            break;
+        }
+        while matches!(iter.peek(), Some(ch) if ch.is_whitespace()) {
+            iter.next();
+        }
+
+        let value = parse_json_value(&mut iter).unwrap_or_default();
+        envs.push(format!("{}={}", key, value));
+    }
+
+    envs.sort();
+    envs
+}
+
+fn parse_json_string(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    if iter.next() != Some('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escape_next = false;
+    while let Some(ch) = iter.next() {
+        if escape_next {
+            match ch {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'u' => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(h) = iter.next() {
+                            hex.push(h);
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(code) = u16::from_str_radix(&hex, 16) {
+                        if let Some(c) = char::from_u32(code as u32) {
+                            out.push(c);
+                        }
+                    }
+                }
+                _ => out.push(ch),
+            }
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            return Some(out);
+        }
+        out.push(ch);
+    }
+    None
+}
+
+fn parse_json_value(
+    iter: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<String> {
+    match iter.peek().copied() {
+        Some('"') => parse_json_string(iter),
+        Some('{') => {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escape_next = false;
+            let mut out = String::new();
+            while let Some(ch) = iter.next() {
+                out.push(ch);
+                if in_string {
+                    if escape_next {
+                        escape_next = false;
+                    } else if ch == '\\' {
+                        escape_next = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(out)
+        }
+        Some('[') => {
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escape_next = false;
+            let mut out = String::new();
+            while let Some(ch) = iter.next() {
+                out.push(ch);
+                if in_string {
+                    if escape_next {
+                        escape_next = false;
+                    } else if ch == '\\' {
+                        escape_next = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(out)
+        }
+        Some(_) => {
+            let mut out = String::new();
+            while let Some(ch) = iter.peek().copied() {
+                if ch == ',' || ch == '}' {
+                    break;
+                }
+                out.push(ch);
+                iter.next();
+            }
+            Some(out.trim().to_string())
+        }
+        None => None,
+    }
 }
 
 #[cfg(test)]
