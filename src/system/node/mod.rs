@@ -72,18 +72,6 @@ impl NodeWorker {
     }
 }
 
-/// Collect all Node.js processes, merging with PM2 data if available.
-/// Groups cluster workers together to avoid duplicates.
-pub fn collect_node_processes(
-    system: &sysinfo::System,
-    filter: &str,
-) -> Vec<NodeProcessInfo> {
-    let pm2_procs = load_pm2_processes().unwrap_or_default();
-    let mut node_procs = collect_node_processes_unfiltered(system, &pm2_procs);
-    node_procs = filter_node_processes(&node_procs, filter);
-    node_procs
-}
-
 pub fn filter_pm2_processes(pm2_procs: &[Pm2Process], filter: &str) -> Vec<usize> {
     if filter.is_empty() {
         return (0..pm2_procs.len()).collect();
