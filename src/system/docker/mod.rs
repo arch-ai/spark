@@ -12,14 +12,17 @@ use crate::util::{contains_lower, Filterable};
 
 pub use container::{
     kill_container, kill_containers, load_container_env, prune_build_cache, prune_dangling_images,
-    prune_volumes, restart_container, load_container_logs,
-    start_container, stop_container,
+    prune_volumes, restart_container, load_container_logs, load_docker_images,
+    load_docker_containers_with_size, load_docker_volumes, inspect_docker_container,
+    inspect_docker_image, inspect_docker_volume, delete_docker_image,
+    delete_docker_container, delete_docker_volume,
+    start_container, stop_container, DockerListItem,
 };
 pub use stats::{
     apply_container_filter, group_containers, load_docker_stats, load_docker_system_df,
     DockerSystemDf,
 };
-pub use terminal::open_container_shell;
+pub use terminal::{open_container_logs, open_container_shell};
 
 /// Container information with optimized string storage.
 /// Uses Cow<'static, str> for fields that often contain static values like "-".

@@ -1,7 +1,7 @@
 use sysinfo::{Pid, System};
 
 use crate::app::{AppState, InputMode, ViewMode};
-use crate::app::state::{LogSource, OperationComplete};
+use crate::app::state::{LogOutputMode, LogSource, OperationComplete};
 use crate::system::{docker, node, process};
 
 /// Check if a PID is managed by PM2 and return the PM2 ID if found
@@ -317,6 +317,9 @@ where
     state.log_in_progress = Some(title.clone());
     state.log_output = None;
     state.log_output_hover = false;
+    state.log_select_hover = false;
+    state.log_select_mode = false;
+    state.log_output_mode = LogOutputMode::Logs;
     state.log_text.clear();
     state.log_lines.clear();
     state.log_wrap_width = 0;
@@ -340,6 +343,49 @@ where
             success,
             message: if success { String::new() } else { output.clone() },
             output: Some(output),
+        });
+    });
+}
+
+pub(crate) fn start_inspect_fetch<F>(
+    state: &mut AppState,
+    title: String,
+    command: F,
+) where
+    F: FnOnce() -> std::io::Result<String> + Send + 'static,
+{
+    state.log_in_progress = Some(title.clone());
+    state.log_output = None;
+    state.log_output_hover = false;
+    state.log_select_hover = false;
+    state.log_select_mode = false;
+    state.log_output_mode = LogOutputMode::Inspect;
+    state.log_text.clear();
+    state.log_lines.clear();
+    state.log_wrap_width = 0;
+    state.log_line_count = 0;
+    state.log_scroll = 0;
+    state.log_follow = false;
+    state.log_last_scroll = std::time::Instant::now();
+    state.log_source = None;
+    state.log_refresh_in_progress = false;
+    state.log_last_refresh = std::time::Instant::now();
+
+    let tx = state.operation_tx.clone();
+    std::thread::spawn(move || {
+        let result = command();
+        let success = result.is_ok();
+        let output = result.as_ref().ok().cloned();
+        let message = result
+            .as_ref()
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        let _ = tx.send(OperationComplete {
+            container_id: format!("inspect::{}", title),
+            success,
+            message,
+            output,
         });
     });
 }
