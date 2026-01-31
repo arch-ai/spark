@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use ratatui::text::Line;
 use sysinfo::{Pid, Uid};
 
-use crate::system::docker::{DockerRow, DockerSystemDf};
+use crate::system::docker::{DockerListItem, DockerRow, DockerSystemDf};
 
 /// Message sent when a container operation completes
 #[derive(Debug)]
@@ -29,10 +29,18 @@ pub enum ContextMenuAction {
     Stop,
     Restart,
     Logs,
+    LogsNewWindow,
     Shell,
     Env,
     OpenLocation,
     Kill,
+    DeleteImage,
+    DeleteContainer,
+    DeleteVolume,
+    Inspect,
+    ShowVolumes,
+    ShowImages,
+    ShowContainers,
     PruneBuildCache,
     PruneDanglingImages,
     PruneVolumes,
@@ -45,19 +53,30 @@ impl ContextMenuAction {
             ContextMenuAction::Stop => if is_group { "x Stop All" } else { "x Stop" },
             ContextMenuAction::Restart => if is_group { "~ Restart All" } else { "~ Restart" },
             ContextMenuAction::Logs => "] Logs",
+            ContextMenuAction::LogsNewWindow => "] Logs - New Window",
             ContextMenuAction::Shell => "$ Shell",
             ContextMenuAction::Env => "# Env",
             ContextMenuAction::OpenLocation => "O Open Dir",
             ContextMenuAction::Kill => "x Kill",
+            ContextMenuAction::DeleteImage => "x Delete Image",
+            ContextMenuAction::DeleteContainer => "x Delete Container",
+            ContextMenuAction::DeleteVolume => "x Delete Volume",
+            ContextMenuAction::Inspect => "i Inspect",
+            ContextMenuAction::ShowVolumes => "V Show Volumes",
+            ContextMenuAction::ShowImages => "I Show Images",
+            ContextMenuAction::ShowContainers => "C Show Containers",
             ContextMenuAction::PruneBuildCache => "P Prune Cache",
-            ContextMenuAction::PruneDanglingImages => "P Prune Images",
+            ContextMenuAction::PruneDanglingImages => "P Prune Unused",
             ContextMenuAction::PruneVolumes => "P Prune Volumes",
         }
     }
 
     /// Returns true if this action is only available for single containers (not groups)
     pub fn is_container_only(&self) -> bool {
-        matches!(self, ContextMenuAction::Logs | ContextMenuAction::Shell | ContextMenuAction::Env)
+        matches!(
+            self,
+            ContextMenuAction::Logs | ContextMenuAction::LogsNewWindow | ContextMenuAction::Shell | ContextMenuAction::Env
+        )
     }
 }
 
@@ -65,14 +84,38 @@ impl ContextMenuAction {
 pub enum ContextMenuTarget {
     #[allow(dead_code)]
     Container { id: String, name: String, running: bool },
+    DockerContainer { id: String, name: String },
+    DockerImage { id: String, name: String },
+    DockerVolume { name: String },
     Group { name: String, path: Option<String> },
     Process { pid: u32, name: String },
     Pm2 { pm_id: u32, name: String },
-    DockerDf,
+    DockerDf { kind: DockerDfKind },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DockerDfKind {
+    Images,
+    Containers,
+    Volumes,
+    BuildCache,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DockerListKind {
+    Images,
+    Containers,
+    Volumes,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PruneConfirmChoice {
+    Yes,
+    No,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeleteConfirmChoice {
     Yes,
     No,
 }
@@ -86,6 +129,26 @@ pub struct PruneOutput {
 #[derive(Clone, Debug)]
 pub struct LogOutput {
     pub title: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteConfirm {
+    pub kind: DeleteKind,
+    pub name: String,
+    pub id: String,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeleteKind {
+    Image,
+    Container,
+    Volume,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LogOutputMode {
+    Logs,
+    Inspect,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +284,10 @@ pub struct AppState {
     pub prune_output: Option<PruneOutput>,
     /// Hover state for prune output modal close button
     pub prune_output_hover: bool,
+    /// Pending delete confirmation
+    pub pending_delete: Option<DeleteConfirm>,
+    /// Hovered choice in delete confirmation modal
+    pub pending_delete_hover: Option<DeleteConfirmChoice>,
     /// Environment modal open
     pub env_modal_open: bool,
     /// Hover state for environment modal close button
@@ -231,6 +298,12 @@ pub struct AppState {
     pub log_output: Option<LogOutput>,
     /// Hover state for log output modal close button
     pub log_output_hover: bool,
+    /// Hover state for log output modal select button
+    pub log_select_hover: bool,
+    /// Mouse selection mode for log output (disables mouse capture)
+    pub log_select_mode: bool,
+    /// Mode for log output modal rendering
+    pub log_output_mode: LogOutputMode,
     /// Normalized log text for rendering
     pub log_text: String,
     /// Cached wrapped lines for log output
@@ -259,6 +332,16 @@ pub struct AppState {
     pub term_height: u16,
     /// Hovered PM2 row in the Node view
     pub pm2_hover_row: Option<usize>,
+    /// Docker list modal open
+    pub docker_list_open: bool,
+    /// Docker list modal kind (images/containers)
+    pub docker_list_kind: Option<DockerListKind>,
+    /// Docker list modal items
+    pub docker_list_items: Vec<DockerListItem>,
+    /// Selected index in docker list modal
+    pub docker_list_selected: usize,
+    /// Hover state for docker list modal close button
+    pub docker_list_hover: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -339,11 +422,16 @@ impl AppState {
             prune_in_progress: None,
             prune_output: None,
             prune_output_hover: false,
+            pending_delete: None,
+            pending_delete_hover: None,
             env_modal_open: false,
             env_modal_hover: false,
             log_in_progress: None,
             log_output: None,
             log_output_hover: false,
+            log_select_hover: false,
+            log_select_mode: false,
+            log_output_mode: LogOutputMode::Logs,
             log_text: String::new(),
             log_lines: Vec::new(),
             log_wrap_width: 0,
@@ -358,6 +446,11 @@ impl AppState {
             term_width: 0,
             term_height: 0,
             pm2_hover_row: None,
+            docker_list_open: false,
+            docker_list_kind: None,
+            docker_list_items: Vec::new(),
+            docker_list_selected: 0,
+            docker_list_hover: false,
         }
     }
 
@@ -415,6 +508,88 @@ impl AppState {
                 any_completed = true;
                 continue;
             }
+            if let Some(title) = msg.container_id.strip_prefix("inspect::") {
+                self.log_in_progress = None;
+                self.log_refresh_in_progress = false;
+                let output = msg
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| if msg.message.is_empty() { "No output.".to_string() } else { msg.message.clone() });
+                self.set_log_output(title.to_string(), output);
+                self.log_output_hover = false;
+                self.log_select_hover = false;
+                self.log_select_mode = false;
+                self.log_output_mode = LogOutputMode::Inspect;
+                self.log_follow = false;
+                self.log_scroll = 0;
+                self.log_source = None;
+                if !msg.success && !msg.message.is_empty() {
+                    self.set_message(format!("Failed to load inspect: {}", msg.message));
+                }
+                any_completed = true;
+                continue;
+            }
+            if let Some(id) = msg.container_id.strip_prefix("image-delete::") {
+                if msg.success {
+                    if self.docker_list_open
+                        && self.docker_list_kind == Some(DockerListKind::Images)
+                    {
+                        self.docker_list_items.retain(|item| item.id != id);
+                        if self.docker_list_selected >= self.docker_list_items.len() {
+                            self.docker_list_selected = self
+                                .docker_list_items
+                                .len()
+                                .saturating_sub(1);
+                        }
+                    }
+                }
+                if !msg.message.is_empty() {
+                    self.set_message(msg.message);
+                }
+                any_completed = true;
+                continue;
+            }
+            if let Some(id) = msg.container_id.strip_prefix("container-delete::") {
+                if msg.success {
+                    if self.docker_list_open
+                        && self.docker_list_kind == Some(DockerListKind::Containers)
+                    {
+                        self.docker_list_items.retain(|item| item.id != id);
+                        if self.docker_list_selected >= self.docker_list_items.len() {
+                            self.docker_list_selected = self
+                                .docker_list_items
+                                .len()
+                                .saturating_sub(1);
+                        }
+                    }
+                }
+                if !msg.message.is_empty() {
+                    self.set_message(msg.message);
+                }
+                any_completed = true;
+                continue;
+            }
+            if let Some(name) = msg.container_id.strip_prefix("volume-delete::") {
+                if msg.success {
+                    if self.docker_list_open
+                        && self.docker_list_kind == Some(DockerListKind::Volumes)
+                    {
+                        self.docker_list_items
+                            .retain(|item| item.name != name);
+                        if self.docker_list_selected >= self.docker_list_items.len() {
+                            self.docker_list_selected = self
+                                .docker_list_items
+                                .len()
+                                .saturating_sub(1);
+                        }
+                    }
+                }
+                if !msg.message.is_empty() {
+                    self.set_message(msg.message);
+                }
+                any_completed = true;
+                continue;
+            }
             // Only remove from pending on failure - success keeps it pending until state matches
             if !msg.success {
                 self.pending_operations.remove(&msg.container_id);
@@ -459,7 +634,10 @@ impl AppState {
     pub fn clear_log_state(&mut self) {
         self.log_output = None;
         self.log_output_hover = false;
+        self.log_select_hover = false;
         self.log_source = None;
+        self.log_select_mode = false;
+        self.log_output_mode = LogOutputMode::Logs;
         self.log_follow = true;
         self.log_scroll = 0;
         self.log_refresh_in_progress = false;
