@@ -141,7 +141,7 @@ pub fn group_containers(
 
     let other = grouped.remove("Other");
 
-    // Convert to vec and sort by activity (most recent first)
+    // Convert to vec and sort groups by activity (most recent first)
     let mut buckets: Vec<_> = grouped.into_values().collect();
     buckets.sort_by_key(|b| b.min_activity);
 
@@ -150,8 +150,14 @@ pub fn group_containers(
     let mut first_group = true;
 
     for mut bucket in buckets {
-        // Sort containers within group by activity (most recent first)
-        bucket.containers.sort_by_key(|c| c.activity_secs);
+        // Sort containers within group by name (A-Z)
+        bucket.containers.sort_by(|a, b| {
+            let a_name = a.name.to_lowercase();
+            let b_name = b.name.to_lowercase();
+            a_name
+                .cmp(&b_name)
+                .then_with(|| a.activity_secs.cmp(&b.activity_secs))
+        });
 
         if !first_group {
             rows.push(DockerRow::Separator);
@@ -179,7 +185,13 @@ pub fn group_containers(
 
     // "Other" group always goes last
     if let Some(mut bucket) = other {
-        bucket.containers.sort_by_key(|c| c.activity_secs);
+        bucket.containers.sort_by(|a, b| {
+            let a_name = a.name.to_lowercase();
+            let b_name = b.name.to_lowercase();
+            a_name
+                .cmp(&b_name)
+                .then_with(|| a.activity_secs.cmp(&b.activity_secs))
+        });
 
         if !rows.is_empty() {
             rows.push(DockerRow::Separator);

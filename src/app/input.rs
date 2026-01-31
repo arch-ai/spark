@@ -3,11 +3,17 @@ use sysinfo::System;
 
 use crate::app::actions::{
     enter_env_view, kill_selected_in_docker, kill_selected_port_process, kill_selected_process,
-    open_selected_container, open_selected_container_logs, open_selected_env, start_log_fetch,
+    open_selected_container, open_selected_container_logs, open_selected_env, start_inspect_fetch,
+    start_log_fetch,
 };
-use crate::app::state::{view_for_sidebar_index, ContextMenu, ContextMenuAction, ContextMenuTarget, Focus, InputMode, LogSource, OperationComplete, PruneConfirmChoice, SortBy, ViewMode};
+use crate::app::state::{
+    view_for_sidebar_index, ContextMenu, ContextMenuAction, ContextMenuTarget, DeleteConfirm,
+    DeleteConfirmChoice, DeleteKind, 
+    DockerDfKind, DockerListKind, Focus, InputMode, LogOutputMode, LogSource, OperationComplete,
+    PruneConfirmChoice, SortBy, ViewMode,
+};
 use crate::app::AppState;
-use crate::system::docker::{ContainerInfo, DockerRow};
+use crate::system::docker::{ContainerInfo, DockerListItem, DockerRow};
 use crate::system::node::open_path_location;
 use crate::system::process::{self, load_process_logs};
 
@@ -22,6 +28,22 @@ pub(crate) fn handle_key_event(
         return true;
     }
 
+    if let Some(confirm) = state.pending_delete.clone() {
+        match key.code {
+            KeyCode::Char('y') => {
+                state.pending_delete = None;
+                state.pending_delete_hover = None;
+                start_delete_action(state, confirm);
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                state.pending_delete = None;
+                state.pending_delete_hover = None;
+                state.set_message("Delete canceled.");
+            }
+            _ => {}
+        }
+        return false;
+    }
     if let Some(action) = state.pending_prune {
         match key.code {
             KeyCode::Char('y') => {
@@ -48,6 +70,8 @@ pub(crate) fn handle_key_event(
     if state.log_output.is_some() {
         if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
             state.clear_log_state();
+        } else if matches!(key.code, KeyCode::Char('v')) && state.log_output_mode == LogOutputMode::Logs {
+            toggle_log_select_mode(state);
         } else if let Some((viewport_w, viewport_h)) = log_modal_inner_size(state) {
             match key.code {
                 KeyCode::Up => {
@@ -78,6 +102,9 @@ pub(crate) fn handle_key_event(
             }
         }
         return false;
+    }
+    if state.docker_list_open {
+        return handle_docker_list_modal_mode(key, state);
     }
     if state.env_modal_open {
         return handle_env_modal_mode(key, state);
@@ -448,6 +475,47 @@ fn handle_env_modal_mode(key: KeyEvent, state: &mut AppState) -> bool {
     false
 }
 
+fn handle_docker_list_modal_mode(key: KeyEvent, state: &mut AppState) -> bool {
+    let total = state.docker_list_items.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            state.docker_list_open = false;
+            state.docker_list_hover = false;
+            state.context_menu = None;
+        }
+        KeyCode::Up => {
+            if total > 0 && state.docker_list_selected > 0 {
+                state.docker_list_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if total > 0 && state.docker_list_selected + 1 < total {
+                state.docker_list_selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            state.docker_list_selected = state.docker_list_selected.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            if total > 0 {
+                state.docker_list_selected = (state.docker_list_selected + 10).min(total - 1);
+            }
+        }
+        KeyCode::Home => {
+            if total > 0 {
+                state.docker_list_selected = 0;
+            }
+        }
+        KeyCode::End => {
+            if total > 0 {
+                state.docker_list_selected = total - 1;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn move_ports_selection(state: &mut AppState, direction: isize) -> bool {
     if direction == 0 {
         return false;
@@ -548,6 +616,9 @@ pub(crate) fn handle_mouse_event(
     let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
     let main_width = if show_sidebar { width.saturating_sub(SIDEBAR_WIDTH + 1) } else { width };
 
+    if state.pending_delete.is_some() {
+        return handle_delete_confirm_mouse(mouse, state, main_x, main_width, height);
+    }
     if state.pending_prune.is_some() {
         return handle_prune_confirm_mouse(mouse, state, main_x, main_width, height);
     }
@@ -558,45 +629,23 @@ pub(crate) fn handle_mouse_event(
         return handle_env_modal_mouse(mouse, state, main_x, main_width, height);
     }
     if state.log_output.is_some() {
+        if state.log_select_mode {
+            return false;
+        }
         return handle_log_output_mouse(mouse, state, main_x, main_width, height);
     }
     if state.log_in_progress.is_some() {
         return true;
     }
-
-    // If context menu is open, handle it first
-    if let Some(ref menu) = state.context_menu {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Check if click is inside menu
-                if let Some(action) = get_menu_action_at(menu, x, y) {
-                    let target = menu.target.clone();
-                    state.context_menu = None;
-                    execute_context_action(state, action, &target, containers, pm2_view, pm2_rows);
-                    return true;
-                }
-                // Click outside menu - close it
-                state.context_menu = None;
-                return true;
-            }
-            MouseEventKind::Moved => {
-                // Update menu hover only if it changed
-                let new_hover = get_menu_item_at(menu, x, y);
-                if let Some(menu) = state.context_menu.as_mut() {
-                    if menu.hover != new_hover {
-                        menu.hover = new_hover;
-                        return true;
-                    }
-                }
-                return false;
-            }
-            MouseEventKind::Down(MouseButton::Right) => {
-                // Right-click closes menu
-                state.context_menu = None;
-                return true;
-            }
-            _ => return false,
+    if state.docker_list_open {
+        if let Some(result) = handle_context_menu_mouse(mouse, state, containers, pm2_view, pm2_rows) {
+            return result;
         }
+        return handle_docker_list_modal_mouse(mouse, state, main_x, main_width, width, height);
+    }
+
+    if let Some(result) = handle_context_menu_mouse(mouse, state, containers, pm2_view, pm2_rows) {
+        return result;
     }
 
     match mouse.kind {
@@ -1124,7 +1173,7 @@ fn handle_node_hover(state: &mut AppState, y: u16, table_start: u16, table_heigh
 }
 
 // Context menu constants
-const MENU_WIDTH: u16 = 16;
+const MENU_WIDTH: u16 = 28;
 const MENU_PADDING: u16 = 1;
 
 /// Position context menu within terminal bounds
@@ -1170,16 +1219,20 @@ fn handle_docker_right_click(
         let df_hover = (y - 9) as usize;
         let (target, items) = match df_hover {
             0 => (
-                ContextMenuTarget::DockerDf,
-                vec![ContextMenuAction::PruneDanglingImages],
+                ContextMenuTarget::DockerDf { kind: DockerDfKind::Images },
+                vec![ContextMenuAction::ShowImages, ContextMenuAction::PruneDanglingImages],
+            ),
+            1 => (
+                ContextMenuTarget::DockerDf { kind: DockerDfKind::Containers },
+                vec![ContextMenuAction::ShowContainers],
             ),
             3 => (
-                ContextMenuTarget::DockerDf,
+                ContextMenuTarget::DockerDf { kind: DockerDfKind::BuildCache },
                 vec![ContextMenuAction::PruneBuildCache],
             ),
             2 => (
-                ContextMenuTarget::DockerDf,
-                vec![ContextMenuAction::PruneVolumes],
+                ContextMenuTarget::DockerDf { kind: DockerDfKind::Volumes },
+                vec![ContextMenuAction::ShowVolumes, ContextMenuAction::PruneVolumes],
             ),
             _ => return,
         };
@@ -1251,6 +1304,7 @@ fn handle_docker_right_click(
                 vec![
                     ContextMenuAction::Shell,
                     ContextMenuAction::Logs,
+                    ContextMenuAction::LogsNewWindow,
                     ContextMenuAction::Env,
                     ContextMenuAction::Stop,
                     ContextMenuAction::Restart,
@@ -1258,13 +1312,14 @@ fn handle_docker_right_click(
             } else {
                 vec![
                     ContextMenuAction::Logs,
+                    ContextMenuAction::LogsNewWindow,
                     ContextMenuAction::Env,
                     ContextMenuAction::Start,
                 ]
             };
             if has_compose_cwd {
-                let insert_idx = if container.running { 3 } else { 2 };
-                items.insert(insert_idx.min(items.len()), ContextMenuAction::OpenLocation);
+            let insert_idx = if container.running { 4 } else { 3 };
+            items.insert(insert_idx.min(items.len()), ContextMenuAction::OpenLocation);
             }
             (target, items, false, Some(format!("Container: {}", container.name)))
         }
@@ -1612,6 +1667,47 @@ fn handle_node_right_click(
     });
 }
 
+fn handle_context_menu_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    containers: &[ContainerInfo],
+    pm2_view: &[crate::system::node::Pm2Process],
+    pm2_rows: &[usize],
+) -> Option<bool> {
+    let menu = state.context_menu.as_ref()?;
+    let x = mouse.column;
+    let y = mouse.row;
+    let result = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(action) = get_menu_action_at(menu, x, y) {
+                let target = menu.target.clone();
+                state.context_menu = None;
+                execute_context_action(state, action, &target, containers, pm2_view, pm2_rows);
+                true
+            } else {
+                state.context_menu = None;
+                true
+            }
+        }
+        MouseEventKind::Moved => {
+            let new_hover = get_menu_item_at(menu, x, y);
+            if let Some(menu) = state.context_menu.as_mut() {
+                if menu.hover != new_hover {
+                    menu.hover = new_hover;
+                    return Some(true);
+                }
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            state.context_menu = None;
+            true
+        }
+        _ => false,
+    };
+    Some(result)
+}
+
 fn get_menu_item_at(menu: &ContextMenu, x: u16, y: u16) -> Option<usize> {
     let menu_x = menu.x;
     let menu_y = menu.y + MENU_PADDING + menu_header_offset(menu) as u16;
@@ -1816,6 +1912,64 @@ fn execute_context_action(
         return;
     }
 
+    if matches!(action, ContextMenuAction::Inspect) {
+        match target {
+            ContextMenuTarget::DockerImage { id, name } => {
+                let id = id.clone();
+                let title = format!("Inspect image: {}", name);
+                start_inspect_fetch(state, title, move || crate::system::docker::inspect_docker_image(&id));
+            }
+            ContextMenuTarget::DockerContainer { id, name } | ContextMenuTarget::Container { id, name, .. } => {
+                let id = id.clone();
+                let title = format!("Inspect container: {}", name);
+                start_inspect_fetch(state, title, move || crate::system::docker::inspect_docker_container(&id));
+            }
+            ContextMenuTarget::DockerVolume { name } => {
+                let name = name.clone();
+                let title = format!("Inspect volume: {}", name);
+                start_inspect_fetch(state, title, move || crate::system::docker::inspect_docker_volume(&name));
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if matches!(
+        action,
+        ContextMenuAction::DeleteImage
+            | ContextMenuAction::DeleteContainer
+            | ContextMenuAction::DeleteVolume
+    ) {
+        match (action, target) {
+            (ContextMenuAction::DeleteImage, ContextMenuTarget::DockerImage { id, name }) => {
+                request_delete_confirmation(
+                    state,
+                    DeleteKind::Image,
+                    name.clone(),
+                    id.clone(),
+                );
+            }
+            (ContextMenuAction::DeleteContainer, ContextMenuTarget::DockerContainer { id, name }) => {
+                request_delete_confirmation(
+                    state,
+                    DeleteKind::Container,
+                    name.clone(),
+                    id.clone(),
+                );
+            }
+            (ContextMenuAction::DeleteVolume, ContextMenuTarget::DockerVolume { name }) => {
+                request_delete_confirmation(
+                    state,
+                    DeleteKind::Volume,
+                    name.clone(),
+                    name.clone(),
+                );
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if let ContextMenuTarget::Container { id, name, .. } = target {
         if matches!(action, ContextMenuAction::OpenLocation) {
             let compose_path = containers
@@ -1851,6 +2005,16 @@ fn execute_context_action(
                         },
                         move || crate::system::docker::load_container_logs(&id),
                     );
+                }
+                ContextMenuAction::LogsNewWindow => {
+                    match crate::system::docker::open_container_logs(id) {
+                        Ok(()) => {
+                            state.set_message(format!("Opening logs for {}", name));
+                        }
+                        Err(err) => {
+                            state.set_message(format!("Failed to open logs: {}", err));
+                        }
+                    }
                 }
                 ContextMenuAction::Shell => {
                     state.set_message(format!("Opening shell in {}...", name));
@@ -1888,6 +2052,19 @@ fn execute_context_action(
             | ContextMenuAction::PruneVolumes
     ) {
         request_prune_confirmation(state, action);
+        return;
+    }
+
+    if matches!(
+        action,
+        ContextMenuAction::ShowImages | ContextMenuAction::ShowContainers | ContextMenuAction::ShowVolumes
+    ) {
+        match action {
+            ContextMenuAction::ShowImages => open_docker_list_modal(state, DockerListKind::Images),
+            ContextMenuAction::ShowContainers => open_docker_list_modal(state, DockerListKind::Containers),
+            ContextMenuAction::ShowVolumes => open_docker_list_modal(state, DockerListKind::Volumes),
+            _ => {}
+        }
         return;
     }
 
@@ -1969,7 +2146,12 @@ fn execute_context_action(
         }
         // Process targets are handled at the start of the function
         ContextMenuTarget::Process { .. } => {}
-        ContextMenuTarget::DockerDf => {}
+        ContextMenuTarget::DockerDf { kind } => {
+            let _ = kind;
+        }
+        ContextMenuTarget::DockerImage { .. } => {}
+        ContextMenuTarget::DockerContainer { .. } => {}
+        ContextMenuTarget::DockerVolume { .. } => {}
     }
 }
 
@@ -2066,13 +2248,92 @@ fn looks_like_node_binary(path: &std::path::Path) -> bool {
         || path_lower.ends_with("/bin/deno")
 }
 
+fn open_docker_list_modal(state: &mut AppState, kind: DockerListKind) {
+    let (items, label) = match kind {
+        DockerListKind::Images => (crate::system::docker::load_docker_images(), "images"),
+        DockerListKind::Containers => (
+            crate::system::docker::load_docker_containers_with_size(),
+            "containers",
+        ),
+        DockerListKind::Volumes => (crate::system::docker::load_docker_volumes(), "volumes"),
+    };
+
+    let mut items = match items {
+        Ok(items) => items,
+        Err(err) => {
+            state.set_message(format!("Failed to load {}: {}", label, err));
+            vec![DockerListItem {
+                name: format!("Failed to load {}.", label),
+                id: "-".to_string(),
+                size: "-".to_string(),
+                detail_left: "-".to_string(),
+                detail_right: "-".to_string(),
+            }]
+        }
+    };
+
+    if matches!(kind, DockerListKind::Images | DockerListKind::Containers) {
+        items.sort_by(|a, b| {
+            let a_size = docker_size_bytes(&a.size);
+            let b_size = docker_size_bytes(&b.size);
+            b_size.cmp(&a_size)
+        });
+    }
+
+    state.context_menu = None;
+    state.docker_list_open = true;
+    state.docker_list_kind = Some(kind);
+    state.docker_list_items = items;
+    state.docker_list_selected = 0;
+    state.docker_list_hover = false;
+}
+
+fn docker_size_bytes(raw: &str) -> u64 {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "-" {
+        return 0;
+    }
+    let main = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or(trimmed)
+        .split('(')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    let mut num = String::new();
+    let mut unit = String::new();
+    for ch in main.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num.push(ch);
+        } else if !ch.is_whitespace() {
+            unit.push(ch);
+        }
+    }
+    let value: f64 = num.parse().unwrap_or(0.0);
+    let unit_lower = unit.to_lowercase();
+    let multiplier = match unit_lower.as_str() {
+        "b" => 1.0,
+        "kb" => 1_000.0,
+        "kib" => 1_024.0,
+        "mb" => 1_000_000.0,
+        "mib" => 1_048_576.0,
+        "gb" => 1_000_000_000.0,
+        "gib" => 1_073_741_824.0,
+        "tb" => 1_000_000_000_000.0,
+        "tib" => 1_099_511_627_776.0,
+        _ => 1.0,
+    };
+    (value * multiplier).round() as u64
+}
+
 fn request_prune_confirmation(state: &mut AppState, action: ContextMenuAction) {
     if state.pending_prune.is_some() {
         return;
     }
     let label = match action {
         ContextMenuAction::PruneBuildCache => "build cache",
-        ContextMenuAction::PruneDanglingImages => "dangling images",
+        ContextMenuAction::PruneDanglingImages => "unused images",
         ContextMenuAction::PruneVolumes => "volumes",
         _ => return,
     };
@@ -2080,10 +2341,19 @@ fn request_prune_confirmation(state: &mut AppState, action: ContextMenuAction) {
     state.set_message(format!("Confirm prune {}? (y/n)", label));
 }
 
+fn request_delete_confirmation(state: &mut AppState, kind: DeleteKind, name: String, id: String) {
+    if state.pending_delete.is_some() {
+        return;
+    }
+    state.pending_delete = Some(DeleteConfirm { kind, name, id });
+    state.pending_delete_hover = None;
+    state.set_message("Confirm delete? (y/n)");
+}
+
 fn start_prune_action(state: &mut AppState, action: ContextMenuAction) {
     let (label, command) = match action {
         ContextMenuAction::PruneBuildCache => ("build cache", crate::system::docker::prune_build_cache as fn() -> std::io::Result<String>),
-        ContextMenuAction::PruneDanglingImages => ("dangling images", crate::system::docker::prune_dangling_images as fn() -> std::io::Result<String>),
+        ContextMenuAction::PruneDanglingImages => ("unused images", crate::system::docker::prune_dangling_images as fn() -> std::io::Result<String>),
         ContextMenuAction::PruneVolumes => ("volumes", crate::system::docker::prune_volumes as fn() -> std::io::Result<String>),
         _ => return,
     };
@@ -2113,6 +2383,34 @@ fn start_prune_action(state: &mut AppState, action: ContextMenuAction) {
             success,
             message,
             output,
+        });
+    });
+}
+
+fn start_delete_action(state: &mut AppState, confirm: DeleteConfirm) {
+    let (kind_label, id_label) = match confirm.kind {
+        DeleteKind::Image => ("image", confirm.id.clone()),
+        DeleteKind::Container => ("container", confirm.id.clone()),
+        DeleteKind::Volume => ("volume", confirm.name.clone()),
+    };
+    state.set_message(format!("Deleting {} {}...", kind_label, confirm.name));
+    let tx = state.operation_tx.clone();
+    std::thread::spawn(move || {
+        let result = match confirm.kind {
+            DeleteKind::Image => crate::system::docker::delete_docker_image(&confirm.id),
+            DeleteKind::Container => crate::system::docker::delete_docker_container(&confirm.id),
+            DeleteKind::Volume => crate::system::docker::delete_docker_volume(&confirm.name),
+        };
+        let success = result.is_ok();
+        let message = match result {
+            Ok(()) => format!("Deleted {} {}", kind_label, confirm.name),
+            Err(err) => format!("Failed to delete {} {}: {}", kind_label, confirm.name, err),
+        };
+        let _ = tx.send(OperationComplete {
+            container_id: format!("{}-delete::{}", kind_label, id_label),
+            success,
+            message,
+            output: None,
         });
     });
 }
@@ -2204,6 +2502,71 @@ fn handle_prune_confirm_mouse(
     }
 }
 
+fn handle_delete_confirm_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> bool {
+    let x = mouse.column;
+    let y = mouse.row;
+    let (modal_x, modal_y, modal_w, modal_h, yes_area, no_area) =
+        delete_confirm_layout(state, main_x, main_width, height);
+
+    let in_modal = x >= modal_x
+        && x < modal_x + modal_w
+        && y >= modal_y
+        && y < modal_y + modal_h;
+
+    match mouse.kind {
+        MouseEventKind::Moved => {
+            if !in_modal {
+                if state.pending_delete_hover.is_some() {
+                    state.pending_delete_hover = None;
+                    return true;
+                }
+                return false;
+            }
+            let hover = if point_in_rect(x, y, yes_area) {
+                Some(DeleteConfirmChoice::Yes)
+            } else if point_in_rect(x, y, no_area) {
+                Some(DeleteConfirmChoice::No)
+            } else {
+                None
+            };
+            if state.pending_delete_hover != hover {
+                state.pending_delete_hover = hover;
+                return true;
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if point_in_rect(x, y, yes_area) {
+                if let Some(confirm) = state.pending_delete.take() {
+                    state.pending_delete_hover = None;
+                    start_delete_action(state, confirm);
+                }
+                return true;
+            }
+            if point_in_rect(x, y, no_area) {
+                state.pending_delete = None;
+                state.pending_delete_hover = None;
+                state.set_message("Delete canceled.");
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            state.pending_delete = None;
+            state.pending_delete_hover = None;
+            state.set_message("Delete canceled.");
+            true
+        }
+        _ => in_modal,
+    }
+}
+
 fn handle_prune_output_mouse(
     mouse: MouseEvent,
     state: &mut AppState,
@@ -2256,10 +2619,11 @@ fn handle_log_output_mouse(
 ) -> bool {
     let x = mouse.column;
     let y = mouse.row;
-    let (modal_x, modal_y, modal_w, modal_h, close_area) =
+    let (modal_x, modal_y, modal_w, modal_h, close_area, select_area) =
         log_output_layout(state, main_x, main_width, height);
     let inner_width = modal_w.saturating_sub(4);
     let inner_height = modal_h.saturating_sub(6);
+    let show_select = state.log_output_mode == LogOutputMode::Logs;
 
     let in_modal = x >= modal_x
         && x < modal_x + modal_w
@@ -2280,16 +2644,29 @@ fn handle_log_output_mouse(
             in_modal
         }
         MouseEventKind::Moved => {
-            let hover = point_in_rect(x, y, close_area);
-            if state.log_output_hover != hover {
-                state.log_output_hover = hover;
-                return true;
+            let close_hover = point_in_rect(x, y, close_area);
+            let select_hover = show_select && point_in_rect(x, y, select_area);
+            let mut changed = false;
+            if state.log_output_hover != close_hover {
+                state.log_output_hover = close_hover;
+                changed = true;
             }
-            false
+            if show_select && state.log_select_hover != select_hover {
+                state.log_select_hover = select_hover;
+                changed = true;
+            } else if !show_select && state.log_select_hover {
+                state.log_select_hover = false;
+                changed = true;
+            }
+            changed
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if point_in_rect(x, y, close_area) {
                 state.clear_log_state();
+                return true;
+            }
+            if show_select && point_in_rect(x, y, select_area) {
+                toggle_log_select_mode(state);
                 return true;
             }
             in_modal
@@ -2299,6 +2676,19 @@ fn handle_log_output_mouse(
             true
         }
         _ => in_modal,
+    }
+}
+
+fn toggle_log_select_mode(state: &mut AppState) {
+    state.log_select_mode = !state.log_select_mode;
+    state.log_select_hover = false;
+    if state.log_select_mode {
+        state.log_follow = false;
+        state.log_last_scroll = std::time::Instant::now();
+    } else if let Some((viewport_w, viewport_h)) = log_modal_inner_size(state) {
+        state.log_follow = true;
+        state.log_scroll = state.log_max_scroll(viewport_w, viewport_h);
+        state.log_last_scroll = std::time::Instant::now();
     }
 }
 
@@ -2359,6 +2749,144 @@ fn handle_env_modal_mouse(
     }
 }
 
+fn handle_docker_list_modal_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    main_x: u16,
+    main_width: u16,
+    width: u16,
+    height: u16,
+) -> bool {
+    let x = mouse.column;
+    let y = mouse.row;
+    let (modal_x, modal_y, modal_w, modal_h, list_area, close_area) =
+        docker_list_modal_layout(state, main_x, main_width, height);
+    let (list_x, list_y, list_w, list_h) = list_area;
+    let in_modal = x >= modal_x
+        && x < modal_x + modal_w
+        && y >= modal_y
+        && y < modal_y + modal_h;
+
+    let total = state.docker_list_items.len();
+    let visible = docker_list_visible_height(list_h);
+    let scroll = docker_list_scroll_offset(state.docker_list_selected, visible, total);
+
+    let row_at = if y >= list_y.saturating_add(1)
+        && y < list_y.saturating_add(list_h)
+        && x >= list_x
+        && x < list_x + list_w
+    {
+        let rel = y.saturating_sub(list_y + 1) as usize;
+        let idx = scroll.saturating_add(rel);
+        if idx < total {
+            Some(idx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if in_modal && total > 0 && state.docker_list_selected > 0 {
+                state.docker_list_selected -= 1;
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::ScrollDown => {
+            if in_modal && total > 0 && state.docker_list_selected + 1 < total {
+                state.docker_list_selected += 1;
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::Moved => {
+            let hover = point_in_rect(x, y, close_area);
+            if state.docker_list_hover != hover {
+                state.docker_list_hover = hover;
+                return true;
+            }
+            false
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if point_in_rect(x, y, close_area) {
+                state.docker_list_open = false;
+                state.docker_list_hover = false;
+                state.context_menu = None;
+                return true;
+            }
+            if let Some(idx) = row_at {
+                state.docker_list_selected = idx;
+                return true;
+            }
+            in_modal
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(idx) = row_at {
+                state.docker_list_selected = idx;
+                if let Some(kind) = state.docker_list_kind {
+                    let item = &state.docker_list_items[idx];
+                    let (target, header) = match kind {
+                        DockerListKind::Images => (
+                            ContextMenuTarget::DockerImage {
+                                id: item.id.clone(),
+                                name: item.name.clone(),
+                            },
+                            format!("Image: {}", item.name),
+                        ),
+                        DockerListKind::Containers => (
+                            ContextMenuTarget::DockerContainer {
+                                id: item.id.clone(),
+                                name: item.name.clone(),
+                            },
+                            format!("Container: {}", item.name),
+                        ),
+                        DockerListKind::Volumes => (
+                            ContextMenuTarget::DockerVolume {
+                                name: item.name.clone(),
+                            },
+                            format!("Volume: {}", item.name),
+                        ),
+                    };
+                    let items = match kind {
+        DockerListKind::Images => {
+            vec![ContextMenuAction::Inspect, ContextMenuAction::DeleteImage]
+        }
+        DockerListKind::Containers => {
+            vec![ContextMenuAction::Inspect, ContextMenuAction::DeleteContainer]
+        }
+        DockerListKind::Volumes => {
+            vec![
+                ContextMenuAction::Inspect,
+                ContextMenuAction::DeleteVolume,
+                ContextMenuAction::PruneVolumes,
+            ]
+        }
+    };
+                    let (menu_x, menu_y) = position_context_menu(x, y, items.len() + 1, width, height);
+                    state.context_menu = Some(ContextMenu {
+                        x: menu_x,
+                        y: menu_y,
+                        items,
+                        hover: Some(0),
+                        target,
+                        is_group: false,
+                        header: Some(header),
+                    });
+                    return true;
+                }
+            }
+            state.docker_list_open = false;
+            state.docker_list_hover = false;
+            state.context_menu = None;
+            true
+        }
+        _ => in_modal,
+    }
+}
+
 pub(crate) fn log_modal_inner_size(state: &AppState) -> Option<(u16, u16)> {
     const SIDEBAR_WIDTH: u16 = 20;
     const MIN_MAIN_WIDTH: u16 = 40;
@@ -2372,7 +2900,7 @@ pub(crate) fn log_modal_inner_size(state: &AppState) -> Option<(u16, u16)> {
     } else {
         (0, term_width)
     };
-    let (_, _, modal_w, modal_h, _) = log_output_layout(state, main_x, main_width, term_height);
+    let (_, _, modal_w, modal_h, _, _) = log_output_layout(state, main_x, main_width, term_height);
     let inner_w = modal_w.saturating_sub(4);
     let inner_h = modal_h.saturating_sub(6);
     if inner_w == 0 || inner_h == 0 {
@@ -2435,6 +2963,34 @@ fn prune_confirm_layout(
     (x, y, width, height_box, yes_area, no_area)
 }
 
+fn delete_confirm_layout(
+    state: &AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> (u16, u16, u16, u16, (u16, u16, u16, u16), (u16, u16, u16, u16)) {
+    let label = state
+        .pending_delete
+        .as_ref()
+        .map(|p| p.name.as_str())
+        .unwrap_or("");
+    let width = 60u16.max(label.len() as u16 + 28);
+    let height_box = 9u16;
+    let x = main_x + (main_width.saturating_sub(width)) / 2;
+    let y = (height.saturating_sub(height_box)) / 2;
+
+    let button_w = 10u16;
+    let button_h = 1u16;
+    let buttons_y = y + height_box - 3;
+    let gap = 4u16;
+    let total_buttons_w = button_w * 2 + gap;
+    let buttons_x = x + (width.saturating_sub(total_buttons_w)) / 2;
+    let yes_area = (buttons_x, buttons_y, button_w, button_h);
+    let no_area = (buttons_x + button_w + gap, buttons_y, button_w, button_h);
+
+    (x, y, width, height_box, yes_area, no_area)
+}
+
 fn prune_output_layout(
     state: &AppState,
     main_x: u16,
@@ -2465,7 +3021,7 @@ fn log_output_layout(
     main_x: u16,
     main_width: u16,
     height: u16,
-) -> (u16, u16, u16, u16, (u16, u16, u16, u16)) {
+) -> (u16, u16, u16, u16, (u16, u16, u16, u16), (u16, u16, u16, u16)) {
     let label = state
         .log_output
         .as_ref()
@@ -2481,13 +3037,25 @@ fn log_output_layout(
     let x = main_x + (main_width.saturating_sub(width)) / 2;
     let y = (height.saturating_sub(height_box)) / 2;
 
-    let button_w = 10u16;
+    let button_w = 12u16;
     let button_h = 1u16;
     let button_y = y + height_box - 3;
-    let button_x = x + (width.saturating_sub(button_w)) / 2;
-    let close_area = (button_x, button_y, button_w, button_h);
+    let show_select = state.log_output_mode == LogOutputMode::Logs;
+    let (close_area, select_area) = if show_select {
+        let gap = 4u16;
+        let total_w = button_w.saturating_mul(2).saturating_add(gap);
+        let button_x = x + (width.saturating_sub(total_w)) / 2;
+        let select_area = (button_x, button_y, button_w, button_h);
+        let close_area = (button_x + button_w + gap, button_y, button_w, button_h);
+        (close_area, select_area)
+    } else {
+        let button_x = x + (width.saturating_sub(button_w)) / 2;
+        let close_area = (button_x, button_y, button_w, button_h);
+        let select_area = (0u16, 0u16, 0u16, 0u16);
+        (close_area, select_area)
+    };
 
-    (x, y, width, height_box, close_area)
+    (x, y, width, height_box, close_area, select_area)
 }
 
 fn env_modal_layout(
@@ -2514,6 +3082,52 @@ fn env_modal_layout(
     let close_area = (button_x, button_y, button_w, button_h);
 
     (x, y, width, height_box, close_area)
+}
+
+fn docker_list_modal_layout(
+    state: &AppState,
+    main_x: u16,
+    main_width: u16,
+    height: u16,
+) -> (u16, u16, u16, u16, (u16, u16, u16, u16), (u16, u16, u16, u16)) {
+    let title = match state.docker_list_kind {
+        Some(DockerListKind::Images) => "Docker Images",
+        Some(DockerListKind::Containers) => "Docker Containers",
+        Some(DockerListKind::Volumes) => "Docker Volumes",
+        None => "Docker List",
+    };
+    let max_width = main_width.saturating_sub(2).max(4);
+    let max_height = height.saturating_sub(2).max(6);
+    let width = (main_width.saturating_mul(88) / 100)
+        .max(70)
+        .max(title.len() as u16 + 24)
+        .min(max_width);
+    let height_box = (height.saturating_mul(80) / 100).max(14).min(max_height);
+    let x = main_x + (main_width.saturating_sub(width)) / 2;
+    let y = (height.saturating_sub(height_box)) / 2;
+
+    let list_area = (x + 2, y + 2, width.saturating_sub(4), height_box.saturating_sub(6));
+
+    let button_w = 10u16;
+    let button_h = 1u16;
+    let button_y = y + height_box - 3;
+    let button_x = x + (width.saturating_sub(button_w)) / 2;
+    let close_area = (button_x, button_y, button_w, button_h);
+
+    (x, y, width, height_box, list_area, close_area)
+}
+
+fn docker_list_visible_height(list_height: u16) -> usize {
+    list_height.saturating_sub(1) as usize
+}
+
+fn docker_list_scroll_offset(selected: usize, visible: usize, total: usize) -> usize {
+    if total <= visible || visible == 0 {
+        return 0;
+    }
+    let max_offset = total.saturating_sub(visible);
+    let ideal = selected.saturating_sub(visible / 2);
+    ideal.min(max_offset)
 }
 
 fn point_in_rect(x: u16, y: u16, rect: (u16, u16, u16, u16)) -> bool {

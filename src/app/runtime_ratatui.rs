@@ -6,6 +6,8 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use sysinfo::{Disks, Pid, System};
@@ -119,6 +121,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
     let mut term_height = size.height;
     state.term_width = term_width;
     state.term_height = term_height;
+    let mut mouse_capture_enabled = true;
 
     loop {
         // Handle input events
@@ -145,6 +148,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 let prev_view = state.view_mode;
                 let prev_log_open = state.log_output.is_some();
                 let prev_prune_open = state.prune_output.is_some();
+                let prev_list_open = state.docker_list_open;
 
                 if handle_key_event(key, &mut state, &mut system, &pm2_view, &pm2_rows) {
                     break;
@@ -155,7 +159,8 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 let zoom_changed = state.zoom != prev_zoom;
                 let view_changed = state.view_mode != prev_view;
                 let modal_closed = (prev_log_open && state.log_output.is_none())
-                    || (prev_prune_open && state.prune_output.is_none());
+                    || (prev_prune_open && state.prune_output.is_none())
+                    || (prev_list_open && !state.docker_list_open);
 
                 if filter_changed {
                     match state.view_mode {
@@ -212,6 +217,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 let prev_view = state.view_mode;
                 let prev_log_open = state.log_output.is_some();
                 let prev_prune_open = state.prune_output.is_some();
+                let prev_list_open = state.docker_list_open;
 
                 let mouse_needs_render = handle_mouse_event(
                     mouse,
@@ -225,7 +231,8 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 );
                 let view_changed = state.view_mode != prev_view;
                 let modal_closed = (prev_log_open && state.log_output.is_none())
-                    || (prev_prune_open && state.prune_output.is_none());
+                    || (prev_prune_open && state.prune_output.is_none())
+                    || (prev_list_open && !state.docker_list_open);
 
                 if view_changed {
                     process_dirty = true;
@@ -256,6 +263,16 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         let ports_active = matches!(state.view_mode, ViewMode::Ports);
         let process_active = matches!(state.view_mode, ViewMode::Process);
         let node_active = matches!(state.view_mode, ViewMode::Node);
+
+        let want_mouse_capture = !state.log_select_mode;
+        if want_mouse_capture != mouse_capture_enabled {
+            if want_mouse_capture {
+                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+            } else {
+                execute!(terminal.backend_mut(), DisableMouseCapture)?;
+            }
+            mouse_capture_enabled = want_mouse_capture;
+        }
 
         docker_worker.set_paused(log_modal_open || !docker_active);
         docker_df_worker.set_paused(log_modal_open || !docker_active);
@@ -365,6 +382,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         if state.log_output.is_some()
             && state.log_source.is_some()
             && !state.log_refresh_in_progress
+            && !state.log_select_mode
             && state.log_last_scroll.elapsed() >= Duration::from_millis(400)
             && state.log_last_refresh.elapsed() >= Duration::from_secs(1)
         {
