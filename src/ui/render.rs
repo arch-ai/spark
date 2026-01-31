@@ -11,7 +11,10 @@ use ratatui::{
 };
 use sysinfo::Pid;
 
-use crate::app::{AppState, Focus, InputMode, SortBy, SortOrder, ViewMode};
+use crate::app::{
+    AppState, DeleteConfirmChoice, DeleteKind, DockerListKind, Focus, InputMode, LogOutputMode,
+    SortBy, SortOrder, ViewMode,
+};
 use crate::system::docker::DockerSystemDf;
 use crate::system::{docker, node, ports, process};
 
@@ -102,18 +105,19 @@ pub fn render_ratatui(
         }
     }
 
-    // Render context menu if active
-    if state.context_menu.is_some() {
-        render_context_menu(frame, state, main_area);
-    }
-
-    let other_modal_open = state.pending_prune.is_some()
+    let blocking_modal_open = state.pending_delete.is_some()
+        || state.pending_prune.is_some()
         || state.prune_in_progress.is_some()
         || state.prune_output.is_some()
         || state.log_in_progress.is_some()
         || state.log_output.is_some();
-    if other_modal_open || state.env_modal_open {
+    let any_modal_open = blocking_modal_open || state.env_modal_open || state.docker_list_open;
+    if any_modal_open {
         render_modal_overlay(frame, frame.area());
+    }
+
+    if state.pending_delete.is_some() {
+        render_delete_confirm(frame, state, main_area);
     }
 
     if state.pending_prune.is_some() {
@@ -136,8 +140,16 @@ pub fn render_ratatui(
         render_log_output(frame, state, main_area);
     }
 
-    if state.env_modal_open && !other_modal_open {
+    if state.env_modal_open && !blocking_modal_open {
         render_env_modal(frame, state, main_area);
+    }
+    if state.docker_list_open && !blocking_modal_open && !state.env_modal_open {
+        render_docker_list_modal(frame, state, main_area);
+    }
+
+    // Render context menu if active
+    if state.context_menu.is_some() {
+        render_context_menu(frame, state, main_area);
     }
 }
 
@@ -394,7 +406,7 @@ fn render_docker_view(
         ],
         vec![
             HelpItem::key("Right click"),
-            HelpItem::plain(" DF prune "),
+            HelpItem::plain(" DF actions "),
             HelpItem::key("Ctrl+B"),
             HelpItem::plain(" cache "),
             HelpItem::key("Ctrl+I"),
@@ -1093,7 +1105,7 @@ fn render_context_menu(frame: &mut Frame, state: &AppState, main_area: Rect) {
 fn render_prune_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let label = match state.pending_prune {
         Some(crate::app::ContextMenuAction::PruneBuildCache) => "build cache",
-        Some(crate::app::ContextMenuAction::PruneDanglingImages) => "dangling images",
+        Some(crate::app::ContextMenuAction::PruneDanglingImages) => "unused images",
         Some(crate::app::ContextMenuAction::PruneVolumes) => "volumes",
         _ => return,
     };
@@ -1107,8 +1119,8 @@ fn render_prune_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
     if label == "volumes" {
         text.push(Line::from("WARNING! This will remove all volumes not used by at least one container."));
         text.push(Line::from("Are you sure you want to continue?"));
-    } else if label == "dangling images" {
-        text.push(Line::from("WARNING! This will remove all images without at least one container associated to them."));
+    } else if label == "unused images" {
+        text.push(Line::from("WARNING! This will remove all images not used by any container."));
         text.push(Line::from("Are you sure you want to continue?"));
     } else if label == "build cache" {
         text.push(Line::from("WARNING! This will remove all unused build cache."));
@@ -1162,6 +1174,84 @@ fn render_prune_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
     frame.render_widget(Paragraph::new(no_text), Rect::new(buttons_x + button_w + gap, buttons_y, button_w, 1));
 }
 
+fn render_delete_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
+    let Some(confirm) = state.pending_delete.as_ref() else {
+        return;
+    };
+    let (kind_label, warning_line) = match confirm.kind {
+        DeleteKind::Image => (
+            "image",
+            "WARNING! This will remove the image and any untagged layers.",
+        ),
+        DeleteKind::Container => (
+            "container",
+            "WARNING! This will remove the container and its writable layer.",
+        ),
+        DeleteKind::Volume => (
+            "volume",
+            "WARNING! This will remove the volume and all its data.",
+        ),
+    };
+
+    let mut text = vec![Line::from(vec![
+        Span::styled("Confirm delete ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(kind_label),
+        Span::raw("?"),
+    ])];
+    text.push(Line::from(warning_line));
+    if confirm.kind == DeleteKind::Container {
+        text.push(Line::from("If running, it will be stopped and removed."));
+    }
+    text.push(Line::from(vec![
+        Span::styled("Y", Style::default().fg(Color::Yellow)),
+        Span::raw(" = yes, "),
+        Span::styled("N/Esc", Style::default().fg(Color::Yellow)),
+        Span::raw(" = cancel"),
+    ]));
+
+    let width = 60u16.max(confirm.name.len() as u16 + 28);
+    let height = 9u16;
+    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
+    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Confirm Delete: {} ", confirm.name));
+    frame.render_widget(block, area);
+
+    let inner = Rect::new(area.x + 2, area.y + 2, area.width.saturating_sub(4), area.height.saturating_sub(6));
+    frame.render_widget(Paragraph::new(text), inner);
+
+    let button_w = 10u16;
+    let gap = 4u16;
+    let total_buttons_w = button_w * 2 + gap;
+    let buttons_x = area.x + (area.width.saturating_sub(total_buttons_w)) / 2;
+    let buttons_y = area.y + area.height - 3;
+
+    let yes_hover = state.pending_delete_hover == Some(DeleteConfirmChoice::Yes);
+    let no_hover = state.pending_delete_hover == Some(DeleteConfirmChoice::No);
+    let yes_style = if yes_hover {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::Black).fg(Color::White)
+    };
+    let no_style = if no_hover {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::Black).fg(Color::White)
+    };
+
+    let yes_text = Line::from(Span::styled(" [ Yes ] ", yes_style));
+    let no_text = Line::from(Span::styled(" [ No ] ", no_style));
+    frame.render_widget(Paragraph::new(yes_text), Rect::new(buttons_x, buttons_y, button_w, 1));
+    frame.render_widget(
+        Paragraph::new(no_text),
+        Rect::new(buttons_x + button_w + gap, buttons_y, button_w, 1),
+    );
+}
+
 fn render_prune_progress(frame: &mut Frame, state: &AppState, main_area: Rect, label: &str) {
     let spinner = state.spinner_char();
     let text = vec![
@@ -1205,7 +1295,15 @@ fn render_prune_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let area = Rect::new(x, y, width, height);
 
     frame.render_widget(ratatui::widgets::Clear, area);
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let bg_color = if output.label == "build cache" {
+        Color::Reset
+    } else {
+        Color::Black
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(bg_color).fg(Color::White));
     frame.render_widget(block, area);
 
     let inner = Rect::new(
@@ -1214,12 +1312,19 @@ fn render_prune_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
         area.width.saturating_sub(4),
         area.height.saturating_sub(6),
     );
-    let text = if output.output.trim().is_empty() {
+    let cleaned = output.output.replace('\r', "").replace('\t', " ");
+    let text = if cleaned.trim().is_empty() {
         "No output from docker.".to_string()
     } else {
-        output.output.clone()
+        cleaned
     };
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
+    frame.render_widget(ratatui::widgets::Clear, inner);
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().bg(bg_color).fg(Color::White)),
+        inner,
+    );
 
     let button_w = 10u16;
     let button_y = area.y + area.height.saturating_sub(3);
@@ -1235,8 +1340,13 @@ fn render_prune_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
 }
 
 fn render_log_progress(frame: &mut Frame, state: &AppState, main_area: Rect, label: &str) {
+    let prefix = if state.log_output_mode == LogOutputMode::Inspect {
+        "Loading inspect for "
+    } else {
+        "Loading logs for "
+    };
     let mut text = vec![Line::from(vec![
-        Span::styled("Loading logs for ", Style::default().fg(Color::White)),
+        Span::styled(prefix, Style::default().fg(Color::White)),
         Span::styled(label, Style::default().fg(Color::Yellow)),
         Span::raw("..."),
     ])];
@@ -1253,9 +1363,11 @@ fn render_log_progress(frame: &mut Frame, state: &AppState, main_area: Rect, lab
     let area = Rect::new(x, y, width, height);
 
     frame.render_widget(ratatui::widgets::Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Logs ");
+    let block = if state.log_output_mode == LogOutputMode::Inspect {
+        Block::default().borders(Borders::ALL).title(" Inspect ")
+    } else {
+        Block::default().borders(Borders::ALL).title(" Logs ")
+    };
     frame.render_widget(block, area);
 
     let inner = Rect::new(
@@ -1286,9 +1398,14 @@ fn render_log_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let area = Rect::new(x, y, width, height);
 
     frame.render_widget(ratatui::widgets::Clear, area);
+    let base_title = if state.log_select_mode {
+        format!("{} [SELECT]", output.title)
+    } else {
+        output.title.clone()
+    };
     let title_max = width.saturating_sub(4) as usize;
     let title = if title_max > 0 {
-        truncate(&output.title, title_max)
+        truncate(&base_title, title_max)
     } else {
         String::new()
     };
@@ -1322,17 +1439,40 @@ fn render_log_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
         inner,
     );
 
-    let button_w = 10u16;
+    let button_w = 12u16;
     let button_y = area.y + area.height.saturating_sub(3);
-    let button_x = area.x + (area.width.saturating_sub(button_w)) / 2;
-    let hover = state.log_output_hover;
-    let style = if hover {
+    let close_hover = state.log_output_hover;
+    let close_style = if close_hover {
         Style::default().bg(Color::Cyan).fg(Color::Black)
     } else {
         Style::default().bg(Color::Black).fg(Color::White)
     };
-    let line = Line::from(Span::styled(" [ Close ] ", style));
-    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
+    if state.log_output_mode == LogOutputMode::Logs {
+        let gap = 4u16;
+        let total_w = button_w.saturating_mul(2).saturating_add(gap);
+        let button_x = area.x + (area.width.saturating_sub(total_w)) / 2;
+        let select_hover = state.log_select_hover;
+        let select_label = if state.log_select_mode {
+            " [ Live ] "
+        } else {
+            " [ Select ] "
+        };
+        let select_style = if select_hover {
+            Style::default().bg(Color::Cyan).fg(Color::Black)
+        } else {
+            Style::default().bg(Color::Black).fg(Color::White)
+        };
+        let select_line = Line::from(Span::styled(select_label, select_style));
+        frame.render_widget(Paragraph::new(select_line), Rect::new(button_x, button_y, button_w, 1));
+
+        let close_x = button_x + button_w + gap;
+        let close_line = Line::from(Span::styled(" [ Close ] ", close_style));
+        frame.render_widget(Paragraph::new(close_line), Rect::new(close_x, button_y, button_w, 1));
+    } else {
+        let close_x = area.x + (area.width.saturating_sub(button_w)) / 2;
+        let close_line = Line::from(Span::styled(" [ Close ] ", close_style));
+        frame.render_widget(Paragraph::new(close_line), Rect::new(close_x, button_y, button_w, 1));
+    }
 }
 
 fn render_env_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
@@ -1378,6 +1518,118 @@ fn render_env_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let button_y = area.y + area.height.saturating_sub(3);
     let button_x = area.x + (area.width.saturating_sub(button_w)) / 2;
     let hover = state.env_modal_hover;
+    let style = if hover {
+        Style::default().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        Style::default().bg(Color::Black).fg(Color::White)
+    };
+    let line = Line::from(Span::styled(" [ Close ] ", style));
+    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
+}
+
+fn render_docker_list_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
+    let kind = match state.docker_list_kind {
+        Some(kind) => kind,
+        None => return,
+    };
+    let title = match kind {
+        DockerListKind::Images => "Docker Images",
+        DockerListKind::Containers => "Docker Containers",
+        DockerListKind::Volumes => "Docker Volumes",
+    };
+
+    let max_width = main_area.width.saturating_sub(2).max(4);
+    let max_height = main_area.height.saturating_sub(2).max(6);
+    let width = (main_area.width.saturating_mul(88) / 100)
+        .max(70)
+        .max(title.len() as u16 + 24)
+        .min(max_width);
+    let height = (main_area.height.saturating_mul(80) / 100)
+        .max(14)
+        .min(max_height);
+    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
+    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", title));
+    frame.render_widget(block, area);
+
+    let list_area = Rect::new(
+        area.x + 2,
+        area.y + 2,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(6),
+    );
+    let visible_height = list_area.height.saturating_sub(1) as usize;
+    let total = state.docker_list_items.len();
+    let selected = if total > 0 {
+        state.docker_list_selected.min(total - 1)
+    } else {
+        0
+    };
+    let scroll_offset = if total <= visible_height || visible_height == 0 {
+        0
+    } else {
+        let max_offset = total.saturating_sub(visible_height);
+        let ideal = selected.saturating_sub(visible_height / 2);
+        ideal.min(max_offset)
+    };
+
+    let rows: Vec<Row> = if total == 0 {
+        vec![Row::new(vec![
+            Cell::from("No items found"),
+            Cell::from(""),
+            Cell::from(""),
+        ])]
+    } else {
+        state
+            .docker_list_items
+            .iter()
+            .skip(scroll_offset)
+            .take(visible_height.max(1))
+            .enumerate()
+            .map(|(i, item)| {
+                let actual = scroll_offset + i;
+                let style = if actual == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Row::new(vec![
+                    Cell::from(truncate(&item.name, 40)),
+                    Cell::from(truncate(&item.id, 20)),
+                    Cell::from(truncate(&item.size, 14)),
+                ])
+                .style(style)
+            })
+            .collect()
+    };
+
+    let header = Row::new(vec![
+        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("SIZE").style(Style::default().add_modifier(Modifier::BOLD)),
+    ]);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(20),
+            Constraint::Length(20),
+            Constraint::Length(14),
+        ],
+    )
+    .header(header)
+    .column_spacing(1);
+    frame.render_widget(table, list_area);
+
+    let button_w = 10u16;
+    let button_y = area.y + area.height.saturating_sub(3);
+    let button_x = area.x + (area.width.saturating_sub(button_w)) / 2;
+    let hover = state.docker_list_hover;
     let style = if hover {
         Style::default().bg(Color::Cyan).fg(Color::Black)
     } else {
