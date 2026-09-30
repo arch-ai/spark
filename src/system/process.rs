@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,11 +10,18 @@ use sysinfo::{Pid, System, Uid};
 use crate::app::{SortBy, SortOrder};
 use crate::util::cmp_f32;
 
+mod memory;
+pub use memory::MemorySample;
+
 pub struct ProcInfo {
     pub name: String,
     pub name_lower: String,
     pub cpu: f32,
     pub memory_bytes: u64,
+    pub memory_estimated: bool,
+    pub tree_memory_bytes: u64,
+    pub tree_memory_estimated: bool,
+    pub tree_swap_bytes: Option<u64>,
     pub user: String,
     pub parent: Option<Pid>,
 }
@@ -30,6 +37,8 @@ pub struct ProcessEntry {
     pub name: String,
     pub cpu: f32,
     pub memory_bytes: u64,
+    pub start_time: u64,
+    pub memory_sample: Option<MemorySample>,
     pub user_id: Option<Uid>,
     pub parent: Option<Pid>,
     pub is_thread: bool,
@@ -79,21 +88,18 @@ pub fn collect_processes_from_entries(
     entries: &[ProcessEntry],
     filter: &str,
     user_cache: &HashMap<Uid, String>,
-    skip_threads: bool,
 ) -> HashMap<Pid, ProcInfo> {
     let filter_lower = filter.to_lowercase();
     let has_filter = !filter_lower.is_empty();
     let mut processes: HashMap<Pid, ProcInfo> = HashMap::with_capacity(entries.len() / 2);
 
     for entry in entries {
-        if skip_threads && entry.is_thread {
+        // Threads share the process address space; counting them inflates totals.
+        if entry.is_thread {
             continue;
         }
 
         let name_ref = entry.name.as_str();
-        if has_filter && !name_ref.to_lowercase().contains(&filter_lower) {
-            continue;
-        }
 
         let name = name_ref.to_string();
         let name_lower = name.to_lowercase();
@@ -104,20 +110,89 @@ pub fn collect_processes_from_entries(
             .cloned()
             .unwrap_or_else(|| DASH.to_string());
 
+        let memory_bytes = entry
+            .memory_sample
+            .map_or(entry.memory_bytes, |sample| sample.pss_bytes);
+        let memory_estimated = entry.memory_sample.is_none();
         processes.insert(
             entry.pid,
             ProcInfo {
                 name,
                 name_lower,
                 cpu: entry.cpu,
-                memory_bytes: entry.memory_bytes,
+                memory_bytes,
+                memory_estimated,
+                tree_memory_bytes: memory_bytes,
+                tree_memory_estimated: memory_estimated,
+                tree_swap_bytes: entry.memory_sample.and_then(|sample| sample.swap_pss_bytes),
                 user,
                 parent: entry.parent,
             },
         );
     }
 
+    aggregate_tree_memory(&mut processes);
+    // Searching for a parent must not discard memory used by differently named children.
+    if has_filter {
+        processes.retain(|_, info| info.name_lower.contains(&filter_lower));
+    }
     processes
+}
+
+fn aggregate_tree_memory(processes: &mut HashMap<Pid, ProcInfo>) {
+    let parents: HashMap<_, _> = processes
+        .iter()
+        .filter_map(|(pid, info)| {
+            info.parent
+                .filter(|parent| {
+                    parent != pid
+                        && processes.contains_key(parent)
+                        && !is_skipped_parent(*parent, processes)
+                })
+                .map(|parent| (*pid, parent))
+        })
+        .collect();
+    let mut remaining: HashMap<Pid, usize> = processes.keys().map(|pid| (*pid, 0)).collect();
+    for parent in parents.values() {
+        *remaining.get_mut(parent).unwrap() += 1;
+    }
+    let mut ready: VecDeque<_> = remaining
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(pid, _)| *pid)
+        .collect();
+    while let Some(pid) = ready.pop_front() {
+        let Some(parent) = parents.get(&pid) else {
+            continue;
+        };
+        let info = &processes[&pid];
+        let (memory, estimated, swap) = (
+            info.tree_memory_bytes,
+            info.tree_memory_estimated,
+            info.tree_swap_bytes,
+        );
+        let parent_info = processes.get_mut(parent).unwrap();
+        parent_info.tree_memory_bytes = parent_info.tree_memory_bytes.saturating_add(memory);
+        parent_info.tree_memory_estimated |= estimated;
+        parent_info.tree_swap_bytes = parent_info
+            .tree_swap_bytes
+            .zip(swap)
+            .map(|(a, b)| a.saturating_add(b));
+        let count = remaining.get_mut(parent).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            ready.push_back(*parent);
+        }
+    }
+    for (pid, info) in processes {
+        // Break inconsistent parent cycles from a changing process snapshot.
+        // Each cycle member keeps only its own memory and its acyclic descendants.
+        info.parent = if remaining[pid] > 0 {
+            None
+        } else {
+            parents.get(pid).copied()
+        };
+    }
 }
 
 pub struct ProcessWorker {
@@ -144,6 +219,7 @@ pub fn start_process_worker(interval: Duration) -> ProcessWorker {
 
     std::thread::spawn(move || {
         let mut system = System::new();
+        let mut memory = memory::MemorySampler::default();
         loop {
             if thread_paused.load(Ordering::Relaxed) {
                 std::thread::sleep(interval);
@@ -154,16 +230,23 @@ pub fn start_process_worker(interval: Duration) -> ProcessWorker {
 
             let mut entries = Vec::with_capacity(system.processes().len());
             for (pid, process) in system.processes() {
+                if process.thread_kind().is_some() {
+                    continue;
+                }
                 entries.push(ProcessEntry {
                     pid: *pid,
                     name: process.name().to_string(),
                     cpu: process.cpu_usage(),
                     memory_bytes: process.memory(),
+                    start_time: process.start_time(),
+                    memory_sample: None,
                     user_id: process.user_id().cloned(),
                     parent: process.parent(),
                     is_thread: process.thread_kind().is_some(),
                 });
             }
+            memory.refresh(&mut entries);
+            entries.sort_unstable_by_key(|entry| entry.pid);
             let should_update = {
                 let guard = thread_data.read().unwrap_or_else(|err| err.into_inner());
                 guard.as_ref() != &entries
@@ -287,7 +370,7 @@ fn sort_pid_list(
 fn compare_proc(a: &ProcInfo, b: &ProcInfo, sort_by: SortBy) -> std::cmp::Ordering {
     match sort_by {
         SortBy::Cpu => cmp_f32(a.cpu, b.cpu),
-        SortBy::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+        SortBy::Memory => a.tree_memory_bytes.cmp(&b.tree_memory_bytes),
         SortBy::Name => a.name_lower.cmp(&b.name_lower),
     }
 }
@@ -344,4 +427,95 @@ fn is_skipped_parent(pid: Pid, processes: &HashMap<Pid, ProcInfo>) -> bool {
         processes.get(&pid).map(|proc_info| proc_info.name.as_str()),
         Some("gnome-shell")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) fn entry(pid: u32, parent: Option<u32>, name: &str, rss: u64) -> ProcessEntry {
+        ProcessEntry {
+            pid: Pid::from_u32(pid),
+            parent: parent.map(Pid::from_u32),
+            name: name.into(),
+            cpu: 0.0,
+            memory_bytes: rss,
+            memory_sample: None,
+            start_time: 1,
+            user_id: None,
+            is_thread: false,
+        }
+    }
+
+    fn measured(mut entry: ProcessEntry, pss: u64, swap: u64) -> ProcessEntry {
+        entry.memory_sample = Some(MemorySample {
+            pss_bytes: pss,
+            swap_pss_bytes: Some(swap),
+        });
+        entry
+    }
+
+    #[test]
+    fn tree_totals_use_proportional_memory_and_ignore_shared_threads() {
+        let mut thread = entry(13, Some(10), "thread", 9999);
+        thread.is_thread = true;
+        let entries = vec![
+            measured(entry(10, None, "chrome", 500), 200, 10),
+            measured(entry(11, Some(10), "renderer", 400), 250, 20),
+            measured(entry(12, Some(11), "worker", 300), 150, 5),
+            thread,
+            measured(entry(20, None, "editor", 450), 450, 0),
+        ];
+        let procs = collect_processes_from_entries(&entries, "", &HashMap::new());
+        let chrome = &procs[&Pid::from_u32(10)];
+        assert_eq!(chrome.memory_bytes, 200);
+        assert_eq!(chrome.tree_memory_bytes, 600);
+        assert_eq!(chrome.tree_swap_bytes, Some(35));
+        assert!(!chrome.tree_memory_estimated);
+        assert!(!procs.contains_key(&Pid::from_u32(13)));
+        for expanded in [true, false] {
+            let rows = build_tree_rows(&procs, SortBy::Memory, SortOrder::Desc, expanded);
+            assert_eq!(rows[0].pid, Pid::from_u32(10));
+        }
+        let filtered = collect_processes_from_entries(&entries, "chrome", &HashMap::new());
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[&Pid::from_u32(10)].tree_memory_bytes, 600);
+    }
+
+    #[test]
+    fn rss_fallback_marks_the_entire_tree_and_keeps_swap_unknown() {
+        let entries = vec![
+            measured(entry(10, None, "app", 500), 200, 10),
+            entry(11, Some(10), "restricted-child", 400),
+        ];
+        let procs = collect_processes_from_entries(&entries, "", &HashMap::new());
+        let root = &procs[&Pid::from_u32(10)];
+        assert_eq!(root.tree_memory_bytes, 600);
+        assert!(!root.memory_estimated);
+        assert!(root.tree_memory_estimated);
+        assert!(root.tree_swap_bytes.is_none());
+    }
+
+    #[test]
+    fn tree_boundaries_cycles_and_large_values_cannot_inflate_or_overflow_totals() {
+        let entries = vec![
+            entry(1, None, "init", 10),
+            entry(2, Some(1), "app", 20),
+            entry(3, Some(99), "orphan", 30),
+            entry(4, Some(5), "cycle-a", 40),
+            entry(5, Some(4), "cycle-b", 50),
+            entry(6, Some(4), "cycle-child", 60),
+            entry(7, None, "large", u64::MAX),
+            entry(8, Some(7), "large-child", 1),
+        ];
+        let procs = collect_processes_from_entries(&entries, "", &HashMap::new());
+        assert_eq!(procs[&Pid::from_u32(1)].tree_memory_bytes, 10);
+        assert_eq!(procs[&Pid::from_u32(4)].tree_memory_bytes, 100);
+        assert_eq!(procs[&Pid::from_u32(5)].tree_memory_bytes, 50);
+        assert_eq!(procs[&Pid::from_u32(7)].tree_memory_bytes, u64::MAX);
+        assert_eq!(
+            build_tree_rows(&procs, SortBy::Memory, SortOrder::Desc, true).len(),
+            entries.len()
+        );
+    }
 }

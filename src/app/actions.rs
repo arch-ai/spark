@@ -69,14 +69,7 @@ pub(crate) fn kill_selected_port_process(state: &mut AppState, system: &mut Syst
             .get(state.selected)
             .and_then(|id| id.clone());
         if let Some(id) = container_id {
-            match docker::kill_container(&id) {
-                Ok(()) => {
-                    state.set_message(format!("Killed container {}", id));
-                }
-                Err(err) => {
-                    state.set_message(format!("Failed to kill container: {err}"));
-                }
-            }
+            start_container_kills(state, vec![id]);
         } else {
             state.set_message("No process associated with this port");
         }
@@ -163,74 +156,68 @@ pub(crate) fn kill_selected_port_process(state: &mut AppState, system: &mut Syst
 
 pub(crate) fn kill_selected_in_docker(state: &mut AppState) {
     use crate::system::docker::DockerRow;
-
-    let Some(row) = state.docker_rows.get(state.docker_selected_row) else {
-        state.set_message("No selection");
-        return;
+    let targets: Vec<String> = match state.docker_rows.get(state.docker_selected_row) {
+        Some(DockerRow::Item { index, .. }) => state
+            .visible_containers
+            .get(*index)
+            .cloned()
+            .into_iter()
+            .collect(),
+        Some(DockerRow::Group { name, path, .. }) => state
+            .visible_containers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let candidate_path = state
+                    .visible_container_group_path
+                    .get(*index)
+                    .map(String::as_str)
+                    .filter(|value| *value != "-" && !value.is_empty());
+                candidate_path == path.as_deref()
+                    && (path.is_some()
+                        || state
+                            .visible_container_group_name
+                            .get(*index)
+                            .is_some_and(|candidate| candidate == name))
+            })
+            .map(|(_, id)| id.clone())
+            .collect(),
+        _ => Vec::new(),
     };
+    start_container_kills(state, targets);
+}
 
-    match row {
-        DockerRow::Group { name, path, .. } => {
-            // Kill all containers in this group
-            let group_path = path.clone();
-            let group_name = name.clone();
-            let mut container_ids = Vec::new();
-
-            for (i, container_group_path) in state.visible_container_group_path.iter().enumerate() {
-                let matches = match &group_path {
-                    Some(gp) => container_group_path == gp,
-                    None => container_group_path == "-" || container_group_path.is_empty(),
-                };
-                if matches {
-                    if let Some(id) = state.visible_containers.get(i) {
-                        container_ids.push(id.clone());
-                    }
-                }
-            }
-
-            if container_ids.is_empty() {
-                state.set_message("No containers in group");
-                return;
-            }
-
-            let (success, failed) = docker::kill_containers(&container_ids);
-            if failed == 0 {
-                state.set_message(format!("Killed {} containers in {}", success, group_name));
-            } else {
-                state.set_message(format!(
-                    "Killed {}/{} containers in {} ({} failed)",
-                    success,
-                    success + failed,
-                    group_name,
-                    failed
-                ));
-            }
-        }
-        DockerRow::Item { index, .. } => {
-            // Kill single container
-            let Some(container_id) = state.visible_containers.get(*index).cloned() else {
-                state.set_message("No container selected");
-                return;
-            };
-            let name = state
-                .visible_container_names
-                .get(*index)
-                .cloned()
-                .unwrap_or_else(|| container_id.clone());
-
-            match docker::kill_container(&container_id) {
-                Ok(()) => {
-                    state.set_message(format!("Killed container {}", name));
-                }
-                Err(err) => {
-                    state.set_message(format!("Failed to kill container: {err}"));
-                }
-            }
-        }
-        DockerRow::Separator => {
-            state.set_message("Cannot kill separator");
-        }
+fn start_container_kills(state: &mut AppState, targets: Vec<String>) {
+    let targets: Vec<_> = targets
+        .into_iter()
+        .filter(|id| !state.pending_operations.contains_key(id))
+        .collect();
+    if targets.is_empty() {
+        state.set_message("No available containers selected");
+        return;
     }
+    for id in &targets {
+        state.pending_operations.insert(id.clone(), false);
+    }
+    state.set_message(format!("Killing {} container(s)...", targets.len()));
+    let tx = state.operation_tx.clone();
+    std::thread::spawn(move || {
+        for id in targets {
+            let result = docker::kill_container(&id);
+            let success = result.is_ok();
+            let message = match result {
+                Ok(()) => format!("Killed container {}", id),
+                Err(err) => format!("Failed to kill container: {err}"),
+            };
+            let _ = tx.send(OperationComplete {
+                request_id: None,
+                container_id: id,
+                success,
+                message,
+                output: None,
+            });
+        }
+    });
 }
 
 pub(crate) fn open_selected_container(state: &mut AppState) {
@@ -314,6 +301,7 @@ pub(crate) fn start_log_fetch<F>(
 where
     F: FnOnce() -> std::io::Result<String> + Send + 'static,
 {
+    state.log_request_id = state.log_request_id.wrapping_add(1);
     state.log_in_progress = Some(title.clone());
     state.log_output = None;
     state.log_output_hover = false;
@@ -330,6 +318,7 @@ where
     state.log_source = Some(source);
     state.log_refresh_in_progress = true;
     state.log_last_refresh = std::time::Instant::now();
+    let request_id = Some(state.log_request_id);
     let tx = state.operation_tx.clone();
     std::thread::spawn(move || {
         let result = command();
@@ -339,6 +328,7 @@ where
             Err(err) => err.to_string(),
         };
         let _ = tx.send(OperationComplete {
+            request_id,
             container_id: format!("logs::{}", title),
             success,
             message: if success { String::new() } else { output.clone() },
@@ -354,6 +344,7 @@ pub(crate) fn start_inspect_fetch<F>(
 ) where
     F: FnOnce() -> std::io::Result<String> + Send + 'static,
 {
+    state.log_request_id = state.log_request_id.wrapping_add(1);
     state.log_in_progress = Some(title.clone());
     state.log_output = None;
     state.log_output_hover = false;
@@ -371,6 +362,7 @@ pub(crate) fn start_inspect_fetch<F>(
     state.log_refresh_in_progress = false;
     state.log_last_refresh = std::time::Instant::now();
 
+    let request_id = Some(state.log_request_id);
     let tx = state.operation_tx.clone();
     std::thread::spawn(move || {
         let result = command();
@@ -382,6 +374,7 @@ pub(crate) fn start_inspect_fetch<F>(
             .map(|err| err.to_string())
             .unwrap_or_default();
         let _ = tx.send(OperationComplete {
+            request_id,
             container_id: format!("inspect::{}", title),
             success,
             message,
@@ -399,6 +392,7 @@ where
     }
     state.log_refresh_in_progress = true;
     state.log_last_refresh = std::time::Instant::now();
+    let request_id = Some(state.log_request_id);
     let tx = state.operation_tx.clone();
     std::thread::spawn(move || {
         let result = command();
@@ -408,6 +402,7 @@ where
             Err(err) => err.to_string(),
         };
         let _ = tx.send(OperationComplete {
+            request_id,
             container_id: format!("logs::{}", title),
             success,
             message: if success { String::new() } else { output.clone() },
@@ -485,12 +480,7 @@ fn open_selected_container_env(state: &mut AppState, return_view: ViewMode) {
         format!("Container: {name}"),
         format_ports_line(&port_public, &port_internal),
     );
-    match docker::load_container_env(&container_id) {
-        Ok(envs) => state.env_vars = envs,
-        Err(err) => {
-            state.env_vars = vec![format!("Failed to load env: {err}")];
-        }
-    }
+    start_container_env_fetch(state, container_id);
 }
 
 fn open_selected_ports_env(state: &mut AppState, system: &System) {
@@ -513,12 +503,7 @@ fn open_selected_ports_env(state: &mut AppState, system: &System) {
                 "Compose: -".to_string(),
                 "Ports: -".to_string(),
             );
-            match docker::load_container_env(&id) {
-                Ok(envs) => state.env_vars = envs,
-                Err(err) => {
-                    state.env_vars = vec![format!("Failed to load env: {err}")];
-                }
-            }
+            start_container_env_fetch(state, id);
         } else {
             state.set_message("No process selected");
         }
@@ -586,6 +571,7 @@ pub(crate) fn enter_env_view(
 ) {
     state.input_mode = InputMode::Normal;
     state.env_return_view = return_view;
+    state.env_request = None;
     state.env_modal_open = true;
     state.env_title = title.to_string();
     state.env_info_left1 = info_left1;
@@ -602,4 +588,13 @@ fn format_ports_line(port_public: &str, port_internal: &str) -> String {
     } else {
         format!("Ports: {port_public}")
     }
+}
+
+pub(crate) fn start_container_env_fetch(state: &mut AppState, container_id: String) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.env_vars = vec!["Loading environment...".into()];
+    state.env_request = Some(rx);
+    std::thread::spawn(move || {
+        let _ = tx.send(docker::load_container_env(&container_id));
+    });
 }

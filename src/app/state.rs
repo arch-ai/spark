@@ -11,6 +11,7 @@ use crate::system::docker::{DockerListItem, DockerRow, DockerSystemDf};
 /// Message sent when a container operation completes
 #[derive(Debug)]
 pub struct OperationComplete {
+    pub request_id: Option<u64>,
     pub container_id: String,
     pub success: bool,
     pub message: String,
@@ -138,6 +139,12 @@ pub struct DeleteConfirm {
     pub id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct DeleteProgress {
+    pub label: String,
+    pub started_at: Instant,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeleteKind {
     Image,
@@ -242,6 +249,14 @@ pub struct AppState {
     pub user_last_refresh: Instant,
     pub docker_filtered_out: usize,
     pub docker_total: usize,
+    pub docker_error: Option<String>,
+    pub docker_updated_at: Option<Instant>,
+    pub docker_df_error: Option<String>,
+    pub docker_df_updated_at: Option<Instant>,
+    pub docker_refresh_requested: bool,
+    pub docker_list_request: Option<Receiver<std::io::Result<Vec<DockerListItem>>>>,
+    pub docker_list_error: Option<String>,
+    pub env_request: Option<Receiver<std::io::Result<Vec<String>>>>,
     pub env_vars: Vec<String>,
     pub env_title: String,
     pub env_info_left1: String,
@@ -288,6 +303,9 @@ pub struct AppState {
     pub pending_delete: Option<DeleteConfirm>,
     /// Hovered choice in delete confirmation modal
     pub pending_delete_hover: Option<DeleteConfirmChoice>,
+    pub delete_in_progress: Option<DeleteProgress>,
+    /// Keep the result until existing dialogs close; then show scrollable output.
+    pub delete_result: Option<OperationComplete>,
     /// Environment modal open
     pub env_modal_open: bool,
     /// Hover state for environment modal close button
@@ -324,6 +342,7 @@ pub struct AppState {
     pub log_last_refresh: Instant,
     /// Whether a log refresh is currently in flight
     pub log_refresh_in_progress: bool,
+    pub log_request_id: u64,
     /// Last time disk stats were refreshed
     pub last_disk_refresh: Instant,
     /// Cached terminal width for modal sizing
@@ -393,6 +412,14 @@ impl AppState {
             user_last_refresh: Instant::now() - Duration::from_secs(60),
             docker_filtered_out: 0,
             docker_total: 0,
+            docker_error: None,
+            docker_updated_at: None,
+            docker_df_error: None,
+            docker_df_updated_at: None,
+            docker_refresh_requested: false,
+            docker_list_request: None,
+            docker_list_error: None,
+            env_request: None,
             env_vars: Vec::new(),
             env_title: "ENV".to_string(),
             env_info_left1: "-".to_string(),
@@ -424,6 +451,8 @@ impl AppState {
             prune_output_hover: false,
             pending_delete: None,
             pending_delete_hover: None,
+            delete_in_progress: None,
+            delete_result: None,
             env_modal_open: false,
             env_modal_hover: false,
             log_in_progress: None,
@@ -442,6 +471,7 @@ impl AppState {
             log_source: None,
             log_last_refresh: Instant::now() - Duration::from_secs(60),
             log_refresh_in_progress: false,
+            log_request_id: 0,
             last_disk_refresh: Instant::now() - Duration::from_secs(60),
             term_width: 0,
             term_height: 0,
@@ -456,7 +486,13 @@ impl AppState {
 
     /// Advance spinner animation frame, returns true if spinner actually changed
     pub fn tick_spinner(&mut self) -> bool {
-        if !self.pending_operations.is_empty() || self.prune_in_progress.is_some() {
+        if !self.pending_operations.is_empty()
+            || self.prune_in_progress.is_some()
+            || self.delete_in_progress.is_some()
+            || self.log_in_progress.is_some()
+            || (self.docker_list_open && self.docker_list_request.is_some())
+            || self.env_request.is_some()
+        {
             // Rate limit spinner updates to ~8 fps (125ms interval)
             if self.spinner_last_tick.elapsed() >= Duration::from_millis(125) {
                 self.spinner_frame = self.spinner_frame.wrapping_add(1);
@@ -477,8 +513,14 @@ impl AppState {
     }
 
     pub fn check_completed_operations(&mut self) -> bool {
-        let mut any_completed = false;
+        let mut any_completed = self.check_resource_requests();
         while let Ok(msg) = self.operation_rx.try_recv() {
+            if msg.request_id.is_some_and(|id| id != self.log_request_id) {
+                continue;
+            }
+            if msg.request_id.is_none() {
+                self.docker_refresh_requested = true;
+            }
             if msg.container_id.starts_with("prune-") {
                 self.prune_in_progress = None;
                 if let Some(output) = msg.output.clone() {
@@ -529,74 +571,51 @@ impl AppState {
                 any_completed = true;
                 continue;
             }
-            if let Some(id) = msg.container_id.strip_prefix("image-delete::") {
-                if msg.success {
-                    if self.docker_list_open
-                        && self.docker_list_kind == Some(DockerListKind::Images)
-                    {
-                        self.docker_list_items.retain(|item| item.id != id);
-                        if self.docker_list_selected >= self.docker_list_items.len() {
-                            self.docker_list_selected = self
-                                .docker_list_items
-                                .len()
-                                .saturating_sub(1);
-                        }
-                    }
+            let deleted = msg.container_id.strip_prefix("image-delete::")
+                .map(|id| (DockerListKind::Images, id))
+                .or_else(|| msg.container_id.strip_prefix("container-delete::")
+                    .map(|id| (DockerListKind::Containers, id)))
+                .or_else(|| msg.container_id.strip_prefix("volume-delete::")
+                    .map(|id| (DockerListKind::Volumes, id)));
+            if let Some((kind, id)) = deleted {
+                self.delete_in_progress = None;
+                if msg.success && self.docker_list_kind == Some(kind) {
+                    // A list started before deletion can otherwise resurrect this row.
+                    self.docker_list_request = None;
+                    self.docker_list_items.retain(|item| {
+                        if kind == DockerListKind::Volumes { item.name != id } else { item.id != id }
+                    });
+                    self.docker_list_selected = self.docker_list_selected
+                        .min(self.docker_list_items.len().saturating_sub(1));
                 }
-                if !msg.message.is_empty() {
-                    self.set_message(msg.message);
-                }
+                self.delete_result = Some(msg);
                 any_completed = true;
                 continue;
             }
-            if let Some(id) = msg.container_id.strip_prefix("container-delete::") {
-                if msg.success {
-                    if self.docker_list_open
-                        && self.docker_list_kind == Some(DockerListKind::Containers)
-                    {
-                        self.docker_list_items.retain(|item| item.id != id);
-                        if self.docker_list_selected >= self.docker_list_items.len() {
-                            self.docker_list_selected = self
-                                .docker_list_items
-                                .len()
-                                .saturating_sub(1);
-                        }
-                    }
-                }
-                if !msg.message.is_empty() {
-                    self.set_message(msg.message);
-                }
-                any_completed = true;
-                continue;
-            }
-            if let Some(name) = msg.container_id.strip_prefix("volume-delete::") {
-                if msg.success {
-                    if self.docker_list_open
-                        && self.docker_list_kind == Some(DockerListKind::Volumes)
-                    {
-                        self.docker_list_items
-                            .retain(|item| item.name != name);
-                        if self.docker_list_selected >= self.docker_list_items.len() {
-                            self.docker_list_selected = self
-                                .docker_list_items
-                                .len()
-                                .saturating_sub(1);
-                        }
-                    }
-                }
-                if !msg.message.is_empty() {
-                    self.set_message(msg.message);
-                }
-                any_completed = true;
-                continue;
-            }
-            // Only remove from pending on failure - success keeps it pending until state matches
-            if !msg.success {
-                self.pending_operations.remove(&msg.container_id);
-            }
+            // Completion belongs to the command, not a possibly stale stats snapshot.
+            self.pending_operations.remove(&msg.container_id);
+            self.docker_refresh_requested = true;
             if !msg.message.is_empty() {
                 self.set_message(msg.message);
             }
+            any_completed = true;
+        }
+        if self.delete_result.is_some()
+            && self.pending_delete.is_none()
+            && self.pending_prune.is_none()
+            && self.prune_in_progress.is_none()
+            && self.prune_output.is_none()
+            && self.log_in_progress.is_none()
+            && self.log_output.is_none()
+            && !self.env_modal_open
+            && self.context_menu.is_none()
+        {
+            let result = self.delete_result.take().unwrap();
+            let title = if result.success { "Deletion complete" } else { "Delete failed" };
+            self.clear_log_state();
+            self.log_output_mode = LogOutputMode::Inspect;
+            self.log_follow = false;
+            self.set_log_output(title.into(), result.message);
             any_completed = true;
         }
         any_completed
@@ -632,6 +651,8 @@ impl AppState {
     }
 
     pub fn clear_log_state(&mut self) {
+        self.log_request_id = self.log_request_id.wrapping_add(1);
+        self.log_in_progress = None;
         self.log_output = None;
         self.log_output_hover = false;
         self.log_select_hover = false;
@@ -655,34 +676,40 @@ impl AppState {
         } else {
             output
         };
-        self.log_text = normalize_log_text(&raw);
+        let normalized = normalize_log_text(&raw);
+        if self.log_text == normalized {
+            return;
+        }
+        self.log_text = normalized;
         self.log_lines.clear();
         self.log_wrap_width = 0;
         self.log_line_count = 0;
     }
 
-    /// Check container states and remove from pending when state matches expected
-    pub fn update_pending_with_containers(&mut self, containers: &[crate::system::docker::ContainerInfo]) -> bool {
-        if self.pending_operations.is_empty() {
-            return false;
+    pub fn check_resource_requests(&mut self) -> bool {
+        let mut changed = false;
+        if !self.docker_list_open {
+            self.docker_list_request = None;
         }
-
-        let mut to_remove = Vec::new();
-        for (container_id, expected_running) in &self.pending_operations {
-            // Find this container in the list
-            if let Some(container) = containers.iter().find(|c| &c.id == container_id) {
-                // If actual state matches expected state, operation is complete
-                if container.running == *expected_running {
-                    to_remove.push(container_id.clone());
-                }
+        if let Some(result) = self.docker_list_request.as_ref().and_then(receive_resource) {
+            self.docker_list_request = None;
+            match result {
+                Ok(items) => self.docker_list_items = items,
+                Err(err) => self.docker_list_error = Some(err.to_string()),
             }
+            self.docker_list_selected = 0;
+            changed = true;
         }
-
-        let any_removed = !to_remove.is_empty();
-        for id in to_remove {
-            self.pending_operations.remove(&id);
+        if !self.env_modal_open && self.view_mode != ViewMode::DockerEnv {
+            self.env_request = None;
         }
-        any_removed
+        if let Some(result) = self.env_request.as_ref().and_then(receive_resource) {
+            self.env_request = None;
+            self.env_vars =
+                result.unwrap_or_else(|err| vec![format!("Failed to load environment: {err}")]);
+            changed = true;
+        }
+        changed
     }
 
     #[allow(dead_code)]
@@ -931,5 +958,146 @@ pub(crate) fn view_for_sidebar_index(index: usize) -> ViewMode {
         2 => ViewMode::Docker,
         3 => ViewMode::Node,
         _ => ViewMode::Process,
+    }
+}
+
+fn receive_resource<T>(rx: &Receiver<std::io::Result<T>>) -> Option<std::io::Result<T>> {
+    match rx.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err(std::io::Error::other(
+            "Background request stopped; retry the request",
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_results_preserve_failures_and_discard_stale_lists_only_on_success() {
+        for success in [false, true] {
+            let mut state = AppState::new();
+            state.docker_list_open = true;
+            state.docker_list_kind = Some(DockerListKind::Volumes);
+            state.docker_list_items = vec![DockerListItem {
+                name: "large-volume".into(), id: "large-volume".into(), size: "800 GB".into(),
+                detail_left: String::new(), detail_right: String::new(), activity: None,
+            }];
+            state.delete_in_progress = Some(DeleteProgress {
+                label: "volume large-volume".into(), started_at: Instant::now(),
+            });
+            let (list_tx, list_rx) = mpsc::channel();
+            state.docker_list_request = Some(list_rx);
+            state.operation_tx.send(OperationComplete {
+                request_id: None, container_id: "volume-delete::large-volume".into(),
+                success, message: if success { "Deleted volume large-volume" } else {
+                    "Docker error: volume is in use - container abc123"
+                }.into(), output: None,
+            }).unwrap();
+            assert!(state.check_completed_operations());
+            assert!(state.delete_in_progress.is_none());
+            assert_eq!(state.docker_list_items.is_empty(), success);
+            assert_eq!(list_tx.send(Ok(state.docker_list_items.clone())).is_err(), success);
+            assert!(state.docker_refresh_requested);
+            assert_eq!(state.log_output_mode, LogOutputMode::Inspect);
+            if !success {
+                assert!(state.log_display_text().contains("container abc123"));
+                assert!(state.log_output.is_some());
+                // Header messages expiring cannot dismiss a deletion result.
+                state.message = None;
+                state.check_completed_operations();
+                assert!(state.log_display_text().contains("volume is in use"));
+            }
+        }
+    }
+
+    #[test]
+    fn delete_result_waits_for_open_details_instead_of_overwriting_them() {
+        let mut state = AppState::new();
+        state.set_log_output("Volume details".into(), "Existing details".into());
+        state.operation_tx.send(OperationComplete {
+            request_id: None, container_id: "volume-delete::data".into(),
+            success: false, message: "Permission denied".into(), output: None,
+        }).unwrap();
+        state.check_completed_operations();
+        assert_eq!(state.log_display_text(), "Existing details");
+        assert!(state.delete_result.is_some());
+        state.clear_log_state();
+        assert!(state.check_completed_operations());
+        assert_eq!(state.log_display_text(), "Permission denied");
+        assert!(state.delete_result.is_none());
+    }
+
+    #[test]
+    fn closed_and_replaced_resource_requests_cannot_overwrite_the_current_list() {
+        let mut state = AppState::new();
+        let (old_tx, old_rx) = mpsc::channel();
+        state.docker_list_open = true;
+        state.docker_list_request = Some(old_rx);
+        let (new_tx, new_rx) = mpsc::channel();
+        state.docker_list_request = Some(new_rx);
+        assert!(old_tx.send(Ok(Vec::new())).is_err());
+        new_tx
+            .send(Err(std::io::Error::other("daemon offline")))
+            .unwrap();
+        assert!(state.check_resource_requests());
+        assert!(state.docker_list_items.is_empty());
+        assert_eq!(state.docker_list_error.as_deref(), Some("daemon offline"));
+        assert!(state.docker_list_request.is_none());
+    }
+
+    #[test]
+    fn late_logs_and_inspect_results_cannot_reopen_or_replace_a_modal() {
+        let mut state = AppState::new();
+        state.log_request_id = 1;
+        state.log_in_progress = Some("old".into());
+        state.clear_log_state();
+        for prefix in ["logs", "inspect"] {
+            state
+                .operation_tx
+                .send(OperationComplete {
+                    request_id: Some(1),
+                    container_id: format!("{prefix}::old"),
+                    success: true,
+                    message: String::new(),
+                    output: Some("stale text".into()),
+                })
+                .unwrap();
+        }
+        state.check_completed_operations();
+        assert!(state.log_output.is_none());
+        assert!(state.log_in_progress.is_none());
+        assert!(state.log_text.is_empty());
+    }
+
+    #[test]
+    fn completed_commands_clear_pending_and_request_fresh_docker_data() {
+        let mut state = AppState::new();
+        state.pending_operations.insert("alpha".into(), true);
+        state
+            .operation_tx
+            .send(OperationComplete {
+                request_id: None,
+                container_id: "alpha".into(),
+                success: true,
+                message: "Started".into(),
+                output: None,
+            })
+            .unwrap();
+        state.check_completed_operations();
+        assert!(state.pending_operations.is_empty());
+        assert!(state.docker_refresh_requested);
+    }
+
+    #[test]
+    fn unchanged_logs_keep_the_wrapped_cache() {
+        let mut state = AppState::new();
+        state.set_log_output("logs".into(), "hello world".into());
+        state.ensure_log_lines(40);
+        state.set_log_output("logs".into(), "hello world".into());
+        assert_eq!(state.log_wrap_width, 40);
+        assert!(!state.log_lines.is_empty());
     }
 }

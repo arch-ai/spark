@@ -11,9 +11,7 @@ fn main() -> io::Result<()> {
 
     let result = app::run_ratatui(tui.terminal());
 
-    if let Err(err) = result {
-        eprintln!("Error: {err}");
-    }
-
-    Ok(())
+    // Restore the terminal before main prints an error and returns a failure status.
+    drop(tui);
+    result
 }

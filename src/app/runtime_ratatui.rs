@@ -59,7 +59,6 @@ struct PortsBuildResult {
 
 pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     let mut system = System::new_all();
-    system.refresh_all();
 
     let docker_worker = docker::start_docker_stats_worker(Duration::from_secs(2));
     let docker_df_worker = docker::start_docker_df_worker(Duration::from_secs(10));
@@ -72,7 +71,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
     maybe_refresh_user_cache(&mut state);
 
     let tick_rate = Duration::from_millis(1000);
-    let input_poll = Duration::from_millis(16);
+    let input_poll = Duration::from_millis(50);
     let mut last_tick = Instant::now();
     let mut needs_render = true;
 
@@ -89,8 +88,8 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
     let mut docker_raw: Arc<Vec<docker::ContainerInfo>> = Arc::new(Vec::new());
     let mut docker_view: Vec<docker::ContainerInfo> = Vec::new();
     let mut docker_dirty = true;
-    let mut last_docker_pull = Instant::now() - Duration::from_secs(60);
-    let mut last_docker_df_pull = Instant::now();
+    let mut docker_snapshot = docker_worker.snapshot();
+    let mut docker_df_snapshot = docker_df_worker.snapshot();
     let (docker_build_tx, docker_build_rx) = mpsc::channel::<DockerBuildResult>();
     let mut docker_build_version: u64 = 0;
     let mut docker_build_in_progress = false;
@@ -283,7 +282,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         // Periodic system refresh (paused while log modal is open)
         if last_tick.elapsed() >= tick_rate {
             if !log_modal_open {
-                refresh_system(&mut system);
+                refresh_system(&mut system, !docker_active);
                 update_system_snapshot(&mut state, &system);
 
                 match state.view_mode {
@@ -304,15 +303,30 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         if state.check_completed_operations() {
             needs_render = true;
         }
+        if state.docker_refresh_requested {
+            state.docker_refresh_requested = false;
+            docker_worker.refresh();
+            docker_df_worker.refresh();
+        }
 
         if state.tick_spinner() {
             needs_render = true;
         }
 
         while let Ok(result) = process_build_rx.try_recv() {
-            if result.version != process_build_version {
+            if state.view_mode != ViewMode::Process {
+                process_dirty = true;
                 process_build_in_progress = false;
                 continue;
+            }
+            if result.version != process_build_version {
+                process_dirty = true;
+                process_build_in_progress = false;
+                continue;
+            }
+            let selected_pid = state.visible_pids.get(state.selected).copied();
+            if let Some(selected) = selected_pid.and_then(|pid| result.visible_pids.iter().position(|next| *next == pid)) {
+                state.selected = selected;
             }
             process_cache = result.process_cache;
             rows_cache = result.rows_cache;
@@ -324,7 +338,13 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         }
 
         while let Ok(result) = node_build_rx.try_recv() {
+            if state.view_mode != ViewMode::Node {
+                node_dirty = true;
+                node_build_in_progress = false;
+                continue;
+            }
             if result.version != node_build_version {
+                node_dirty = true;
                 node_build_in_progress = false;
                 continue;
             }
@@ -344,9 +364,16 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
 
         while let Ok(result) = docker_build_rx.try_recv() {
             if result.version != docker_build_version {
+                docker_dirty = true;
                 docker_build_in_progress = false;
                 continue;
             }
+            state.docker_selected_row = docker_selection_after_refresh(
+                &state,
+                &result.docker_rows,
+                &result.visible_containers,
+            );
+            state.hover_row = None;
             docker_view = result.docker_view;
             state.docker_rows = result.docker_rows;
             state.visible_containers = result.visible_containers;
@@ -364,7 +391,13 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         }
 
         while let Ok(result) = ports_build_rx.try_recv() {
+            if state.view_mode != ViewMode::Ports {
+                ports_dirty = true;
+                ports_build_in_progress = false;
+                continue;
+            }
             if result.version != ports_build_version {
+                ports_dirty = true;
                 ports_build_in_progress = false;
                 continue;
             }
@@ -439,7 +472,6 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                             &entries,
                             &filter,
                             &user_cache,
-                            zoom,
                         );
                         let rows_cache = process::build_tree_rows(
                             &process_cache,
@@ -458,22 +490,25 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 }
             }
             ViewMode::Docker => {
-                // Snapshot docker system df from background worker (non-blocking)
-                if last_docker_df_pull.elapsed() >= Duration::from_millis(500) {
-                    state.docker_system_df = docker_df_worker.snapshot();
-                    last_docker_df_pull = Instant::now();
+                let next_df = docker_df_worker.snapshot();
+                if !Arc::ptr_eq(&next_df, &docker_df_snapshot) {
+                    state.docker_system_df = (*next_df.data).clone();
+                    state.docker_df_error = next_df.error.clone();
+                    state.docker_df_updated_at = next_df.updated_at;
+                    docker_df_snapshot = next_df;
                     needs_render = true;
                 }
-
-                if last_docker_pull.elapsed() >= Duration::from_millis(500) {
-                    docker_raw = docker_worker.snapshot();
-                    docker_dirty = true;
-                    docker_build_version = docker_build_version.wrapping_add(1);
-                    last_docker_pull = Instant::now();
-
-                    if state.update_pending_with_containers(&docker_raw) {
-                        needs_render = true;
+                let next = docker_worker.snapshot();
+                if !Arc::ptr_eq(&next, &docker_snapshot) {
+                    state.docker_error = next.error.clone();
+                    state.docker_updated_at = next.updated_at;
+                    if !Arc::ptr_eq(&next.data, &docker_raw) {
+                        docker_raw = Arc::clone(&next.data);
+                        docker_dirty = true;
+                        docker_build_version = docker_build_version.wrapping_add(1);
                     }
+                    docker_snapshot = next;
+                    needs_render = true;
                 }
 
                 if docker_dirty && !docker_build_in_progress {
@@ -724,8 +759,17 @@ fn adjust_visible_height(state: &AppState, height: u16) -> usize {
     // Docker: title(3) + header(1) + search(3) + df_stats(7) + table_border_header(2) + help(2) = 18
     // Ports/Node: title(3) + header(1) + search(3) + table_border_header(2) + help(2) = 11
     let overhead = match state.view_mode {
-        ViewMode::Process => 15u16,
-        ViewMode::Docker => 18,
+        ViewMode::Process => return crate::ui::layout::process_table(height).height.saturating_sub(3) as usize,
+        ViewMode::Docker => {
+            return crate::ui::layout::docker_layout(ratatui::layout::Rect::new(
+                0,
+                0,
+                state.term_width,
+                height,
+            ))[4]
+                .height
+                .saturating_sub(3) as usize
+        }
         ViewMode::Ports => 11,
         ViewMode::Node => {
             if state.pm2_available {
@@ -752,8 +796,10 @@ fn adjust_visible_height(state: &AppState, height: u16) -> usize {
     (height.saturating_sub(overhead)) as usize
 }
 
-fn refresh_system(system: &mut System) {
-    system.refresh_processes();
+fn refresh_system(system: &mut System, refresh_processes: bool) {
+    if refresh_processes {
+        system.refresh_processes();
+    }
     system.refresh_cpu();
     system.refresh_memory();
 }
@@ -851,6 +897,104 @@ fn clamp_node_selection(state: &mut AppState) {
                 state.selected = i;
                 break;
             }
+        }
+    }
+}
+
+fn docker_selection_after_refresh(
+    state: &AppState,
+    rows: &[docker::DockerRow],
+    ids: &[String],
+) -> usize {
+    let old_row = state.docker_rows.get(state.docker_selected_row);
+    let found = rows.iter().position(|row| match (old_row, row) {
+        (
+            Some(docker::DockerRow::Item { index: old, .. }),
+            docker::DockerRow::Item { index: new, .. },
+        ) => state
+            .visible_containers
+            .get(*old)
+            .zip(ids.get(*new))
+            .is_some_and(|(a, b)| a == b),
+        (
+            Some(docker::DockerRow::Group {
+                name: old_name,
+                path: old_path,
+                ..
+            }),
+            docker::DockerRow::Group { name, path, .. },
+        ) => old_name == name && old_path == path,
+        _ => false,
+    });
+    found.unwrap_or_else(|| {
+        let fallback = state.docker_selected_row.min(rows.len().saturating_sub(1));
+        (0..=fallback)
+            .rev()
+            .find(|&index| {
+                rows.get(index)
+                    .is_some_and(|row| !matches!(row, docker::DockerRow::Separator))
+            })
+            .unwrap_or(0)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_scroll_capacity_matches_rendered_memory_rows() {
+        let state = AppState::new();
+        for height in [16, 20, 24, 36] {
+            assert_eq!(adjust_visible_height(&state, height),
+                crate::ui::layout::process_table(height).height.saturating_sub(3) as usize);
+        }
+    }
+
+    fn item(index: usize) -> docker::DockerRow {
+        docker::DockerRow::Item {
+            index,
+            prefix: String::new(),
+        }
+    }
+
+    #[test]
+    fn docker_selection_follows_container_identity_across_reorder() {
+        let mut state = AppState::new();
+        state.docker_rows = vec![item(0), item(1)];
+        state.visible_containers = vec!["alpha".into(), "beta".into()];
+        state.docker_selected_row = 1;
+        assert_eq!(
+            docker_selection_after_refresh(
+                &state,
+                &[item(0), item(1)],
+                &["beta".into(), "alpha".into()]
+            ),
+            0
+        );
+        assert_eq!(
+            docker_selection_after_refresh(
+                &state,
+                &[item(0), docker::DockerRow::Separator],
+                &["alpha".into()]
+            ),
+            0
+        );
+        assert_eq!(docker_selection_after_refresh(&state, &[], &[]), 0);
+    }
+
+    #[test]
+    fn docker_scroll_capacity_matches_rendered_rows() {
+        let state = AppState::new();
+        let mut state = state;
+        state.view_mode = ViewMode::Docker;
+        for height in [16, 20, 24, 36] {
+            assert_eq!(
+                adjust_visible_height(&state, height),
+                crate::ui::layout::docker_table(height)
+                    .height
+                    .saturating_sub(3) as usize
+            );
         }
     }
 }

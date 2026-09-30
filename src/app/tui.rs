@@ -15,6 +15,20 @@ pub struct Tui {
 impl Tui {
     /// Create and initialize a new terminal
     pub fn new() -> io::Result<Self> {
+        let ui_thread = std::thread::current().id();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == ui_thread {
+                let _ = terminal::disable_raw_mode();
+                let _ = execute!(
+                    io::stdout(),
+                    LeaveAlternateScreen,
+                    Show,
+                    DisableMouseCapture
+                );
+            }
+            previous_hook(info);
+        }));
         let backend = CrosstermBackend::new(io::stdout());
         let terminal = Terminal::new(backend)?;
         let mut tui = Self { terminal };
@@ -37,14 +51,14 @@ impl Tui {
 
     /// Exit the TUI mode and restore terminal state
     fn exit(&mut self) -> io::Result<()> {
-        execute!(
+        let screen_result = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             Show,
             DisableMouseCapture
-        )?;
-        terminal::disable_raw_mode()?;
-        Ok(())
+        );
+        let raw_result = terminal::disable_raw_mode();
+        screen_result.and(raw_result)
     }
 
     /// Get a mutable reference to the terminal for rendering

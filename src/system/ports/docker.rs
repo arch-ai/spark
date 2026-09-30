@@ -1,3 +1,4 @@
+use crate::system::docker::command::DockerCommand;
 use std::path::Path;
 use std::process::Command;
 
@@ -12,7 +13,7 @@ pub fn load_docker_port_bindings() -> Vec<PortInfo> {
             "--format",
             "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}|{{.Labels}}",
         ])
-        .output();
+        .docker_output();
     let Ok(output) = output else {
         return Vec::new();
     };

@@ -1,4 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use sysinfo::System;
 
 use crate::app::actions::{
@@ -8,12 +10,12 @@ use crate::app::actions::{
 };
 use crate::app::state::{
     view_for_sidebar_index, ContextMenu, ContextMenuAction, ContextMenuTarget, DeleteConfirm,
-    DeleteConfirmChoice, DeleteKind, 
+    DeleteConfirmChoice, DeleteKind, DeleteProgress,
     DockerDfKind, DockerListKind, Focus, InputMode, LogOutputMode, LogSource, OperationComplete,
     PruneConfirmChoice, SortBy, ViewMode,
 };
 use crate::app::AppState;
-use crate::system::docker::{ContainerInfo, DockerListItem, DockerRow};
+use crate::system::docker::{ContainerInfo, DockerRow};
 use crate::system::node::open_path_location;
 use crate::system::process::{self, load_process_logs};
 
@@ -24,6 +26,9 @@ pub(crate) fn handle_key_event(
     pm2_view: &[crate::system::node::Pm2Process],
     pm2_rows: &[usize],
 ) -> bool {
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
@@ -103,14 +108,17 @@ pub(crate) fn handle_key_event(
         }
         return false;
     }
+    if state.log_in_progress.is_some() {
+        if key.code == KeyCode::Esc {
+            state.clear_log_state();
+        }
+        return false;
+    }
     if state.docker_list_open {
         return handle_docker_list_modal_mode(key, state);
     }
     if state.env_modal_open {
         return handle_env_modal_mode(key, state);
-    }
-    if state.log_in_progress.is_some() {
-        return false;
     }
     // Close context menu on Escape
     if state.context_menu.is_some() && key.code == KeyCode::Esc {
@@ -229,6 +237,19 @@ fn handle_normal_mode(
     }
 
     match key.code {
+        KeyCode::F(5) if state.view_mode == ViewMode::Docker => {
+            state.docker_refresh_requested = true;
+            state.set_message("Refreshing Docker...");
+        }
+        KeyCode::Char('i') if state.view_mode == ViewMode::Docker => {
+            open_docker_list_modal(state, DockerListKind::Images)
+        }
+        KeyCode::Char('v') if state.view_mode == ViewMode::Docker => {
+            open_docker_list_modal(state, DockerListKind::Volumes)
+        }
+        KeyCode::Char('a') if state.view_mode == ViewMode::Docker => {
+            open_docker_list_modal(state, DockerListKind::Containers)
+        }
         KeyCode::Char('q') => return true,
         KeyCode::Char('/') => {
             state.input_mode = InputMode::Filter;
@@ -477,6 +498,31 @@ fn handle_env_modal_mode(key: KeyEvent, state: &mut AppState) -> bool {
 
 fn handle_docker_list_modal_mode(key: KeyEvent, state: &mut AppState) -> bool {
     let total = state.docker_list_items.len();
+    if key.code == KeyCode::Delete && state.docker_list_request.is_none() {
+        if let (Some(kind), Some(item)) = (state.docker_list_kind,
+            state.docker_list_items.get(state.docker_list_selected).cloned()) {
+            let kind = match kind {
+                DockerListKind::Images => DeleteKind::Image,
+                DockerListKind::Containers => DeleteKind::Container,
+                DockerListKind::Volumes => DeleteKind::Volume,
+            };
+            state.context_menu = None;
+            request_delete_confirmation(state, kind, item.name, item.id);
+        }
+        return false;
+    }
+    if key.code == KeyCode::Char('i')
+        || (key.code == KeyCode::Enter && state.docker_list_kind == Some(DockerListKind::Volumes))
+    {
+        open_docker_list_details(state);
+        return false;
+    }
+    if key.code == KeyCode::F(5) && state.docker_list_request.is_none() {
+        if let Some(kind) = state.docker_list_kind {
+            open_docker_list_modal(state, kind);
+        }
+        return false;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Enter => {
             state.docker_list_open = false;
@@ -514,6 +560,28 @@ fn handle_docker_list_modal_mode(key: KeyEvent, state: &mut AppState) -> bool {
         _ => {}
     }
     false
+}
+
+fn open_docker_list_details(state: &mut AppState) {
+    let Some(item) = state.docker_list_items.get(state.docker_list_selected) else {
+        return;
+    };
+    let target = match state.docker_list_kind {
+        Some(DockerListKind::Volumes) => ContextMenuTarget::DockerVolume {
+            name: item.name.clone(),
+        },
+        Some(DockerListKind::Images) => ContextMenuTarget::DockerImage {
+            id: item.id.clone(),
+            name: item.name.clone(),
+        },
+        Some(DockerListKind::Containers) => ContextMenuTarget::DockerContainer {
+            id: item.id.clone(),
+            name: item.name.clone(),
+        },
+        None => return,
+    };
+    state.context_menu = None;
+    execute_context_action(state, ContextMenuAction::Inspect, &target, &[], &[], &[]);
 }
 
 fn move_ports_selection(state: &mut AppState, direction: isize) -> bool {
@@ -612,9 +680,10 @@ pub(crate) fn handle_mouse_event(
     let y = mouse.row;
 
     // Check if sidebar is visible
-    let show_sidebar = width >= SIDEBAR_WIDTH + 1 + 40; // sidebar + gap + min main
-    let main_x = if show_sidebar { SIDEBAR_WIDTH + 1 } else { 0 };
-    let main_width = if show_sidebar { width.saturating_sub(SIDEBAR_WIDTH + 1) } else { width };
+    let main_area = crate::ui::layout::main_area(ratatui::layout::Rect::new(0, 0, width, height));
+    let main_x = main_area.x;
+    let main_width = main_area.width;
+    let show_sidebar = main_x > 0;
 
     if state.pending_delete.is_some() {
         return handle_delete_confirm_mouse(mouse, state, main_x, main_width, height);
@@ -638,13 +707,13 @@ pub(crate) fn handle_mouse_event(
         return true;
     }
     if state.docker_list_open {
-        if let Some(result) = handle_context_menu_mouse(mouse, state, containers, pm2_view, pm2_rows) {
+        if let Some(result) = handle_context_menu_mouse(mouse, state, containers, pm2_view, pm2_rows, main_area) {
             return result;
         }
         return handle_docker_list_modal_mouse(mouse, state, main_x, main_width, width, height);
     }
 
-    if let Some(result) = handle_context_menu_mouse(mouse, state, containers, pm2_view, pm2_rows) {
+    if let Some(result) = handle_context_menu_mouse(mouse, state, containers, pm2_view, pm2_rows, main_area) {
         return result;
     }
 
@@ -861,9 +930,20 @@ fn handle_main_click(
 
     // Check for click on search box area (rows 4-6 for most views)
     // Layout: title(3) + header(1) = 4, then search box starts
-    let search_start: u16 = 4;
-    let search_end: u16 = 7; // search box is 3 rows
-    let in_search_area = y >= search_start && y < search_end && state.view_mode != ViewMode::DockerEnv;
+    let search_area =
+        crate::ui::layout::docker_layout(ratatui::layout::Rect::new(0, 0, width, height))[2];
+    let search_start: u16 = if state.view_mode == ViewMode::Docker {
+        search_area.y
+    } else {
+        4
+    };
+    let search_end: u16 = if state.view_mode == ViewMode::Docker {
+        search_area.bottom()
+    } else {
+        7
+    }; // search box is 3 rows
+    let in_search_area =
+        y >= search_start && y < search_end && state.view_mode != ViewMode::DockerEnv;
 
     if in_search_area {
         state.input_mode = InputMode::Filter;
@@ -878,8 +958,8 @@ fn handle_main_click(
     // Docker: 3 (title) + 1 (header) + 3 (search) + 7 (df stats) + 2 (table border+header) = 16
     // Ports/Node: 3 + 1 + 3 + 2 = 9
     let list_start: u16 = match state.view_mode {
-        ViewMode::Process => 13,
-        ViewMode::Docker => 16,
+        ViewMode::Process => crate::ui::layout::process_table(height).y + 2,
+        ViewMode::Docker => crate::ui::layout::docker_table(height).y + 2,
         ViewMode::Ports => 9,
         ViewMode::Node => {
             if state.pm2_available {
@@ -927,6 +1007,20 @@ fn handle_main_click(
         }
     }
 
+    if state.view_mode == ViewMode::Process
+        && y >= crate::ui::layout::process_table(height).bottom().saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
+    if state.view_mode == ViewMode::Docker
+        && y >= crate::ui::layout::docker_table(height)
+            .bottom()
+            .saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
     if y < list_start {
         return;
     }
@@ -1004,8 +1098,10 @@ fn handle_main_hover(
 ) {
     // Docker df stats area: title(3) + header(1) + search(3) = 7, df stats is 7 rows
     // Data rows start at row 9 (0-indexed: 9, 10, 11, 12 for Images, Containers, Volumes, Build Cache)
-    if state.view_mode == ViewMode::Docker && y >= 9 && y < 13 {
-        let df_hover = (y - 9) as usize;
+    if let Some(df_hover) = (state.view_mode == ViewMode::Docker)
+        .then(|| crate::ui::layout::docker_disk_row(height, y))
+        .flatten()
+    {
         if df_hover < 4 {
             state.docker_df_hover = Some(df_hover);
             state.hover_row = None;
@@ -1040,8 +1136,8 @@ fn handle_main_hover(
     // Docker: 3 (title) + 1 (header) + 3 (search) + 7 (df stats) + 2 (table border+header) = 16
     // Ports/Node: 3 + 1 + 3 + 2 = 9
     let list_start: u16 = match state.view_mode {
-        ViewMode::Process => 13,
-        ViewMode::Docker => 16,
+        ViewMode::Process => crate::ui::layout::process_table(height).y + 2,
+        ViewMode::Docker => crate::ui::layout::docker_table(height).y + 2,
         ViewMode::Ports => 9,
         ViewMode::Node => 9,
         ViewMode::DockerEnv => {
@@ -1058,6 +1154,20 @@ fn handle_main_hover(
         }
     };
 
+    if state.view_mode == ViewMode::Process
+        && y >= crate::ui::layout::process_table(height).bottom().saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
+    if state.view_mode == ViewMode::Docker
+        && y >= crate::ui::layout::docker_table(height)
+            .bottom()
+            .saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
     if y < list_start {
         state.hover_row = None;
         return;
@@ -1212,11 +1322,13 @@ fn handle_docker_right_click(
     y: u16,
     width: u16,
     height: u16,
-    _main_x: u16,
+    main_x: u16,
     containers: &[crate::system::docker::ContainerInfo],
 ) {
-    if y >= 9 && y < 13 {
-        let df_hover = (y - 9) as usize;
+    if x < main_x {
+        return;
+    }
+    if let Some(df_hover) = crate::ui::layout::docker_disk_row(height, y) {
         let (target, items) = match df_hover {
             0 => (
                 ContextMenuTarget::DockerDf { kind: DockerDfKind::Images },
@@ -1251,7 +1363,15 @@ fn handle_docker_right_click(
     }
 
     // Docker view: 3 (title) + 1 (header) + 3 (search) + 7 (df stats) + 2 (table border+header) = 16
-    let list_start: u16 = 16;
+    let list_start = crate::ui::layout::docker_table(height).y + 2;
+    if state.view_mode == ViewMode::Docker
+        && y >= crate::ui::layout::docker_table(height)
+            .bottom()
+            .saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
     if y < list_start {
         return;
     }
@@ -1350,8 +1470,16 @@ fn handle_process_right_click(
     _main_x: u16,
 ) {
     // Process view: 3 + 1 + 3 + 4 + 2 = 13
-    let list_start: u16 = 13;
-    if y < list_start {
+    let list_start = crate::ui::layout::process_table(height).y + 2;
+    if state.view_mode == ViewMode::Docker
+        && y >= crate::ui::layout::docker_table(height)
+            .bottom()
+            .saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
+    if y < list_start || y >= crate::ui::layout::process_table(height).bottom().saturating_sub(1) {
         return;
     }
 
@@ -1416,6 +1544,14 @@ fn handle_ports_right_click(
 ) {
     // Ports view: 3 + 1 + 3 + 2 = 9
     let list_start: u16 = 9;
+    if state.view_mode == ViewMode::Docker
+        && y >= crate::ui::layout::docker_table(height)
+            .bottom()
+            .saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
     if y < list_start {
         return;
     }
@@ -1555,6 +1691,14 @@ fn handle_node_right_click(
         let (pm2_start, pm2_height, node_start, node_height) = node_table_bounds(height);
         if pm2_height > 0 && y >= pm2_start && y < pm2_start + pm2_height {
             let list_start = pm2_start + 2;
+            if state.view_mode == ViewMode::Docker
+                && y >= crate::ui::layout::docker_table(height)
+                    .bottom()
+                    .saturating_sub(1)
+            {
+                state.hover_row = None;
+                return;
+            }
             if y < list_start {
                 return;
             }
@@ -1609,6 +1753,14 @@ fn handle_node_right_click(
     } else {
         9
     };
+    if state.view_mode == ViewMode::Docker
+        && y >= crate::ui::layout::docker_table(height)
+            .bottom()
+            .saturating_sub(1)
+    {
+        state.hover_row = None;
+        return;
+    }
     if y < list_start {
         return;
     }
@@ -1673,13 +1825,14 @@ fn handle_context_menu_mouse(
     containers: &[ContainerInfo],
     pm2_view: &[crate::system::node::Pm2Process],
     pm2_rows: &[usize],
+    bounds: ratatui::layout::Rect,
 ) -> Option<bool> {
     let menu = state.context_menu.as_ref()?;
     let x = mouse.column;
     let y = mouse.row;
     let result = match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(action) = get_menu_action_at(menu, x, y) {
+            if let Some(action) = get_menu_action_at(menu, x, y, bounds) {
                 let target = menu.target.clone();
                 state.context_menu = None;
                 execute_context_action(state, action, &target, containers, pm2_view, pm2_rows);
@@ -1690,7 +1843,7 @@ fn handle_context_menu_mouse(
             }
         }
         MouseEventKind::Moved => {
-            let new_hover = get_menu_item_at(menu, x, y);
+            let new_hover = get_menu_item_at(menu, x, y, bounds);
             if let Some(menu) = state.context_menu.as_mut() {
                 if menu.hover != new_hover {
                     menu.hover = new_hover;
@@ -1708,24 +1861,23 @@ fn handle_context_menu_mouse(
     Some(result)
 }
 
-fn get_menu_item_at(menu: &ContextMenu, x: u16, y: u16) -> Option<usize> {
-    let menu_x = menu.x;
-    let menu_y = menu.y + MENU_PADDING + menu_header_offset(menu) as u16;
-    let menu_width = MENU_WIDTH;
-
-    if x < menu_x || x >= menu_x + menu_width {
+fn get_menu_item_at(menu: &ContextMenu, x: u16, y: u16, bounds: ratatui::layout::Rect) -> Option<usize> {
+    let labels: Vec<_> = menu.items.iter().map(|action| action.label(menu.is_group)).collect();
+    let area = crate::ui::layout::context_menu_area(bounds, menu.x, menu.y, &labels, menu.header.as_deref());
+    let menu_y = area.y + MENU_PADDING + menu_header_offset(menu) as u16;
+    if x <= area.x || x >= area.right().saturating_sub(1) {
         return None;
     }
 
-    if y < menu_y || y >= menu_y + menu.items.len() as u16 {
+    if y < menu_y || y >= menu_y + menu.items.len() as u16 || y >= area.bottom().saturating_sub(1) {
         return None;
     }
 
     Some((y - menu_y) as usize)
 }
 
-fn get_menu_action_at(menu: &ContextMenu, x: u16, y: u16) -> Option<ContextMenuAction> {
-    get_menu_item_at(menu, x, y).map(|idx| menu.items[idx])
+fn get_menu_action_at(menu: &ContextMenu, x: u16, y: u16, bounds: ratatui::layout::Rect) -> Option<ContextMenuAction> {
+    get_menu_item_at(menu, x, y, bounds).map(|idx| menu.items[idx])
 }
 
 fn execute_context_action(
@@ -1926,7 +2078,7 @@ fn execute_context_action(
             }
             ContextMenuTarget::DockerVolume { name } => {
                 let name = name.clone();
-                let title = format!("Inspect volume: {}", name);
+                let title = format!("Volume details: {}", name);
                 start_inspect_fetch(state, title, move || crate::system::docker::inspect_docker_volume(&name));
             }
             _ => {}
@@ -2021,23 +2173,16 @@ fn execute_context_action(
                     let _ = crate::system::docker::open_container_shell(id);
                 }
                 ContextMenuAction::Env => {
-                    match crate::system::docker::load_container_env(id) {
-                        Ok(env_vars) => {
-                            state.env_vars = env_vars;
-                            enter_env_view(
-                                state,
-                                ViewMode::Docker,
-                                "CONTAINER ENV",
-                                format!("Container: {}", name),
-                                format!("ID: {}", &id[..12.min(id.len())]),
-                                "-".to_string(),
-                                "-".to_string(),
-                            );
-                        }
-                        Err(_) => {
-                            state.set_message(format!("Failed to load env for {}", name));
-                        }
-                    }
+                    enter_env_view(
+                        state,
+                        ViewMode::Docker,
+                        "CONTAINER ENV",
+                        format!("Container: {name}"),
+                        format!("ID: {id}"),
+                        "-".to_string(),
+                        "-".to_string(),
+                    );
+                    crate::app::actions::start_container_env_fetch(state, id.clone());
                 }
                 _ => {}
             }
@@ -2077,6 +2222,9 @@ fn execute_context_action(
 
     match target {
         ContextMenuTarget::Container { id, name, .. } => {
+            if state.pending_operations.contains_key(id) {
+                return;
+            }
             state.set_message(format!("{} {}...", action_name, name));
             // Track expected state: Start/Restart -> running, Stop -> stopped
             let expected_running = !matches!(action, ContextMenuAction::Stop);
@@ -2091,20 +2239,22 @@ fn execute_context_action(
                     ContextMenuAction::Restart => crate::system::docker::restart_container(&id),
                     _ => Ok(()),
                 };
-            let _ = tx.send(OperationComplete {
-                container_id: id,
-                success: result.is_ok(),
-                message: result.err().map(|e| e.to_string()).unwrap_or_default(),
-                output: None,
+                let _ = tx.send(OperationComplete {
+                    request_id: None,
+                    container_id: id,
+                    success: result.is_ok(),
+                    message: result.err().map(|e| e.to_string()).unwrap_or_default(),
+                    output: None,
+                });
             });
-        });
         }
         ContextMenuTarget::Pm2 { .. } => {}
         ContextMenuTarget::Group { name, path } => {
             // Find all containers in this group
             let group_containers: Vec<_> = containers
                 .iter()
-                .filter(|c| c.group_path.as_deref() == path.as_deref())
+                .filter(|c| crate::system::docker::matches_group(c, name, path.as_deref()))
+                .filter(|c| !state.pending_operations.contains_key(&c.id))
                 .map(|c| (c.id.clone(), c.name.clone()))
                 .collect();
 
@@ -2124,25 +2274,35 @@ fn execute_context_action(
                 state.pending_operations.insert(id.clone(), expected_running);
             }
 
-            // Start operations for each container
-            for (id, _name) in group_containers {
-                let tx = state.operation_tx.clone();
-                let container_id = id.clone();
-                std::thread::spawn(move || {
+            let tx = state.operation_tx.clone();
+            std::thread::spawn(move || {
+                for (container_id, name) in group_containers {
                     let result = match action {
-                        ContextMenuAction::Start => crate::system::docker::start_container(&container_id),
-                        ContextMenuAction::Stop => crate::system::docker::stop_container(&container_id),
-                        ContextMenuAction::Restart => crate::system::docker::restart_container(&container_id),
-                        _ => Ok(()), // Container-only actions handled earlier
+                        ContextMenuAction::Start => {
+                            crate::system::docker::start_container(&container_id)
+                        }
+                        ContextMenuAction::Stop => {
+                            crate::system::docker::stop_container(&container_id)
+                        }
+                        ContextMenuAction::Restart => {
+                            crate::system::docker::restart_container(&container_id)
+                        }
+                        _ => Ok(()),
                     };
+                    let success = result.is_ok();
+                    let message = result
+                        .err()
+                        .map(|e| format!("{name}: {e}"))
+                        .unwrap_or_else(|| format!("{name}: action completed"));
                     let _ = tx.send(OperationComplete {
+                        request_id: None,
                         container_id,
-                        success: result.is_ok(),
-                        message: result.err().map(|e| e.to_string()).unwrap_or_default(),
+                        success,
+                        message,
                         output: None,
                     });
-                });
-            }
+                }
+            });
         }
         // Process targets are handled at the start of the function
         ContextMenuTarget::Process { .. } => {}
@@ -2249,43 +2409,27 @@ fn looks_like_node_binary(path: &std::path::Path) -> bool {
 }
 
 fn open_docker_list_modal(state: &mut AppState, kind: DockerListKind) {
-    let (items, label) = match kind {
-        DockerListKind::Images => (crate::system::docker::load_docker_images(), "images"),
-        DockerListKind::Containers => (
-            crate::system::docker::load_docker_containers_with_size(),
-            "containers",
-        ),
-        DockerListKind::Volumes => (crate::system::docker::load_docker_volumes(), "volumes"),
-    };
-
-    let mut items = match items {
-        Ok(items) => items,
-        Err(err) => {
-            state.set_message(format!("Failed to load {}: {}", label, err));
-            vec![DockerListItem {
-                name: format!("Failed to load {}.", label),
-                id: "-".to_string(),
-                size: "-".to_string(),
-                detail_left: "-".to_string(),
-                detail_right: "-".to_string(),
-            }]
-        }
-    };
-
-    if matches!(kind, DockerListKind::Images | DockerListKind::Containers) {
-        items.sort_by(|a, b| {
-            let a_size = docker_size_bytes(&a.size);
-            let b_size = docker_size_bytes(&b.size);
-            b_size.cmp(&a_size)
-        });
-    }
-
+    let (tx, rx) = std::sync::mpsc::channel();
     state.context_menu = None;
     state.docker_list_open = true;
     state.docker_list_kind = Some(kind);
-    state.docker_list_items = items;
+    state.docker_list_items.clear();
     state.docker_list_selected = 0;
     state.docker_list_hover = false;
+    state.docker_list_error = None;
+    state.docker_list_request = Some(rx);
+    std::thread::spawn(move || {
+        let result = match kind {
+            DockerListKind::Images => crate::system::docker::load_docker_images(),
+            DockerListKind::Containers => crate::system::docker::load_docker_containers_with_size(),
+            DockerListKind::Volumes => crate::system::docker::load_docker_volumes(),
+        }
+        .map(|mut items| {
+            items.sort_by_cached_key(|item| std::cmp::Reverse(docker_size_bytes(&item.size)));
+            items
+        });
+        let _ = tx.send(result);
+    });
 }
 
 fn docker_size_bytes(raw: &str) -> u64 {
@@ -2293,14 +2437,7 @@ fn docker_size_bytes(raw: &str) -> u64 {
     if trimmed.is_empty() || trimmed == "-" {
         return 0;
     }
-    let main = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or(trimmed)
-        .split('(')
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
+    let main = trimmed.split('(').next().unwrap_or(trimmed).trim();
     let mut num = String::new();
     let mut unit = String::new();
     for ch in main.chars() {
@@ -2342,7 +2479,7 @@ fn request_prune_confirmation(state: &mut AppState, action: ContextMenuAction) {
 }
 
 fn request_delete_confirmation(state: &mut AppState, kind: DeleteKind, name: String, id: String) {
-    if state.pending_delete.is_some() {
+    if state.pending_delete.is_some() || state.delete_in_progress.is_some() || state.delete_result.is_some() {
         return;
     }
     state.pending_delete = Some(DeleteConfirm { kind, name, id });
@@ -2379,6 +2516,7 @@ fn start_prune_action(state: &mut AppState, action: ContextMenuAction) {
             Err(err) => format!("Failed to prune {}: {}", label, err),
         };
         let _ = tx.send(OperationComplete {
+            request_id: None,
             container_id: format!("prune-{}", label.replace(' ', "-")),
             success,
             message,
@@ -2388,25 +2526,32 @@ fn start_prune_action(state: &mut AppState, action: ContextMenuAction) {
 }
 
 fn start_delete_action(state: &mut AppState, confirm: DeleteConfirm) {
+    if state.delete_in_progress.is_some() || state.delete_result.is_some() {
+        return;
+    }
     let (kind_label, id_label) = match confirm.kind {
         DeleteKind::Image => ("image", confirm.id.clone()),
         DeleteKind::Container => ("container", confirm.id.clone()),
         DeleteKind::Volume => ("volume", confirm.name.clone()),
     };
-    state.set_message(format!("Deleting {} {}...", kind_label, confirm.name));
+    state.delete_in_progress = Some(DeleteProgress {
+        label: format!("{} {}", kind_label, confirm.name),
+        started_at: std::time::Instant::now(),
+    });
     let tx = state.operation_tx.clone();
     std::thread::spawn(move || {
         let result = match confirm.kind {
-            DeleteKind::Image => crate::system::docker::delete_docker_image(&confirm.id),
-            DeleteKind::Container => crate::system::docker::delete_docker_container(&confirm.id),
+            DeleteKind::Image => crate::system::docker::delete_docker_image(&confirm.id).map(|()| String::new()),
+            DeleteKind::Container => crate::system::docker::delete_docker_container(&confirm.id).map(|()| String::new()),
             DeleteKind::Volume => crate::system::docker::delete_docker_volume(&confirm.name),
         };
         let success = result.is_ok();
         let message = match result {
-            Ok(()) => format!("Deleted {} {}", kind_label, confirm.name),
+            Ok(details) => format!("Deleted {} {}\n\n{}", kind_label, confirm.name, details),
             Err(err) => format!("Failed to delete {} {}: {}", kind_label, confirm.name, err),
         };
         let _ = tx.send(OperationComplete {
+            request_id: None,
             container_id: format!("{}-delete::{}", kind_label, id_label),
             success,
             message,
@@ -2964,31 +3109,17 @@ fn prune_confirm_layout(
 }
 
 fn delete_confirm_layout(
-    state: &AppState,
+    _state: &AppState,
     main_x: u16,
     main_width: u16,
     height: u16,
 ) -> (u16, u16, u16, u16, (u16, u16, u16, u16), (u16, u16, u16, u16)) {
-    let label = state
-        .pending_delete
-        .as_ref()
-        .map(|p| p.name.as_str())
-        .unwrap_or("");
-    let width = 60u16.max(label.len() as u16 + 28);
-    let height_box = 9u16;
-    let x = main_x + (main_width.saturating_sub(width)) / 2;
-    let y = (height.saturating_sub(height_box)) / 2;
-
-    let button_w = 10u16;
-    let button_h = 1u16;
-    let buttons_y = y + height_box - 3;
-    let gap = 4u16;
-    let total_buttons_w = button_w * 2 + gap;
-    let buttons_x = x + (width.saturating_sub(total_buttons_w)) / 2;
-    let yes_area = (buttons_x, buttons_y, button_w, button_h);
-    let no_area = (buttons_x + button_w + gap, buttons_y, button_w, button_h);
-
-    (x, y, width, height_box, yes_area, no_area)
+    let (area, yes, no) = crate::ui::layout::delete_confirmation(
+        ratatui::layout::Rect::new(main_x, 0, main_width, height),
+    );
+    (area.x, area.y, area.width, area.height,
+        (yes.x, yes.y, yes.width, yes.height),
+        (no.x, no.y, no.width, no.height))
 }
 
 fn prune_output_layout(
@@ -3106,7 +3237,8 @@ fn docker_list_modal_layout(
     let x = main_x + (main_width.saturating_sub(width)) / 2;
     let y = (height.saturating_sub(height_box)) / 2;
 
-    let list_area = (x + 2, y + 2, width.saturating_sub(4), height_box.saturating_sub(6));
+    let list_area = (x + 2, y + 2, width.saturating_sub(4),
+        crate::ui::layout::docker_list_content_height(height_box, state.docker_list_kind == Some(DockerListKind::Volumes)));
 
     let button_w = 10u16;
     let button_h = 1u16;
@@ -3133,4 +3265,118 @@ fn docker_list_scroll_offset(selected: usize, visible: usize, total: usize) -> u
 fn point_in_rect(x: u16, y: u16, rect: (u16, u16, u16, u16)) -> bool {
     let (rx, ry, rw, rh) = rect;
     x >= rx && x < rx + rw && y >= ry && y < ry + rh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_memory_table_mouse_rows_match_rendering_at_short_heights() {
+        for height in [16, 20, 24, 36] {
+            let mut state = AppState::new();
+            state.view_mode = ViewMode::Process;
+            state.visible_pids = (10..30).map(sysinfo::Pid::from_u32).collect();
+            let table = crate::ui::layout::process_table(height);
+            handle_main_click(&mut state, 5, table.y + 3, 80, height, &[]);
+            assert_eq!(state.selected, 1);
+            handle_main_click(&mut state, 5, table.bottom() - 1, 80, height, &[]);
+            assert_eq!(state.selected, 1);
+            handle_main_hover(&mut state, 5, table.bottom() - 1, height, &[]);
+            assert!(state.hover_row.is_none());
+            handle_process_right_click(&mut state, 5, table.y + 2, 80, height, 0);
+            assert!(matches!(state.context_menu.as_ref().map(|menu| &menu.target),
+                Some(ContextMenuTarget::Process { pid: 10, .. })));
+        }
+    }
+
+    #[test]
+    fn another_delete_cannot_start_while_a_delete_is_pending() {
+        let mut state = AppState::new();
+        state.delete_in_progress = Some(DeleteProgress {
+            label: "volume large-volume".into(), started_at: std::time::Instant::now(),
+        });
+        request_delete_confirmation(&mut state, DeleteKind::Volume, "other".into(), "other".into());
+        assert!(state.pending_delete.is_none());
+        start_delete_action(&mut state, DeleteConfirm {
+            kind: DeleteKind::Volume, name: "other".into(), id: "other".into(),
+        });
+        assert_eq!(state.delete_in_progress.as_ref().unwrap().label, "volume large-volume");
+    }
+
+    #[test]
+    fn long_volume_menu_clicks_and_delete_confirmation_stay_within_terminal() {
+        use ratatui::layout::Rect;
+        for width in [30, 40, 60, 61, 100, 140] {
+            let bounds = crate::ui::layout::main_area(Rect::new(0, 0, width, 16));
+            let menu = ContextMenu {
+                x: width - 5, y: 15, items: vec![ContextMenuAction::Inspect, ContextMenuAction::DeleteVolume],
+                hover: None, target: ContextMenuTarget::DockerVolume { name: "a".repeat(64) },
+                is_group: false, header: Some(format!("Volume: {}", "a".repeat(64))),
+            };
+            let labels: Vec<_> = menu.items.iter().map(|action| action.label(false)).collect();
+            let area = crate::ui::layout::context_menu_area(bounds, menu.x, menu.y, &labels, menu.header.as_deref());
+            assert!(area.right() <= bounds.right());
+            assert!(area.bottom() <= bounds.bottom());
+            for x in [area.x + 1, area.right() - 2] {
+                assert_eq!(get_menu_action_at(&menu, x, area.y + 3, bounds), Some(ContextMenuAction::DeleteVolume));
+            }
+            assert_eq!(get_menu_action_at(&menu, area.x, area.y + 3, bounds), None);
+            let (area, yes, no) = crate::ui::layout::delete_confirmation(bounds);
+            assert!(area.right() <= bounds.right());
+            assert!(yes.x >= area.x && no.right() <= area.right());
+        }
+    }
+
+    #[test]
+    fn docker_sizes_include_spaced_units_but_exclude_virtual_image_size() {
+        assert_eq!(docker_size_bytes("1.25 GB"), 1_250_000_000);
+        assert_eq!(docker_size_bytes("36 B"), 36);
+        assert_eq!(docker_size_bytes("35.58 kB (virtual 209.5 MB)"), 35_580);
+        assert_eq!(docker_size_bytes("Unknown"), 0);
+    }
+
+    #[test]
+    fn docker_mouse_selection_tracks_compact_layout_and_ignores_footer() {
+        for height in [16, 20, 24, 36] {
+            let mut state = AppState::new();
+            state.view_mode = ViewMode::Docker;
+            state.docker_rows = (0..20)
+                .map(|index| DockerRow::Item {
+                    index,
+                    prefix: String::new(),
+                })
+                .collect();
+            let table = crate::ui::layout::docker_table(height);
+            handle_main_click(&mut state, 5, table.y + 3, 80, height, &[]);
+            assert_eq!(state.docker_selected_row, 1);
+            handle_main_click(&mut state, 5, height - 1, 80, height, &[]);
+            assert_eq!(state.docker_selected_row, 1);
+            handle_main_hover(&mut state, 5, height - 1, height, &[]);
+            assert!(state.hover_row.is_none());
+        }
+    }
+
+    #[test]
+    fn compact_disk_actions_use_visible_rows_only() {
+        assert_eq!(crate::ui::layout::docker_disk_row(20, 9), None);
+        assert_eq!(crate::ui::layout::docker_disk_row(24, 7), Some(0));
+        assert_eq!(crate::ui::layout::docker_disk_row(36, 9), Some(0));
+    }
+
+    #[test]
+    fn escape_cancels_a_loading_inspect_above_a_resource_list() {
+        let mut state = AppState::new();
+        state.docker_list_open = true;
+        state.log_in_progress = Some("inspect".into());
+        handle_key_event(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &mut System::new(),
+            &[],
+            &[],
+        );
+        assert!(state.log_in_progress.is_none());
+        assert!(state.docker_list_open);
+    }
 }

@@ -10,3 +10,6 @@ pub use state::{
     LogOutputMode, PruneConfirmChoice, SortBy, SortOrder, ViewMode,
 };
 pub use tui::Tui;
+
+#[cfg(test)]
+pub use state::{DeleteConfirm, DeleteProgress};
