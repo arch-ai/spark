@@ -2,16 +2,18 @@ mod detect;
 mod pm2;
 mod terminal;
 
+use crate::system::worker::{self, Worker};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sysinfo::Pid;
 
 pub use detect::detect_node_processes;
 pub(crate) use detect::project_name_from_process;
-pub use pm2::{is_pm2_running, load_pm2_env, load_pm2_logs, load_pm2_processes, pm2_restart, pm2_start, pm2_stop, Pm2Process};
+pub use pm2::{
+    load_pm2_env, load_pm2_logs, load_pm2_processes, pm2_restart, pm2_start, pm2_stop, Pm2Process,
+};
 pub use terminal::open_path_location;
 
 /// Information about a Node.js process, optionally enriched with PM2 data.
@@ -35,18 +37,13 @@ pub struct NodeProcessInfo {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pm2Info {
     pub pm_id: u32,
-    pub mode: String,       // "fork" or "cluster"
-    pub status: String,     // "online", "stopped", "errored"
+    pub mode: String,   // "fork" or "cluster"
+    pub status: String, // "online", "stopped", "errored"
 }
 
 pub enum NodeRow {
     Group { name: String, count: usize },
     Item { index: usize },
-    UtilsSpacer,
-    UtilsTitle,
-    UtilsTop,
-    UtilsHeader,
-    UtilsSeparator,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -54,21 +51,23 @@ pub struct NodeSnapshot {
     pub node_procs: Vec<NodeProcessInfo>,
     pub pm2_procs: Vec<Pm2Process>,
     pub pm2_available: bool,
+    pub loaded: bool,
+    pub pm2_loading: bool,
+    pub pm2_error: Option<String>,
 }
 
-pub struct NodeWorker {
-    data: Arc<RwLock<Arc<NodeSnapshot>>>,
-    paused: Arc<AtomicBool>,
-}
-
+pub struct NodeWorker(Worker<NodeSnapshot>, Worker<Vec<Pm2Process>>);
 impl NodeWorker {
     pub fn snapshot(&self) -> Arc<NodeSnapshot> {
-        let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
-        Arc::clone(&guard)
+        Arc::clone(&self.0.snapshot().data)
     }
-
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
+        self.1.set_paused(paused);
+        self.0.set_paused(paused);
+    }
+    pub fn refresh(&self) {
+        self.1.refresh();
+        self.0.refresh();
     }
 }
 
@@ -194,46 +193,33 @@ fn sort_node_processes(node_procs: &mut Vec<NodeProcessInfo>) {
 }
 
 pub fn start_node_worker(interval: Duration) -> NodeWorker {
-    let data = Arc::new(RwLock::new(Arc::new(NodeSnapshot::default())));
-    let thread_data = Arc::clone(&data);
-    let paused = Arc::new(AtomicBool::new(false));
-    let thread_paused = Arc::clone(&paused);
-
-    std::thread::spawn(move || {
-        let mut system = sysinfo::System::new();
-        loop {
-            if thread_paused.load(Ordering::Relaxed) {
-                std::thread::sleep(interval);
-                continue;
-            }
-            system.refresh_processes();
-            system.refresh_cpu();
-
-            let pm2_result = load_pm2_processes();
-            let (pm2_available, pm2_procs) = match pm2_result {
-                Ok(list) => (true, list),
-                Err(_) => (false, Vec::new()),
-            };
-            let node_procs = collect_node_processes_unfiltered(&system, &pm2_procs);
-
-            let snapshot = NodeSnapshot {
-                node_procs,
-                pm2_procs,
-                pm2_available,
-            };
-            let should_update = {
-                let guard = thread_data.read().unwrap_or_else(|err| err.into_inner());
-                guard.as_ref() != &snapshot
-            };
-            if should_update {
-                let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
-                *guard = Arc::new(snapshot);
-            }
-            std::thread::sleep(interval);
-        }
+    // A slow/missing PM2 daemon must not stall native Node process snapshots.
+    let pm2_worker = worker::start_worker(interval, || {
+        load_pm2_processes().map_err(std::io::Error::other)
     });
-
-    NodeWorker { data, paused }
+    let pm2_source = pm2_worker.clone();
+    let mut system = sysinfo::System::new();
+    let native = worker::start_worker(interval, move || {
+        system.refresh_processes_specifics(
+            sysinfo::ProcessRefreshKind::new()
+                .with_cpu()
+                .with_memory()
+                .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
+                .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+        );
+        system.refresh_cpu();
+        let pm2 = pm2_source.snapshot();
+        let node_procs = collect_node_processes_unfiltered(&system, &pm2.data);
+        Ok(NodeSnapshot {
+            node_procs,
+            pm2_procs: (*pm2.data).clone(),
+            pm2_available: pm2.updated_at.is_some(),
+            loaded: true,
+            pm2_loading: pm2.updated_at.is_none() && pm2.error.is_none(),
+            pm2_error: pm2.error.clone(),
+        })
+    });
+    NodeWorker(native, pm2_worker)
 }
 
 pub fn is_node_util(proc: &NodeProcessInfo) -> bool {
@@ -336,16 +322,9 @@ fn build_grouped_rows(
     let mut group_map: HashMap<String, usize> = HashMap::new();
 
     for (i, &original_idx) in indices.iter().enumerate() {
-        let use_token = token_counts
-            .get(&token_keys[i])
-            .copied()
-            .unwrap_or(0)
-            > 1;
+        let use_token = token_counts.get(&token_keys[i]).copied().unwrap_or(0) > 1;
         let (group_key, group_label) = if use_token && !token_keys[i].is_empty() {
-            (
-                format!("token::{}", token_keys[i]),
-                tokens[i].clone(),
-            )
+            (format!("token::{}", token_keys[i]), tokens[i].clone())
         } else {
             (
                 format!("label::{}", labels[i].to_ascii_lowercase()),

@@ -1,3 +1,4 @@
+use crate::system::docker::command::DockerCommand;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,13 +10,8 @@ use super::{ContainerInfo, DockerRow};
 const DASH: &str = "-";
 const OTHER: &str = "Other";
 
-/// Load docker stats using a single combined command.
-/// This reduces process spawning from 2 calls to 1 per refresh cycle.
-/// Includes stopped containers with -a flag.
-pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
-    // Combined format: stats data + metadata in single command
-    // Format: ID|Name|CPU|MemUsage|Image|Ports|Status|Labels
-    // Use -a to include stopped containers
+/// Load container metadata with one bounded Docker CLI call.
+pub fn load_docker_stats() -> std::io::Result<Vec<ContainerInfo>> {
     let output = Command::new("docker")
         .args([
             "ps",
@@ -24,15 +20,18 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
             "--format",
             "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}|{{.Status}}|{{.Labels}}",
         ])
-        .output()
-        .ok()?;
-
+        .docker_output()?;
     if !output.status.success() {
-        return None;
+        return Err(std::io::Error::other(format!(
+            "Docker unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
+    Ok(parse_containers(&String::from_utf8_lossy(&output.stdout)))
+}
 
+fn parse_containers(stdout: &str) -> Vec<ContainerInfo> {
     // Parse container metadata from docker ps
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let container_ids: Vec<&str> = stdout
         .lines()
         .filter_map(|line| {
@@ -46,7 +45,7 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
         .collect();
 
     if container_ids.is_empty() {
-        return Some(Vec::new());
+        return Vec::new();
     }
 
     // Parse metadata and combine with stats
@@ -98,11 +97,12 @@ pub fn load_docker_stats() -> Option<Vec<ContainerInfo>> {
                 .unwrap_or(Cow::Borrowed(OTHER)),
             group_path: group.and_then(|g| g.path),
             running,
+            memory: None,
             activity_secs,
         });
     }
 
-    Some(containers)
+    containers
 }
 
 #[derive(Clone)]
@@ -111,8 +111,14 @@ struct ComposeGroup {
     path: Option<String>,
 }
 
-pub fn group_containers(
+#[cfg(test)]
+pub fn group_containers(containers: Vec<ContainerInfo>) -> (Vec<ContainerInfo>, Vec<DockerRow>) {
+    group_containers_sorted(containers, None)
+}
+
+pub fn group_containers_sorted(
     containers: Vec<ContainerInfo>,
+    sort: Option<crate::app::sorting::TableSort>,
 ) -> (Vec<ContainerInfo>, Vec<DockerRow>) {
     struct GroupBucket {
         name: Cow<'static, str>,
@@ -141,23 +147,35 @@ pub fn group_containers(
 
     let other = grouped.remove("Other");
 
-    // Convert to vec and sort groups by activity (most recent first)
+    // Rank groups by their first member under the selected ordering.
     let mut buckets: Vec<_> = grouped.into_values().collect();
-    buckets.sort_by_key(|b| b.min_activity);
+    if let Some(sort) = sort {
+        for bucket in buckets.iter_mut() {
+            bucket
+                .containers
+                .sort_by(|a, b| crate::app::sorting::compare_containers(a, b, sort));
+        }
+        buckets.sort_by(|a, b| {
+            crate::app::sorting::compare_containers(&a.containers[0], &b.containers[0], sort)
+        });
+    } else {
+        buckets.sort_by_key(|b| b.min_activity);
+    }
 
     let mut flat = Vec::new();
     let mut rows = Vec::new();
     let mut first_group = true;
 
     for mut bucket in buckets {
-        // Sort containers within group by name (A-Z)
-        bucket.containers.sort_by(|a, b| {
-            let a_name = a.name.to_lowercase();
-            let b_name = b.name.to_lowercase();
-            a_name
-                .cmp(&b_name)
-                .then_with(|| a.activity_secs.cmp(&b.activity_secs))
-        });
+        if sort.is_none() {
+            bucket.containers.sort_by(|a, b| {
+                let a_name = a.name.to_lowercase();
+                let b_name = b.name.to_lowercase();
+                a_name
+                    .cmp(&b_name)
+                    .then_with(|| a.activity_secs.cmp(&b.activity_secs))
+            });
+        }
 
         if !first_group {
             rows.push(DockerRow::Separator);
@@ -186,6 +204,9 @@ pub fn group_containers(
     // "Other" group always goes last
     if let Some(mut bucket) = other {
         bucket.containers.sort_by(|a, b| {
+            if let Some(sort) = sort {
+                return crate::app::sorting::compare_containers(a, b, sort);
+            }
             let a_name = a.name.to_lowercase();
             let b_name = b.name.to_lowercase();
             a_name
@@ -282,7 +303,12 @@ fn parse_docker_ports(raw: &str) -> (Cow<'static, str>, Cow<'static, str>) {
             let host_port = extract_host_port(left.trim());
             let internal_port = extract_container_port(right.trim());
             if !host_port.is_empty() {
-                public_ports.push(host_port);
+                let port = if right.trim().ends_with("/udp") {
+                    format!("{host_port}/udp")
+                } else {
+                    host_port
+                };
+                public_ports.push(port);
             }
             if !internal_port.is_empty() {
                 internal_ports.push(internal_port);
@@ -299,6 +325,10 @@ fn parse_docker_ports(raw: &str) -> (Cow<'static, str>, Cow<'static, str>) {
         if !unbound_ports.is_empty() {
             internal_ports.extend(unbound_ports);
         }
+        public_ports.sort();
+        public_ports.dedup();
+        internal_ports.sort();
+        internal_ports.dedup();
         let pub_join = public_ports.join(",");
         let internal_join = internal_ports.join(",");
         let internal: Cow<'static, str> = if internal_join.is_empty() {
@@ -308,7 +338,7 @@ fn parse_docker_ports(raw: &str) -> (Cow<'static, str>, Cow<'static, str>) {
         };
         (Cow::Owned(pub_join), internal)
     } else if !unbound_ports.is_empty() {
-        (Cow::Owned(unbound_ports.join(",")), Cow::Borrowed(DASH))
+        (Cow::Borrowed(DASH), Cow::Owned(unbound_ports.join(",")))
     } else {
         (Cow::Borrowed(DASH), Cow::Borrowed(DASH))
     }
@@ -320,12 +350,7 @@ fn extract_host_port(input: &str) -> String {
 }
 
 fn extract_container_port(input: &str) -> String {
-    input
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    extract_unbound_port(input)
 }
 
 fn extract_unbound_port(input: &str) -> String {
@@ -367,7 +392,10 @@ fn parse_activity_time(status: &str) -> u64 {
     let time_str = if status_lower.starts_with("up") {
         status_lower.trim_start_matches("up").trim()
     } else if let Some(pos) = status_lower.find(')') {
-        status_lower[pos + 1..].trim().trim_end_matches("ago").trim()
+        status_lower[pos + 1..]
+            .trim()
+            .trim_end_matches("ago")
+            .trim()
     } else {
         &status_lower
     };
@@ -383,7 +411,10 @@ fn parse_duration_string(input: &str) -> u64 {
     // Handle special cases
     if input.starts_with("a ") || input.starts_with("an ") {
         // "a minute", "an hour", etc.
-        let unit = input.trim_start_matches("a ").trim_start_matches("an ").trim();
+        let unit = input
+            .trim_start_matches("a ")
+            .trim_start_matches("an ")
+            .trim();
         return match unit {
             s if s.starts_with("second") => 1,
             s if s.starts_with("minute") => 60,
@@ -398,7 +429,10 @@ fn parse_duration_string(input: &str) -> u64 {
 
     // Parse "N units" format
     let mut parts = input.split_whitespace();
-    let number = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+    let number = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1);
     let unit = parts.next().unwrap_or("");
 
     let multiplier = match unit {
@@ -440,14 +474,21 @@ pub struct DockerSystemDf {
 }
 
 /// Load docker system disk usage using `docker system df`
-pub fn load_docker_system_df() -> Option<DockerSystemDf> {
+pub fn load_docker_system_df() -> std::io::Result<DockerSystemDf> {
     let output = Command::new("docker")
-        .args(["system", "df", "--format", "{{.Type}}|{{.TotalCount}}|{{.Active}}|{{.Size}}|{{.Reclaimable}}"])
-        .output()
-        .ok()?;
+        .args([
+            "system",
+            "df",
+            "--format",
+            "{{.Type}}|{{.TotalCount}}|{{.Active}}|{{.Size}}|{{.Reclaimable}}",
+        ])
+        .docker_output()?;
 
     if !output.status.success() {
-        return None;
+        return Err(std::io::Error::other(format!(
+            "Docker disk usage unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -501,14 +542,61 @@ pub fn load_docker_system_df() -> Option<DockerSystemDf> {
         }
     }
 
-    Some(df)
+    Ok(df)
 }
 
 fn parse_reclaimable(input: &str) -> (&str, &str) {
     // Input format: "19.87GB (41%)" or just "19.87GB"
     if let Some(idx) = input.find('(') {
-        (&input[..idx].trim(), &input[idx + 1..].trim_end_matches(')'))
+        (input[..idx].trim(), input[idx + 1..].trim_end_matches(')'))
     } else {
         (input.trim(), "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ports_distinguish_published_exposed_and_udp_without_ipv6_duplicates() {
+        assert_eq!(
+            parse_docker_ports("5432/tcp"),
+            (Cow::Borrowed("-"), Cow::Owned("5432".into()))
+        );
+        assert_eq!(
+            parse_docker_ports("0.0.0.0:8080->80/tcp, [::]:8080->80/tcp"),
+            (Cow::Owned("8080".into()), Cow::Owned("80".into()))
+        );
+        assert_eq!(
+            parse_docker_ports("0.0.0.0:5353->53/udp"),
+            (Cow::Owned("5353/udp".into()), Cow::Owned("53/udp".into()))
+        );
+    }
+
+    #[test]
+    fn pathless_compose_projects_remain_separate_action_targets() {
+        let containers = parse_containers("abc|api|node:22||Up 2 hours|com.docker.compose.project=alpha\ndef|worker|node:22||Exited (1) 1 minute ago|com.docker.compose.project=beta\n");
+        assert_eq!(containers.len(), 2);
+        assert!(crate::system::docker::matches_group(
+            &containers[0],
+            "alpha",
+            None
+        ));
+        assert!(!crate::system::docker::matches_group(
+            &containers[1],
+            "alpha",
+            None
+        ));
+        assert!(!crate::system::docker::matches_group(
+            &containers[0],
+            "alpha",
+            Some("/different")
+        ));
+    }
+
+    #[test]
+    fn malformed_and_empty_container_rows_are_not_actionable() {
+        assert!(parse_containers("\n|||\r\n").is_empty());
     }
 }

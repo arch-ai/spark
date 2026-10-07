@@ -17,6 +17,7 @@ pub struct Sidebar<'a> {
     title: &'a str,
     active_color: Color,
     hover_color: Color,
+    logo_frame: u8,
 }
 
 impl<'a> Sidebar<'a> {
@@ -30,6 +31,7 @@ impl<'a> Sidebar<'a> {
             title: "SPARK",
             active_color: Color::Cyan,
             hover_color: Color::DarkGray,
+            logo_frame: 0,
         }
     }
 
@@ -52,6 +54,10 @@ impl<'a> Sidebar<'a> {
         self.has_focus = focus;
         self
     }
+    pub fn logo_frame(mut self, frame: u8) -> Self {
+        self.logo_frame = frame;
+        self
+    }
 }
 
 impl Widget for Sidebar<'_> {
@@ -61,9 +67,7 @@ impl Widget for Sidebar<'_> {
         }
 
         // Draw the outer block with title
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(self.title);
+        let block = Block::default().borders(Borders::ALL).title(self.title);
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -78,12 +82,24 @@ impl Widget for Sidebar<'_> {
             "     '     '",
         ];
 
-        let logo_height = logo_lines.len().min(inner.height.saturating_sub(2) as usize);
+        let logo_height =
+            crate::ui::layout::sidebar_menu_start(area.height).saturating_sub(2) as usize;
         for (i, line) in logo_lines.iter().take(logo_height).enumerate() {
             let y = inner.y + i as u16;
             if y < inner.y + inner.height {
+                let center = ['*', '+', 'x', '+'][self.logo_frame as usize % 4];
+                let line = line.replace('*', &center.to_string());
                 let truncated: String = line.chars().take(inner.width as usize).collect();
-                buf.set_string(inner.x, y, &truncated, Style::default());
+                buf.set_string(
+                    inner.x,
+                    y,
+                    &truncated,
+                    Style::default().fg(if (i + self.logo_frame as usize) % 8 == 3 {
+                        Color::Cyan
+                    } else {
+                        Color::Gray
+                    }),
+                );
             }
         }
 
