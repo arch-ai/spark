@@ -2,7 +2,7 @@ use crate::system::docker::command::DockerCommand;
 use std::io;
 use std::process::Command;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DockerListItem {
     pub name: String,
     pub id: String,
@@ -11,6 +11,9 @@ pub struct DockerListItem {
     pub detail_right: String,
     /// Volume activity inferred from containers, never a file access timestamp.
     pub activity: Option<String>,
+    pub activity_age_secs: Option<u64>,
+    pub detail_project: String,
+    pub attachments: Option<Vec<super::VolumeAttachment>>,
 }
 
 pub fn load_container_env(container_id: &str) -> io::Result<Vec<String>> {
@@ -328,10 +331,15 @@ fn parse_list_items(output: &std::process::Output) -> Vec<DockerListItem> {
         items.push(DockerListItem {
             name: display_name.to_string(),
             id: id.to_string(),
-            size: if size.is_empty() { "-".to_string() } else { size.to_string() },
+            size: if size.is_empty() {
+                "-".to_string()
+            } else {
+                size.to_string()
+            },
             detail_left: "-".to_string(),
             detail_right: "-".to_string(),
             activity: None,
+            ..Default::default()
         });
     }
     items

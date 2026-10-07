@@ -1,4 +1,8 @@
-use std::process::Command;
+use crate::system::command::run_output;
+use serde_json::Value;
+use std::io;
+use std::process::{Command, Output};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// PM2 process information.
 #[derive(Clone, Debug, PartialEq)]
@@ -15,155 +19,133 @@ pub struct Pm2Process {
     pub cwd: Option<String>,
 }
 
-/// Check if PM2 daemon is running.
-pub fn is_pm2_running() -> bool {
-    // Use bash -lc to ensure PM2 is in PATH (handles nvm, npm global installs, etc.)
-    // Use 'pm2 jlist' instead of 'pm2 ping' for more reliable detection
-    Command::new("bash")
-        .args(["-lc", "pm2 jlist"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+// Use the inherited PATH first (including test doubles). A login shell is only
+// needed when an interactive shell profile supplies an nvm/global npm PATH.
+fn pm2_output(args: &[&str], timeout: Duration) -> io::Result<Output> {
+    match run_output(Command::new("pm2").args(args), timeout, "PM2") {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => run_output(
+            Command::new("bash")
+                .args(["-lc", "exec pm2 \"$@\"", "spark-pm2"])
+                .args(args),
+            timeout,
+            "PM2",
+        ),
+        result => result,
+    }
 }
 
-/// Load PM2 process list using `pm2 jlist`.
-/// Returns an empty Vec on error (graceful degradation).
-pub fn load_pm2_processes() -> Result<Vec<Pm2Process>, Pm2Error> {
-    // Try to run pm2 jlist via bash -lc to ensure PM2 is in PATH
-    let output = Command::new("bash")
-        .args(["-lc", "pm2 jlist"])
-        .output()
-        .map_err(|e| Pm2Error::CommandFailed(e.to_string()))?;
-
+fn load_pm2_json() -> Result<Value, Pm2Error> {
+    let output = pm2_output(&["jlist", "--silent"], Duration::from_secs(15))
+        .map_err(|err| Pm2Error::CommandFailed(err.to_string()))?;
     if !output.status.success() {
-        // PM2 might not be installed or daemon not running
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not found") || stderr.contains("command not found") {
-            return Err(Pm2Error::NotInstalled);
-        }
-        if stderr.contains("PM2 is not running") || stderr.contains("spawn pm2") {
-            return Err(Pm2Error::DaemonNotRunning);
-        }
-        return Err(Pm2Error::CommandFailed(stderr.to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse JSON output
-    parse_pm2_json(&stdout)
-}
-
-pub fn pm2_start(pm_id: u32) -> std::io::Result<()> {
-    let cmd = format!("pm2 start {}", pm_id);
-    let output = Command::new("bash")
-        .args(["-lc", &cmd])
-        .output()?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("pm2 start failed: {}", stderr.trim()),
-        ))
-    }
-}
-
-pub fn pm2_stop(pm_id: u32) -> std::io::Result<()> {
-    let cmd = format!("pm2 stop {}", pm_id);
-    let output = Command::new("bash")
-        .args(["-lc", &cmd])
-        .output()?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("pm2 stop failed: {}", stderr.trim()),
-        ))
-    }
-}
-
-pub fn pm2_restart(pm_id: u32) -> std::io::Result<()> {
-    let cmd = format!("pm2 restart {}", pm_id);
-    let output = Command::new("bash")
-        .args(["-lc", &cmd])
-        .output()?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("pm2 restart failed: {}", stderr.trim()),
-        ))
-    }
-}
-
-pub fn load_pm2_logs(pm_id: u32) -> std::io::Result<String> {
-    let cmd = format!("pm2 logs {} --lines 200 --nostream", pm_id);
-    let output = Command::new("bash")
-        .args(["-lc", &cmd])
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success() {
-        if stderr.trim().is_empty() {
-            Ok(stdout.to_string())
-        } else if stdout.trim().is_empty() {
-            Ok(stderr.to_string())
+        let message = command_error(&output);
+        return Err(if output.status.code() == Some(127) {
+            Pm2Error::NotInstalled
+        } else if message.contains("PM2 is not running") {
+            Pm2Error::DaemonNotRunning
         } else {
-            Ok(format!("{}\n{}", stdout, stderr))
-        }
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("pm2 logs failed: {}", stderr.trim()),
-        ))
+            Pm2Error::CommandFailed(message)
+        });
     }
+    parse_array(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_array(text: &str) -> Result<Value, Pm2Error> {
+    let json: Value =
+        serde_json::from_str(text).map_err(|err| Pm2Error::ParseError(err.to_string()))?;
+    if !json.is_array() {
+        return Err(Pm2Error::ParseError("Expected a JSON array".into()));
+    }
+    Ok(json)
+}
+
+pub fn load_pm2_processes() -> Result<Vec<Pm2Process>, Pm2Error> {
+    parse_processes(&load_pm2_json()?)
+}
+
+fn command_error(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stderr.trim().is_empty() {
+        stderr.trim().into()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim().into()
+    } else {
+        format!("Command exited with {}", output.status)
+    }
+}
+
+fn mutate(action: &str, pm_id: u32) -> io::Result<()> {
+    let id = pm_id.to_string();
+    let output = pm2_output(&[action, &id], Duration::from_secs(120))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "pm2 {action} failed: {}",
+            command_error(&output)
+        )))
+    }
+}
+
+pub fn pm2_start(pm_id: u32) -> io::Result<()> {
+    mutate("start", pm_id)
+}
+pub fn pm2_stop(pm_id: u32) -> io::Result<()> {
+    mutate("stop", pm_id)
+}
+pub fn pm2_restart(pm_id: u32) -> io::Result<()> {
+    mutate("restart", pm_id)
+}
+
+pub fn load_pm2_logs(pm_id: u32) -> io::Result<String> {
+    let id = pm_id.to_string();
+    let output = pm2_output(
+        &["logs", &id, "--lines", "200", "--nostream"],
+        Duration::from_secs(15),
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "pm2 logs failed: {}",
+            command_error(&output)
+        )));
+    }
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 pub fn load_pm2_env(pm_id: u32) -> Result<Vec<String>, Pm2Error> {
-    let output = Command::new("bash")
-        .args(["-lc", "pm2 jlist"])
-        .output()
-        .map_err(|e| Pm2Error::CommandFailed(e.to_string()))?;
+    parse_env(&load_pm2_json()?, pm_id)
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not found") || stderr.contains("command not found") {
-            return Err(Pm2Error::NotInstalled);
-        }
-        if stderr.contains("PM2 is not running") || stderr.contains("spawn pm2") {
-            return Err(Pm2Error::DaemonNotRunning);
-        }
-        return Err(Pm2Error::CommandFailed(stderr.to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let trimmed = stdout.trim();
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| Pm2Error::ParseError("Invalid JSON array".to_string()))?;
-
-    let objects = split_json_objects(inner);
-    for obj in objects {
-        if extract_u32(&obj, "pm_id") == Some(pm_id) {
-            if let Some(env_obj) = extract_nested_object(&obj, "pm2_env", "env") {
-                let envs = parse_env_object(&env_obj);
-                return Ok(envs);
-            }
-            return Ok(Vec::new());
-        }
-    }
-
-    Err(Pm2Error::ParseError("PM2 process not found".to_string()))
+fn parse_env(json: &Value, pm_id: u32) -> Result<Vec<String>, Pm2Error> {
+    let process = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|process| process.get("pm_id").and_then(Value::as_u64) == Some(pm_id as u64))
+        .ok_or_else(|| Pm2Error::ParseError("PM2 process no longer exists".into()))?;
+    let mut env = process["pm2_env"]["env"]
+        .as_object()
+        .map(|env| {
+            env.iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{key}={}",
+                        value
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| value.to_string())
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    env.sort();
+    Ok(env)
 }
 
 /// Errors that can occur when interacting with PM2.
@@ -174,6 +156,8 @@ pub enum Pm2Error {
     CommandFailed(String),
     ParseError(String),
 }
+
+impl std::error::Error for Pm2Error {}
 
 impl std::fmt::Display for Pm2Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -186,573 +170,90 @@ impl std::fmt::Display for Pm2Error {
     }
 }
 
-/// Parse PM2 JSON output manually (avoiding external JSON crate dependency).
-fn parse_pm2_json(json_str: &str) -> Result<Vec<Pm2Process>, Pm2Error> {
-    let trimmed = json_str.trim();
-
-    // Handle empty array
-    if trimmed == "[]" {
-        return Ok(Vec::new());
-    }
-
-    // Very basic JSON array parsing
-    // PM2 jlist output format:
-    // [{"pm_id":0,"name":"app","pid":1234,"monit":{"memory":123456,"cpu":5.5},...},...]
-
-    let mut processes = Vec::new();
-
-    // Remove outer brackets
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| Pm2Error::ParseError("Invalid JSON array".to_string()))?;
-
-    if inner.trim().is_empty() {
-        return Ok(processes);
-    }
-
-    // Split by },{ pattern (accounting for nested objects)
-    let objects = split_json_objects(inner);
-
-    for obj_str in objects {
-        if let Some(proc) = parse_pm2_object(&obj_str) {
-            processes.push(proc);
-        }
-    }
-
-    Ok(processes)
-}
-
-/// Split JSON array into individual object strings.
-fn split_json_objects(json: &str) -> Vec<String> {
-    let mut objects = Vec::new();
-    let mut current = String::new();
-    let mut brace_depth = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for ch in json.chars() {
-        if escape_next {
-            current.push(ch);
-            escape_next = false;
-            continue;
-        }
-
-        if ch == '\\' && in_string {
-            current.push(ch);
-            escape_next = true;
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = !in_string;
-        }
-
-        if !in_string {
-            match ch {
-                '{' => brace_depth += 1,
-                '}' => brace_depth -= 1,
-                ',' if brace_depth == 0 => {
-                    if !current.trim().is_empty() {
-                        objects.push(current.trim().to_string());
-                    }
-                    current = String::new();
-                    continue;
+fn parse_processes(json: &Value) -> Result<Vec<Pm2Process>, Pm2Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    json.as_array()
+        .unwrap()
+        .iter()
+        .map(|process| {
+            let pm_id = process
+                .get("pm_id")
+                .and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .ok_or_else(|| Pm2Error::ParseError("Process is missing a valid PM2 id".into()))?;
+            let env = &process["pm2_env"];
+            let status = env["status"].as_str().unwrap_or("unknown").to_owned();
+            let pid = process["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid != 0);
+            Ok(Pm2Process {
+                pm_id,
+                name: process["name"].as_str().unwrap_or("unknown").to_owned(),
+                mode: if env["exec_mode"].as_str().unwrap_or("").contains("cluster") {
+                    "cluster"
+                } else {
+                    "fork"
                 }
-                _ => {}
-            }
-        }
-
-        current.push(ch);
-    }
-
-    if !current.trim().is_empty() {
-        objects.push(current.trim().to_string());
-    }
-
-    objects
-}
-
-/// Parse a single PM2 process object.
-fn parse_pm2_object(json: &str) -> Option<Pm2Process> {
-    // Extract fields using simple string matching
-
-    let pm_id = extract_u32(json, "pm_id")?;
-    let name = extract_string(json, "name").unwrap_or_else(|| "unknown".to_string());
-    let pid = extract_u32(json, "pid");
-
-    // Status is in pm2_env.status
-    let status = extract_nested_string(json, "pm2_env", "status")
-        .or_else(|| extract_string(json, "status"))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // Mode (fork/cluster) is in pm2_env.exec_mode
-    let mode = extract_nested_string(json, "pm2_env", "exec_mode")
-        .map(|m| {
-            if m.contains("cluster") {
-                "cluster".to_string()
-            } else {
-                "fork".to_string()
-            }
+                .into(),
+                uptime_ms: if status == "online" {
+                    env["pm_uptime"]
+                        .as_u64()
+                        .filter(|start| *start > 0)
+                        .and_then(|start| now.checked_sub(start))
+                } else {
+                    None
+                },
+                status,
+                pid,
+                cpu: process["monit"]["cpu"]
+                    .as_f64()
+                    .map(|value| value as f32)
+                    .filter(|value| value.is_finite() && *value >= 0.0),
+                memory_bytes: process["monit"]["memory"].as_u64(),
+                script: env["pm_exec_path"].as_str().map(str::to_owned),
+                cwd: env["pm_cwd"].as_str().map(str::to_owned),
+            })
         })
-        .unwrap_or_else(|| "fork".to_string());
-
-    // Uptime in pm2_env.pm_uptime (timestamp when started)
-    let uptime_ms = extract_nested_u64(json, "pm2_env", "pm_uptime").and_then(|start_time| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis() as u64;
-        if now > start_time {
-            Some(now - start_time)
-        } else {
-            None
-        }
-    });
-
-    // Memory and CPU from monit object
-    let memory_bytes = extract_nested_u64(json, "monit", "memory");
-    let cpu = extract_nested_f32(json, "monit", "cpu");
-
-    // Script path and cwd
-    let script = extract_nested_string(json, "pm2_env", "pm_exec_path");
-    let cwd = extract_nested_string(json, "pm2_env", "pm_cwd");
-
-    Some(Pm2Process {
-        pm_id,
-        name,
-        mode,
-        status,
-        pid,
-        cpu,
-        memory_bytes,
-        uptime_ms,
-        script,
-        cwd,
-    })
-}
-
-/// Extract a string value from JSON.
-fn extract_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = &json[start..];
-
-    // Find the closing quote (handling escapes)
-    let mut end = 0;
-    let mut escape_next = false;
-    for (i, ch) in rest.chars().enumerate() {
-        if escape_next {
-            escape_next = false;
-            continue;
-        }
-        if ch == '\\' {
-            escape_next = true;
-            continue;
-        }
-        if ch == '"' {
-            end = i;
-            break;
-        }
-    }
-
-    Some(rest[..end].to_string())
-}
-
-/// Extract a u32 value from JSON.
-fn extract_u32(json: &str, key: &str) -> Option<u32> {
-    let pattern = format!("\"{}\":", key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = json[start..].trim_start();
-
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-
-    if end == 0 {
-        return None;
-    }
-
-    rest[..end].parse().ok()
-}
-
-/// Extract a u64 value from JSON.
-fn extract_u64(json: &str, key: &str) -> Option<u64> {
-    let pattern = format!("\"{}\":", key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = json[start..].trim_start();
-
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-
-    if end == 0 {
-        return None;
-    }
-
-    rest[..end].parse().ok()
-}
-
-/// Extract a f32 value from JSON.
-fn extract_f32(json: &str, key: &str) -> Option<f32> {
-    let pattern = format!("\"{}\":", key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = json[start..].trim_start();
-
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-        .unwrap_or(rest.len());
-
-    if end == 0 {
-        return None;
-    }
-
-    rest[..end].parse().ok()
-}
-
-/// Extract a nested string value from JSON (e.g., "pm2_env": {"status": "online"}).
-fn extract_nested_string(json: &str, parent: &str, key: &str) -> Option<String> {
-    let parent_pattern = format!("\"{}\":{{", parent);
-
-    // Also try with space: "parent": {
-    let alt_pattern = format!("\"{}\" : {{", parent);
-
-    let parent_start = json
-        .find(&parent_pattern)
-        .or_else(|| json.find(&alt_pattern))?;
-
-    let parent_content = &json[parent_start..];
-
-    // Find matching brace
-    let mut brace_depth = 0;
-    let mut started = false;
-    let mut end = parent_content.len();
-
-    for (i, ch) in parent_content.chars().enumerate() {
-        if ch == '{' {
-            brace_depth += 1;
-            started = true;
-        } else if ch == '}' {
-            brace_depth -= 1;
-            if started && brace_depth == 0 {
-                end = i + 1;
-                break;
-            }
-        }
-    }
-
-    let nested = &parent_content[..end];
-    extract_string(nested, key)
-}
-
-/// Extract a nested u64 value from JSON.
-fn extract_nested_u64(json: &str, parent: &str, key: &str) -> Option<u64> {
-    let parent_pattern = format!("\"{}\":{{", parent);
-    let alt_pattern = format!("\"{}\" : {{", parent);
-
-    let parent_start = json
-        .find(&parent_pattern)
-        .or_else(|| json.find(&alt_pattern))?;
-
-    let parent_content = &json[parent_start..];
-
-    let mut brace_depth = 0;
-    let mut started = false;
-    let mut end = parent_content.len();
-
-    for (i, ch) in parent_content.chars().enumerate() {
-        if ch == '{' {
-            brace_depth += 1;
-            started = true;
-        } else if ch == '}' {
-            brace_depth -= 1;
-            if started && brace_depth == 0 {
-                end = i + 1;
-                break;
-            }
-        }
-    }
-
-    let nested = &parent_content[..end];
-    extract_u64(nested, key)
-}
-
-/// Extract a nested f32 value from JSON.
-fn extract_nested_f32(json: &str, parent: &str, key: &str) -> Option<f32> {
-    let parent_pattern = format!("\"{}\":{{", parent);
-    let alt_pattern = format!("\"{}\" : {{", parent);
-
-    let parent_start = json
-        .find(&parent_pattern)
-        .or_else(|| json.find(&alt_pattern))?;
-
-    let parent_content = &json[parent_start..];
-
-    let mut brace_depth = 0;
-    let mut started = false;
-    let mut end = parent_content.len();
-
-    for (i, ch) in parent_content.chars().enumerate() {
-        if ch == '{' {
-            brace_depth += 1;
-            started = true;
-        } else if ch == '}' {
-            brace_depth -= 1;
-            if started && brace_depth == 0 {
-                end = i + 1;
-                break;
-            }
-        }
-    }
-
-    let nested = &parent_content[..end];
-    extract_f32(nested, key)
-}
-
-fn extract_object(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":{{", key);
-    let alt_pattern = format!("\"{}\" : {{", key);
-    let start = json
-        .find(&pattern)
-        .or_else(|| json.find(&alt_pattern))?;
-    let brace_index = json[start..].find('{')? + start;
-    find_object_slice(json, brace_index)
-}
-
-fn extract_nested_object(json: &str, parent: &str, key: &str) -> Option<String> {
-    let parent_obj = extract_object(json, parent)?;
-    extract_object(&parent_obj, key)
-}
-
-fn find_object_slice(text: &str, start: usize) -> Option<String> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape_next = false;
-
-    for (offset, ch) in text[start..].char_indices() {
-        if in_string {
-            if escape_next {
-                escape_next = false;
-            } else if ch == '\\' {
-                escape_next = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let end = start + offset + 1;
-                    return Some(text[start..end].to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn parse_env_object(raw: &str) -> Vec<String> {
-    let mut envs = Vec::new();
-    let trimmed = raw.trim();
-    let inner = trimmed
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(trimmed);
-    let mut iter = inner.chars().peekable();
-
-    loop {
-        // Skip whitespace and commas
-        while matches!(iter.peek(), Some(ch) if ch.is_whitespace() || *ch == ',') {
-            iter.next();
-        }
-        match iter.peek() {
-            None => break,
-            Some('}') => {
-                iter.next();
-                break;
-            }
-            _ => {}
-        }
-
-        let key = match parse_json_string(&mut iter) {
-            Some(key) => key,
-            None => break,
-        };
-
-        while matches!(iter.peek(), Some(ch) if ch.is_whitespace()) {
-            iter.next();
-        }
-        if iter.next() != Some(':') {
-            break;
-        }
-        while matches!(iter.peek(), Some(ch) if ch.is_whitespace()) {
-            iter.next();
-        }
-
-        let value = parse_json_value(&mut iter).unwrap_or_default();
-        envs.push(format!("{}={}", key, value));
-    }
-
-    envs.sort();
-    envs
-}
-
-fn parse_json_string(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
-    if iter.next() != Some('"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut escape_next = false;
-    while let Some(ch) = iter.next() {
-        if escape_next {
-            match ch {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'u' => {
-                    let mut hex = String::new();
-                    for _ in 0..4 {
-                        if let Some(h) = iter.next() {
-                            hex.push(h);
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Ok(code) = u16::from_str_radix(&hex, 16) {
-                        if let Some(c) = char::from_u32(code as u32) {
-                            out.push(c);
-                        }
-                    }
-                }
-                _ => out.push(ch),
-            }
-            escape_next = false;
-            continue;
-        }
-        if ch == '\\' {
-            escape_next = true;
-            continue;
-        }
-        if ch == '"' {
-            return Some(out);
-        }
-        out.push(ch);
-    }
-    None
-}
-
-fn parse_json_value(
-    iter: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Option<String> {
-    match iter.peek().copied() {
-        Some('"') => parse_json_string(iter),
-        Some('{') => {
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escape_next = false;
-            let mut out = String::new();
-            while let Some(ch) = iter.next() {
-                out.push(ch);
-                if in_string {
-                    if escape_next {
-                        escape_next = false;
-                    } else if ch == '\\' {
-                        escape_next = true;
-                    } else if ch == '"' {
-                        in_string = false;
-                    }
-                    continue;
-                }
-                match ch {
-                    '"' => in_string = true,
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some(out)
-        }
-        Some('[') => {
-            let mut depth = 0i32;
-            let mut in_string = false;
-            let mut escape_next = false;
-            let mut out = String::new();
-            while let Some(ch) = iter.next() {
-                out.push(ch);
-                if in_string {
-                    if escape_next {
-                        escape_next = false;
-                    } else if ch == '\\' {
-                        escape_next = true;
-                    } else if ch == '"' {
-                        in_string = false;
-                    }
-                    continue;
-                }
-                match ch {
-                    '"' => in_string = true,
-                    '[' => depth += 1,
-                    ']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some(out)
-        }
-        Some(_) => {
-            let mut out = String::new();
-            while let Some(ch) = iter.peek().copied() {
-                if ch == ',' || ch == '}' {
-                    break;
-                }
-                out.push(ch);
-                iter.next();
-            }
-            Some(out.trim().to_string())
-        }
-        None => None,
-    }
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_parse_empty_array() {
-        let result = parse_pm2_json("[]").unwrap();
-        assert!(result.is_empty());
+    fn json_handles_whitespace_unicode_and_nested_duplicate_fields() {
+        let json = parse_array(r#"[
+            {"pm2_env": {"env": {"name": "wrong", "pm_id": 99, "BRACES": "{value}", "UNICODE": "\uD83D\uDE80"},
+                "status": "online", "exec_mode": "cluster_mode", "pm_exec_path": "/tmp/项目/app.js"},
+             "pm_id": 7, "name": "café \"worker\"", "pid": 123,
+             "monit": {"cpu": 1.5, "memory": 12345}}
+        ]"#).unwrap();
+        let rows = parse_processes(&json).unwrap();
+        assert_eq!(rows[0].pm_id, 7);
+        assert_eq!(rows[0].name, "café \"worker\"");
+        assert_eq!(rows[0].script.as_deref(), Some("/tmp/项目/app.js"));
+        assert_eq!(rows[0].memory_bytes, Some(12345));
+        assert!(parse_env(&json, 7)
+            .unwrap()
+            .contains(&"UNICODE=🚀".to_string()));
+        assert!(parse_env(&json, 99).is_err());
     }
-
     #[test]
-    fn test_extract_string() {
-        let json = r#"{"name":"my-app","version":"1.0"}"#;
-        assert_eq!(extract_string(json, "name"), Some("my-app".to_string()));
-        assert_eq!(extract_string(json, "version"), Some("1.0".to_string()));
-    }
-
-    #[test]
-    fn test_extract_u32() {
-        let json = r#"{"pm_id":5,"pid":1234}"#;
-        assert_eq!(extract_u32(json, "pm_id"), Some(5));
-        assert_eq!(extract_u32(json, "pid"), Some(1234));
+    fn invalid_output_is_an_error_and_stopped_processes_have_no_pid_or_uptime() {
+        for raw in ["[broken]", "{}", "[{}]", "[{\"pm_id\": 4294967296}]"] {
+            assert!(parse_array(raw)
+                .and_then(|json| parse_processes(&json))
+                .is_err());
+        }
+        let json =
+            parse_array(r#"[{"pm_id":0,"pid":0,"pm2_env":{"status":"stopped","pm_uptime":1}}]"#)
+                .unwrap();
+        let rows = parse_processes(&json).unwrap();
+        assert!(rows[0].pid.is_none());
+        assert!(rows[0].uptime_ms.is_none());
     }
 }

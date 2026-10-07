@@ -6,19 +6,19 @@ use sysinfo::Pid;
 
 use super::PortInfo;
 
-pub fn load_docker_port_bindings() -> Vec<PortInfo> {
+pub fn load_docker_port_bindings() -> std::io::Result<Vec<PortInfo>> {
     let output = Command::new("docker")
         .args([
             "ps",
             "--format",
             "{{.ID}}|{{.Names}}|{{.Image}}|{{.Ports}}|{{.Labels}}",
         ])
-        .docker_output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
+        .docker_output()?;
     if !output.status.success() {
-        return Vec::new();
+        return Err(std::io::Error::other(format!(
+            "Docker bindings unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -58,7 +58,7 @@ pub fn load_docker_port_bindings() -> Vec<PortInfo> {
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
 struct DockerBinding {
@@ -136,7 +136,11 @@ fn parse_port_range(input: &str) -> Vec<u16> {
         }
         return (start..=end).collect();
     }
-    input.trim().parse::<u16>().map(|val| vec![val]).unwrap_or_default()
+    input
+        .trim()
+        .parse::<u16>()
+        .map(|val| vec![val])
+        .unwrap_or_default()
 }
 
 fn compose_group_from_labels(labels: &str) -> Option<String> {

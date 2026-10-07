@@ -1,9 +1,10 @@
 pub(crate) mod command;
 mod container;
+pub mod memory;
 mod stats;
 mod terminal;
-mod worker;
 mod volumes;
+mod worker;
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -11,18 +12,21 @@ use std::time::Duration;
 use crate::util::{contains_lower, Filterable};
 
 pub use container::{
-    delete_docker_container, delete_docker_image, inspect_docker_container,
-    inspect_docker_image, kill_container, load_container_env,
-    load_container_logs, load_docker_containers_with_size, load_docker_images,
-    prune_build_cache, prune_dangling_images, prune_volumes, restart_container, start_container,
-    stop_container, DockerListItem,
+    delete_docker_container, delete_docker_image, inspect_docker_container, inspect_docker_image,
+    kill_container, load_container_env, load_container_logs, load_docker_containers_with_size,
+    load_docker_images, prune_build_cache, prune_dangling_images, prune_volumes, restart_container,
+    start_container, stop_container, DockerListItem,
 };
+#[cfg(test)]
+pub use stats::group_containers;
 pub use stats::{
-    apply_container_filter, group_containers, load_docker_stats, load_docker_system_df,
+    apply_container_filter, group_containers_sorted, load_docker_stats, load_docker_system_df,
     DockerSystemDf,
 };
 pub use terminal::{open_container_logs, open_container_shell};
-pub use volumes::{delete_docker_volume, inspect_docker_volume, load_docker_volumes};
+pub use volumes::{
+    delete_docker_volume, inspect_docker_volume, load_docker_volumes, VolumeAttachment,
+};
 
 /// Container information with optimized string storage.
 /// Uses Cow<'static, str> for fields that often contain static values like "-".
@@ -37,6 +41,7 @@ pub struct ContainerInfo {
     pub group_name: Cow<'static, str>,
     pub group_path: Option<String>,
     pub running: bool,
+    pub memory: Option<memory::ContainerMemory>,
     /// Seconds since last activity (lower = more recent)
     pub activity_secs: u64,
 }
@@ -50,7 +55,10 @@ impl Filterable for ContainerInfo {
             || contains_lower(&self.port_internal, filter_lower)
             || contains_lower(&self.status, filter_lower)
             || contains_lower(&self.group_name, filter_lower)
-            || self.group_path.as_deref().map_or(false, |p| contains_lower(p, filter_lower))
+            || self
+                .group_path
+                .as_deref()
+                .map_or(false, |p| contains_lower(p, filter_lower))
     }
 }
 
@@ -62,7 +70,10 @@ pub enum DockerRow {
         count: usize,
         running_count: usize,
     },
-    Item { index: usize, prefix: String },
+    Item {
+        index: usize,
+        prefix: String,
+    },
     Separator,
 }
 

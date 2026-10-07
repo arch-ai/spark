@@ -1,10 +1,9 @@
 mod docker;
 mod proc;
 
+use crate::system::worker::{self, Worker};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
 
 use sysinfo::{Pid, System};
@@ -38,18 +37,27 @@ impl PortInfo {
 
 pub enum PortRow {
     Group { name: String },
-    Item { index: usize, prefix: String },
+    Item { index: usize },
 }
 
 impl Filterable for PortInfo {
     fn matches_filter(&self, filter_lower: &str) -> bool {
         contains_lower(&self.proto, filter_lower)
             || self.port.to_string().contains(filter_lower)
+            || self
+                .internal_port
+                .is_some_and(|port| port.to_string().contains(filter_lower))
             || self.pid.to_string().contains(filter_lower)
             || contains_lower(&self.name, filter_lower)
             || contains_lower(&self.exe_path, filter_lower)
-            || self.container_id.as_deref().map_or(false, |c| contains_lower(c, filter_lower))
-            || self.group_name.as_deref().map_or(false, |g| contains_lower(g, filter_lower))
+            || self
+                .container_id
+                .as_deref()
+                .map_or(false, |c| contains_lower(c, filter_lower))
+            || self
+                .group_name
+                .as_deref()
+                .map_or(false, |g| contains_lower(g, filter_lower))
             || self
                 .project_name
                 .as_deref()
@@ -57,10 +65,73 @@ impl Filterable for PortInfo {
     }
 }
 
-pub fn collect_ports(system: &System) -> Vec<PortInfo> {
-    let inode_map = proc::build_inode_pid_map();
-    let mut rows = proc::collect_proc_ports(system, &inode_map);
+#[derive(Default)]
+pub struct PortsSnapshot {
+    pub ports: Arc<Vec<PortInfo>>,
+    pub docker_error: Option<String>,
+}
 
+pub fn collect_ports(
+    system: &System,
+    last_docker: &mut Vec<PortInfo>,
+) -> std::io::Result<PortsSnapshot> {
+    let inode_map = proc::build_inode_pid_map();
+    let host = proc::collect_proc_ports(system, &inode_map)?;
+    Ok(ports_snapshot(
+        host,
+        last_docker,
+        docker::load_docker_port_bindings(),
+    ))
+}
+
+/// A one-shot native owner lookup bypasses the periodic worker's inode cache.
+pub(crate) fn current_native_owner(protocol: &str, port: u16) -> std::io::Result<(u32, u64)> {
+    let map = proc::build_inode_pid_map_uncached();
+    let listeners = proc::collect_proc_ports(&System::new(), &map)?;
+    let owners: std::collections::BTreeSet<_> = listeners
+        .iter()
+        .filter(|listener| {
+            listener.proto == protocol && listener.port == port && listener.pid.as_u32() != 0
+        })
+        .map(|listener| listener.pid.as_u32())
+        .collect();
+    if owners.len() != 1 {
+        return Err(std::io::Error::other(if owners.is_empty() {
+            "Listener exited or its owner is inaccessible; refresh Ports"
+        } else {
+            "Several processes own this listener; inspect their rows before navigating"
+        }));
+    }
+    let pid = *owners.first().unwrap();
+    Ok((pid, crate::system::process::process_identity(pid)?))
+}
+
+fn ports_snapshot(
+    host: Vec<PortInfo>,
+    last_docker: &mut Vec<PortInfo>,
+    docker_result: std::io::Result<Vec<PortInfo>>,
+) -> PortsSnapshot {
+    let docker_error = match docker_result {
+        Ok(rows) => {
+            *last_docker = rows;
+            None
+        }
+        Err(err) => Some(format!(
+            "Container ports {}: {err}",
+            if last_docker.is_empty() {
+                "unavailable"
+            } else {
+                "cached"
+            }
+        )),
+    };
+    PortsSnapshot {
+        ports: Arc::new(merge_ports(host, last_docker.clone())),
+        docker_error,
+    }
+}
+
+fn merge_ports(mut rows: Vec<PortInfo>, docker_rows: Vec<PortInfo>) -> Vec<PortInfo> {
     let mut seen_proc = HashSet::new();
     let mut deduped = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
@@ -70,18 +141,16 @@ pub fn collect_ports(system: &System) -> Vec<PortInfo> {
     }
     rows = deduped;
 
-    let mut seen_ports: HashSet<(String, u16)> = HashSet::new();
-    for row in &rows {
-        seen_ports.insert((row.proto.clone(), row.port));
-    }
-
     // Deduplicate docker ports by (proto, port, container_id)
     let mut seen_docker: HashSet<(String, u16, String)> = HashSet::new();
-    for docker_row in docker::load_docker_port_bindings() {
-        // Skip if proc already has this port
-        if seen_ports.contains(&(docker_row.proto.clone(), docker_row.port)) {
-            continue;
-        }
+    for docker_row in docker_rows {
+        // Replace proxy listeners with their container identity, without hiding
+        // a real host process bound to the same port on another address.
+        rows.retain(|row| {
+            !(row.name == "docker-proxy"
+                && row.port == docker_row.port
+                && row.proto.trim_end_matches('6') == docker_row.proto.trim_end_matches('6'))
+        });
         // Skip duplicate docker entries for same container+port
         let container_id = docker_row.container_id.clone().unwrap_or_default();
         if !seen_docker.insert((docker_row.proto.clone(), docker_row.port, container_id)) {
@@ -125,16 +194,9 @@ pub fn group_ports(ports: &[PortInfo]) -> Vec<PortRow> {
     }
 
     for idx in 0..ports.len() {
-        let use_token = token_counts
-            .get(&token_keys[idx])
-            .copied()
-            .unwrap_or(0)
-            > 1;
+        let use_token = token_counts.get(&token_keys[idx]).copied().unwrap_or(0) > 1;
         let (group_key, group_label) = if use_token && !token_keys[idx].is_empty() {
-            (
-                format!("token::{}", token_keys[idx]),
-                tokens[idx].clone(),
-            )
+            (format!("token::{}", token_keys[idx]), tokens[idx].clone())
         } else {
             (
                 format!("label::{}", labels[idx].to_ascii_lowercase()),
@@ -158,17 +220,9 @@ pub fn group_ports(ports: &[PortInfo]) -> Vec<PortRow> {
 
     let mut rows = Vec::with_capacity(ports.len() + groups.len());
     for group in groups {
-        rows.push(PortRow::Group {
-            name: group.name,
-        });
-        let item_count = group.items.len();
-        for (i, index) in group.items.into_iter().enumerate() {
-            let prefix = if i + 1 == item_count {
-                "  └─ ".to_string()
-            } else {
-                "  ├─ ".to_string()
-            };
-            rows.push(PortRow::Item { index, prefix });
+        rows.push(PortRow::Group { name: group.name });
+        for index in group.items {
+            rows.push(PortRow::Item { index });
         }
     }
 
@@ -226,52 +280,115 @@ fn display_group_label(name: &str) -> String {
     }
 }
 
-/// Background worker for collecting ports data
-pub struct PortsWorker {
-    data: Arc<RwLock<Arc<Vec<PortInfo>>>>,
-    paused: Arc<AtomicBool>,
-}
-
+/// Uses the same wakeable lifecycle as the other resource views.
+pub struct PortsWorker(Worker<PortsSnapshot>);
 impl PortsWorker {
-    /// Get a snapshot of the current ports data (thread-safe, no cloning)
     pub fn snapshot(&self) -> Arc<Vec<PortInfo>> {
-        let guard = self.data.read().unwrap();
-        guard.clone()
+        Arc::clone(&self.0.snapshot().data.ports)
     }
-
+    pub fn error(&self) -> Option<String> {
+        {
+            let snapshot = self.0.snapshot();
+            snapshot
+                .error
+                .clone()
+                .or_else(|| snapshot.data.docker_error.clone())
+        }
+    }
+    pub fn is_loaded(&self) -> bool {
+        self.0.snapshot().updated_at.is_some()
+    }
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
+        self.0.set_paused(paused);
+    }
+    pub fn refresh(&self) {
+        self.0.refresh();
     }
 }
-
-/// Start a background worker that collects ports at the given interval
 pub fn start_ports_worker(interval: Duration) -> PortsWorker {
-    let data = Arc::new(RwLock::new(Arc::new(Vec::new())));
-    let thread_data = Arc::clone(&data);
-    let paused = Arc::new(AtomicBool::new(false));
-    let thread_paused = Arc::clone(&paused);
+    let mut system = System::new();
+    let mut last_docker = Vec::new();
+    PortsWorker(worker::start_worker(interval, move || {
+        system.refresh_processes_specifics(
+            sysinfo::ProcessRefreshKind::new()
+                .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
+                .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+        );
+        collect_ports(&system, &mut last_docker)
+    }))
+}
 
-    thread::spawn(move || loop {
-        if thread_paused.load(Ordering::Relaxed) {
-            thread::sleep(interval);
-            continue;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_navigation_resolves_a_current_socket_and_rejects_a_closed_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (pid, identity) = current_native_owner("tcp", port).unwrap();
+        assert_eq!(pid, std::process::id());
+        assert_eq!(
+            identity,
+            crate::system::process::process_identity(pid).unwrap()
+        );
+        drop(listener);
+        assert!(current_native_owner("tcp", port).is_err());
+    }
+    fn binding(name: &str, proto: &str, pid: u32, id: Option<&str>) -> PortInfo {
+        PortInfo {
+            proto: proto.into(),
+            port: 8080,
+            internal_port: None,
+            pid: Pid::from_u32(pid),
+            name: name.into(),
+            exe_path: "-".into(),
+            container_id: id.map(str::to_owned),
+            group_name: None,
+            project_name: None,
         }
-        let mut system = System::new();
-        system.refresh_processes();
-        let new_ports = collect_ports(&system);
+    }
+    #[test]
+    fn container_bindings_replace_only_matching_proxies_and_keep_protocols_and_host_owners() {
+        let host = vec![
+            binding("docker-proxy", "tcp6", 1, None),
+            binding("docker-proxy", "udp", 2, None),
+            binding("server", "tcp", 3, None),
+        ];
+        let mut container = binding("docker:api", "tcp", 0, Some("api-id"));
+        container.internal_port = Some(80);
+        let rows = merge_ports(host, vec![container.clone(), container]);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|row| row.name == "server"));
+        assert!(rows.iter().any(|row| row.proto == "udp"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.container_id.is_some())
+                .unwrap()
+                .binding_display(),
+            "8080:80"
+        );
+    }
 
-        // Only update if data changed (avoid creating new Arc if unchanged)
-        let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
-        let current_ports: &Vec<PortInfo> = &guard;
-
-        // Simple length check first (fast), then deep compare if needed
-        if current_ports.len() != new_ports.len() || current_ports != &new_ports {
-            *guard = Arc::new(new_ports);
-        }
-
-        drop(guard);
-        thread::sleep(interval);
-    });
-
-    PortsWorker { data, paused }
+    #[test]
+    fn docker_failure_keeps_fresh_host_ports_and_cached_bindings_until_recovery() {
+        let container = binding("docker:api", "tcp", 0, Some("api-id"));
+        let mut cached = Vec::new();
+        let good = ports_snapshot(Vec::new(), &mut cached, Ok(vec![container]));
+        assert_eq!(good.ports.len(), 1);
+        let failed = ports_snapshot(
+            vec![binding("new-host", "udp", 9, None)],
+            &mut cached,
+            Err(std::io::Error::other("offline")),
+        );
+        assert_eq!(failed.ports.len(), 2);
+        assert!(failed.ports.iter().any(|row| row.name == "new-host"));
+        assert_eq!(
+            failed.docker_error.as_deref(),
+            Some("Container ports cached: offline")
+        );
+        let recovered = ports_snapshot(Vec::new(), &mut cached, Ok(Vec::new()));
+        assert!(recovered.ports.is_empty());
+        assert!(recovered.docker_error.is_none());
+        assert!(cached.is_empty());
+    }
 }

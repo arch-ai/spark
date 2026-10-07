@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::command::DockerCommand;
 use super::DockerListItem;
 
-const CONTAINER_FORMAT: &str = r#"{"Id":{{json .Id}},"Name":{{json .Name}},"Status":{{json .State.Status}},"FinishedAt":{{json .State.FinishedAt}},"Mounts":{{json .Mounts}},"Image":{{json .Config.Image}},"Project":{{json (index .Config.Labels "com.docker.compose.project")}}}"#;
+const CONTAINER_FORMAT: &str = r#"{"Id":{{json .Id}},"Name":{{json .Name}},"Status":{{json .State.Status}},"FinishedAt":{{json .State.FinishedAt}},"Mounts":{{json .Mounts}},"Image":{{json .Config.Image}},"Project":{{json (index .Config.Labels "com.docker.compose.project")}},"WorkingDir":{{json (index .Config.Labels "com.docker.compose.project.working_dir")}}}"#;
 
 #[derive(Debug, PartialEq)]
 struct VolumeSize {
@@ -19,15 +19,17 @@ struct VolumeSize {
     links: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-struct Attachment {
-    id: String,
-    container: String,
-    status: String,
-    image: String,
-    project: Option<String>,
-    finished_at: Option<DateTime<Utc>>,
+#[derive(Debug, Clone, Default)]
+pub struct VolumeAttachment {
+    pub id: String,
+    pub container: String,
+    pub status: String,
+    pub image: String,
+    pub project: Option<String>,
+    pub project_dir: Option<String>,
+    pub(crate) finished_at: Option<DateTime<Utc>>,
 }
+type Attachment = VolumeAttachment;
 
 #[derive(Default)]
 struct VolumeCatalog {
@@ -69,6 +71,9 @@ pub fn load_docker_volumes() -> io::Result<Vec<DockerListItem>> {
                 detail_left: containers,
                 detail_right: images,
                 activity: Some(activity),
+                activity_age_secs: activity_age(entries, catalog.activity_error.as_deref(), now),
+                detail_project: project_summary(entries, catalog.activity_error.as_deref()),
+                attachments: catalog.activity_error.is_none().then(|| entries.to_vec()),
             }
         })
         .collect())
@@ -288,6 +293,10 @@ fn parse_attachments(
             status: status.to_string(),
             image: image.to_string(),
             project: project.map(str::to_string),
+            project_dir: info["WorkingDir"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string),
             finished_at: parse_timestamp(info["FinishedAt"].as_str().unwrap_or("")),
         };
         // Docker's Go template may encode an empty mount slice as null.
@@ -385,6 +394,46 @@ fn attachment_summary(entries: &[Attachment], error: Option<&str>) -> (String, S
     )
 }
 
+fn activity_age(entries: &[Attachment], error: Option<&str>, now: DateTime<Utc>) -> Option<u64> {
+    if error.is_some() {
+        return None;
+    }
+    if entries
+        .iter()
+        .any(|entry| matches!(entry.status.as_str(), "running" | "paused" | "restarting"))
+    {
+        return Some(0);
+    }
+    entries
+        .iter()
+        .filter_map(|entry| entry.finished_at)
+        .max()
+        .and_then(|time| u64::try_from(now.signed_duration_since(time).num_seconds()).ok())
+}
+
+fn project_summary(entries: &[Attachment], error: Option<&str>) -> String {
+    if error.is_some() {
+        return "Projects: Unknown".into();
+    }
+    if entries.is_empty() {
+        return "Projects: None".into();
+    }
+    let projects = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}: {}",
+                entry.project.as_deref().unwrap_or("Unmanaged"),
+                entry.project_dir.as_deref().unwrap_or("Unknown directory")
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Projects: {projects}")
+}
+
 fn volume_report(name: &str, info: &Value, catalog: &VolumeCatalog, now: DateTime<Utc>) -> String {
     let entries = catalog
         .attachments
@@ -418,10 +467,47 @@ fn volume_report(name: &str, info: &Value, catalog: &VolumeCatalog, now: DateTim
     let (containers, images) = attachment_summary(entries, catalog.activity_error.as_deref());
     lines.push(containers);
     lines.push(images);
+    lines.push(project_summary(entries, catalog.activity_error.as_deref()));
     lines.push(format!(
         "Container activity: {}",
         activity_label(entries, catalog.activity_error.as_deref(), now)
     ));
+    lines.push(String::new());
+    lines.push("ATTACHED CONTAINERS".into());
+    if entries.is_empty() {
+        lines.push(
+            if catalog.activity_error.is_some() {
+                "Unknown"
+            } else {
+                "None"
+            }
+            .into(),
+        );
+    }
+    let mut ordered_entries: Vec<_> = entries.iter().collect();
+    ordered_entries.sort_by_key(|entry| &entry.container);
+    for entry in ordered_entries {
+        lines.push(format!("Container: {} | {}", entry.container, entry.status));
+        lines.push(format!("  Image: {}", entry.image));
+        if let Some(project) = &entry.project {
+            lines.push(format!("  Project: {project}"));
+        }
+        lines.push(format!(
+            "  Project directory: {}",
+            entry
+                .project_dir
+                .as_deref()
+                .unwrap_or("Unknown (no Compose working directory label)")
+        ));
+        if let Some(time) = entry.finished_at {
+            lines.push(format!(
+                "  Last stop: {} ({})",
+                time.format("%Y-%m-%d %H:%M:%S UTC"),
+                age(time, now)
+            ));
+        }
+    }
+    lines.push(String::new());
     if let Some(error) = &catalog.activity_error {
         lines.push(format!("Activity unavailable: {error}"));
     } else if entries.iter().any(|entry| entry.status == "running") {
@@ -452,34 +538,6 @@ fn volume_report(name: &str, info: &Value, catalog: &VolumeCatalog, now: DateTim
         ));
     }
     lines.push(String::new());
-    lines.push("ATTACHED CONTAINERS".into());
-    if entries.is_empty() {
-        lines.push(
-            if catalog.activity_error.is_some() {
-                "Unknown"
-            } else {
-                "None"
-            }
-            .into(),
-        );
-    }
-    let mut entries: Vec<_> = entries.iter().collect();
-    entries.sort_by_key(|entry| &entry.container);
-    for entry in entries {
-        lines.push(format!("Container: {} | {}", entry.container, entry.status));
-        lines.push(format!("  Image: {}", entry.image));
-        if let Some(project) = &entry.project {
-            lines.push(format!("  Project: {project}"));
-        }
-        if let Some(time) = entry.finished_at {
-            lines.push(format!(
-                "  Last stop: {} ({})",
-                time.format("%Y-%m-%d %H:%M:%S UTC"),
-                age(time, now)
-            ));
-        }
-    }
-    lines.push(String::new());
     lines.push("RAW DOCKER INSPECT".into());
     lines.push(serde_json::to_string_pretty(info).unwrap_or_default());
     lines.join("\n")
@@ -487,6 +545,26 @@ fn volume_report(name: &str, info: &Value, catalog: &VolumeCatalog, now: DateTim
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_directories_remain_attached_to_each_container_without_guessing_missing_paths() {
+        let mut parsed = HashMap::new();
+        parse_attachments(r#"{"Id":"a","Name":"/api","Status":"running","Image":"demo:latest","Project":"demo","WorkingDir":"/home/dev/项目 with spaces","Mounts":[{"Type":"volume","Name":"data"}]}
+{"Id":"b","Name":"/backup","Status":"exited","Project":"demo","WorkingDir":"/srv/backup","Mounts":[{"Type":"volume","Name":"data"}]}
+{"Id":"c","Name":"/unmanaged","Status":"exited","Mounts":[{"Type":"volume","Name":"data"}]}"#,&mut parsed).unwrap();
+        assert_eq!(
+            parsed["data"][0].project_dir.as_deref(),
+            Some("/home/dev/项目 with spaces")
+        );
+        assert!(parsed["data"][2].project_dir.is_none());
+        let catalog = VolumeCatalog {
+            attachments: parsed,
+            ..Default::default()
+        };
+        let report = volume_report("data", &serde_json::json!({}), &catalog, now());
+        assert!(report.contains("Container: api | running\n  Image: demo:latest\n  Project: demo\n  Project directory: /home/dev/项目 with spaces"));
+        assert!(report.contains("Project directory: /srv/backup"));
+        assert!(report.contains("Project directory: Unknown"));
+    }
     use super::*;
     use serde_json::json;
 
@@ -618,6 +696,7 @@ mod tests {
             status: status.into(),
             image: "postgres:17".into(),
             project: Some("demo".into()),
+            project_dir: Some("/home/dev/demo".into()),
             finished_at: parse_timestamp(finished),
         }
     }

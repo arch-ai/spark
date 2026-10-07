@@ -23,30 +23,34 @@ fn inode_map_cache() -> &'static Mutex<Option<InodeMapCache>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-pub fn collect_proc_ports(system: &System, inode_map: &HashMap<u64, Pid>) -> Vec<PortInfo> {
+pub fn collect_proc_ports(
+    system: &System,
+    inode_map: &HashMap<u64, Pid>,
+) -> std::io::Result<Vec<PortInfo>> {
     // Pre-allocate with reasonable capacity
     let mut rows = Vec::with_capacity(64);
 
-    parse_socket_table(
-        "/proc/net/tcp",
-        "tcp",
-        Some("0A"),
-        inode_map,
-        system,
-        &mut rows,
-    );
-    parse_socket_table(
-        "/proc/net/tcp6",
-        "tcp6",
-        Some("0A"),
-        inode_map,
-        system,
-        &mut rows,
-    );
-    parse_socket_table("/proc/net/udp", "udp", None, inode_map, system, &mut rows);
-    parse_socket_table("/proc/net/udp6", "udp6", None, inode_map, system, &mut rows);
+    for (path, proto, state) in [
+        ("/proc/net/tcp", "tcp", "0A"),
+        ("/proc/net/tcp6", "tcp6", "0A"),
+        ("/proc/net/udp", "udp", "07"),
+        ("/proc/net/udp6", "udp6", "07"),
+    ] {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                parse_socket_contents(&contents, proto, Some(state), inode_map, system, &mut rows)
+            }
+            Err(err) if proto.ends_with('6') && err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    format!("Cannot read listening ports: {err}"),
+                ))
+            }
+        }
+    }
 
-    rows
+    Ok(rows)
 }
 
 /// Build inode-to-PID map with caching.
@@ -79,7 +83,7 @@ pub fn build_inode_pid_map() -> HashMap<u64, Pid> {
 
 /// Build the inode-to-PID map without caching.
 /// Scans /proc/*/fd/* to find socket inodes.
-fn build_inode_pid_map_uncached() -> HashMap<u64, Pid> {
+pub(super) fn build_inode_pid_map_uncached() -> HashMap<u64, Pid> {
     let mut map = HashMap::with_capacity(1024);
     let Ok(entries) = fs::read_dir("/proc") else {
         return map;
@@ -102,7 +106,11 @@ fn build_inode_pid_map_uncached() -> HashMap<u64, Pid> {
         for fd in fd_entries.flatten() {
             if let Ok(target) = fs::read_link(fd.path()) {
                 if let Some(inode) = parse_socket_inode(&target) {
-                    map.entry(inode).or_insert(pid);
+                    map.entry(inode)
+                        .and_modify(|owner: &mut Pid| {
+                            *owner = (*owner).min(pid);
+                        })
+                        .or_insert(pid);
                 }
             }
         }
@@ -111,18 +119,14 @@ fn build_inode_pid_map_uncached() -> HashMap<u64, Pid> {
     map
 }
 
-fn parse_socket_table(
-    path: &str,
+fn parse_socket_contents(
+    contents: &str,
     proto: &str,
     state_filter: Option<&str>,
     inode_map: &HashMap<u64, Pid>,
     system: &System,
     out: &mut Vec<PortInfo>,
 ) {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
-    };
-
     for line in contents.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 10 {
@@ -146,25 +150,25 @@ fn parse_socket_table(
         if inode == 0 {
             continue;
         }
-        let Some(pid) = inode_map.get(&inode) else {
-            continue;
-        };
-        let Some(process) = system.process(*pid) else {
-            continue;
-        };
-
-        let name = process.name().to_string();
+        let pid = inode_map
+            .get(&inode)
+            .copied()
+            .unwrap_or_else(|| Pid::from_u32(0));
+        let process = system.process(pid);
+        let name = process
+            .map(|process| process.name().to_string())
+            .unwrap_or_else(|| "Unknown owner".into());
         let exe_path = process
-            .exe()
+            .and_then(|process| process.exe())
             .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "-".to_string());
-        let project_name = node::project_name_from_process(process);
+            .unwrap_or_else(|| "Owner unavailable or inaccessible".into());
+        let project_name = process.and_then(node::project_name_from_process);
 
         out.push(PortInfo {
             proto: proto.to_string(),
             port,
             internal_port: None,
-            pid: *pid,
+            pid,
             name,
             exe_path,
             container_id: None,
@@ -188,4 +192,26 @@ fn parse_socket_inode(path: &Path) -> Option<u64> {
     }
     let inner = link.trim_start_matches("socket:[").trim_end_matches(']');
     inner.parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn inaccessible_owners_remain_visible_and_connected_udp_is_excluded() {
+        let contents = "header\n0: 0100007F:1F90 00000000:0000 07 0:0 0:0 0 1000 0 123\n1: 0100007F:1F91 0100007F:0035 01 0:0 0:0 0 1000 0 124\n";
+        let mut rows = Vec::new();
+        parse_socket_contents(
+            contents,
+            "udp",
+            Some("07"),
+            &HashMap::new(),
+            &System::new(),
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].port, 8080);
+        assert_eq!(rows[0].pid.as_u32(), 0);
+        assert_eq!(rows[0].name, "Unknown owner");
+    }
 }

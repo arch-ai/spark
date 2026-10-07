@@ -13,19 +13,22 @@ use ratatui::Terminal;
 use sysinfo::{Disks, Pid, System};
 
 use crate::app::input::{handle_key_event, handle_mouse_event, log_modal_inner_size};
-use crate::app::{AppState, ViewMode};
+use crate::app::{AppState, NodeTab, ViewMode};
 use crate::system::{docker, node, ports, process};
 use crate::ui::render_ratatui;
 
 struct ProcessBuildResult {
     version: u64,
+    source: Arc<Vec<process::ProcessEntry>>,
     process_cache: HashMap<Pid, process::ProcInfo>,
     rows_cache: Vec<process::TreeRow>,
     visible_pids: Vec<Pid>,
+    identities: HashMap<u32, u64>,
 }
 
 struct NodeBuildResult {
     version: u64,
+    source: Arc<node::NodeSnapshot>,
     node_view: Vec<node::NodeProcessInfo>,
     node_rows: Vec<node::NodeRow>,
     pm2_view: Vec<node::Pm2Process>,
@@ -37,6 +40,7 @@ struct NodeBuildResult {
 
 struct DockerBuildResult {
     version: u64,
+    source: Arc<Vec<docker::ContainerInfo>>,
     docker_view: Vec<docker::ContainerInfo>,
     docker_rows: Vec<docker::DockerRow>,
     visible_containers: Vec<String>,
@@ -51,14 +55,18 @@ struct DockerBuildResult {
 
 struct PortsBuildResult {
     version: u64,
+    source: Arc<Vec<ports::PortInfo>>,
     ports_cache: Vec<ports::PortInfo>,
     ports_rows: Vec<ports::PortRow>,
     visible_ports: Vec<Pid>,
+    visible_port_indices: Vec<Option<usize>>,
     visible_ports_container_ids: Vec<Option<String>>,
 }
 
 pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-    let mut system = System::new_all();
+    let mut system = System::new();
+    system.refresh_cpu();
+    system.refresh_memory();
 
     let docker_worker = docker::start_docker_stats_worker(Duration::from_secs(2));
     let docker_df_worker = docker::start_docker_df_worker(Duration::from_secs(10));
@@ -67,6 +75,13 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
     let node_worker = node::start_node_worker(Duration::from_secs(2));
 
     let mut state = AppState::new();
+    let config_path = super::workspace_config::config_path();
+    if let Err(error) = super::workspace_config::load(&mut state, &config_path) {
+        state.workspace.config_error = Some(error.to_string());
+        state.set_message(format!("Workspace configuration preserved: {error}"));
+    }
+    state.workspace.config_path = Some(config_path);
+    let mut catalog = super::workspace_runtime::Catalog::default();
     update_system_snapshot(&mut state, &system);
     maybe_refresh_user_cache(&mut state);
 
@@ -86,6 +101,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
 
     // Docker view cache - docker_raw uses Arc for efficient snapshot without cloning
     let mut docker_raw: Arc<Vec<docker::ContainerInfo>> = Arc::new(Vec::new());
+    let mut docker_metadata: Arc<Vec<docker::ContainerInfo>> = Arc::new(Vec::new());
     let mut docker_view: Vec<docker::ContainerInfo> = Vec::new();
     let mut docker_dirty = true;
     let mut docker_snapshot = docker_worker.snapshot();
@@ -115,7 +131,9 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
     let mut node_build_in_progress = false;
 
     // Cache terminal size to avoid syscalls on every mouse event
-    let size = terminal.size().unwrap_or_else(|_| terminal.size().unwrap_or_default());
+    let size = terminal
+        .size()
+        .unwrap_or_else(|_| terminal.size().unwrap_or_default());
     let mut term_width = size.width;
     let mut term_height = size.height;
     state.term_width = term_width;
@@ -140,25 +158,40 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
             }
 
             if let Event::Key(key) = ev {
+                if key.kind != crossterm::event::KeyEventKind::Release
+                    && key.code == crossterm::event::KeyCode::F(5)
+                {
+                    state.docker_memory.reconnect();
+                }
                 let prev_filter = state.active_filter().to_string();
                 let prev_sort_by = state.sort_by;
                 let prev_sort_order = state.sort_order;
+                let prev_sorts = state.table_sorts;
+                let prev_volume_scope = state.docker_volume_scope.clone();
                 let prev_zoom = state.zoom;
                 let prev_view = state.view_mode;
                 let prev_log_open = state.log_output.is_some();
-                let prev_prune_open = state.prune_output.is_some();
                 let prev_list_open = state.docker_list_open;
 
-                if handle_key_event(key, &mut state, &mut system, &pm2_view, &pm2_rows) {
+                if handle_key_event(
+                    key,
+                    &mut state,
+                    &mut system,
+                    &pm2_view,
+                    &pm2_rows,
+                    &docker_view,
+                    &ports_cache,
+                ) {
                     break;
                 }
 
                 let filter_changed = state.active_filter() != prev_filter;
-                let sort_changed = state.sort_by != prev_sort_by || state.sort_order != prev_sort_order;
+                let sort_changed = state.sort_by != prev_sort_by
+                    || state.sort_order != prev_sort_order
+                    || state.table_sorts != prev_sorts;
                 let zoom_changed = state.zoom != prev_zoom;
                 let view_changed = state.view_mode != prev_view;
                 let modal_closed = (prev_log_open && state.log_output.is_none())
-                    || (prev_prune_open && state.prune_output.is_none())
                     || (prev_list_open && !state.docker_list_open);
 
                 if filter_changed {
@@ -171,7 +204,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                             docker_dirty = true;
                             docker_build_version = docker_build_version.wrapping_add(1);
                         }
-                        ViewMode::DockerEnv => {}
+                        ViewMode::DockerEnv | ViewMode::Projects => {}
                         ViewMode::Ports => {
                             ports_dirty = true;
                             ports_build_version = ports_build_version.wrapping_add(1);
@@ -182,11 +215,15 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                         }
                     }
                 }
-                if sort_changed {
+                if sort_changed || state.docker_volume_scope != prev_volume_scope {
                     process_dirty = true;
                     process_build_version = process_build_version.wrapping_add(1);
                     docker_dirty = true;
                     docker_build_version = docker_build_version.wrapping_add(1);
+                    ports_dirty = true;
+                    ports_build_version = ports_build_version.wrapping_add(1);
+                    node_dirty = true;
+                    node_build_version = node_build_version.wrapping_add(1);
                 }
                 if zoom_changed {
                     process_dirty = true;
@@ -214,8 +251,9 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
 
             if let Event::Mouse(mouse) = ev {
                 let prev_view = state.view_mode;
+                let prev_sorts = state.table_sorts;
+                let prev_sort = (state.sort_by, state.sort_order);
                 let prev_log_open = state.log_output.is_some();
-                let prev_prune_open = state.prune_output.is_some();
                 let prev_list_open = state.docker_list_open;
 
                 let mouse_needs_render = handle_mouse_event(
@@ -229,8 +267,18 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                     term_height,
                 );
                 let view_changed = state.view_mode != prev_view;
+                if prev_sorts != state.table_sorts || prev_sort != (state.sort_by, state.sort_order)
+                {
+                    process_dirty = true;
+                    process_build_version = process_build_version.wrapping_add(1);
+                    docker_dirty = true;
+                    docker_build_version = docker_build_version.wrapping_add(1);
+                    ports_dirty = true;
+                    ports_build_version = ports_build_version.wrapping_add(1);
+                    node_dirty = true;
+                    node_build_version = node_build_version.wrapping_add(1);
+                }
                 let modal_closed = (prev_log_open && state.log_output.is_none())
-                    || (prev_prune_open && state.prune_output.is_none())
                     || (prev_list_open && !state.docker_list_open);
 
                 if view_changed {
@@ -258,6 +306,8 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         }
 
         let log_modal_open = state.log_output.is_some() || state.log_in_progress.is_some();
+        let workspace_active =
+            state.view_mode == ViewMode::Projects || state.workspace.inspector.is_some();
         let docker_active = matches!(state.view_mode, ViewMode::Docker | ViewMode::DockerEnv);
         let ports_active = matches!(state.view_mode, ViewMode::Ports);
         let process_active = matches!(state.view_mode, ViewMode::Process);
@@ -273,20 +323,50 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
             mouse_capture_enabled = want_mouse_capture;
         }
 
-        docker_worker.set_paused(log_modal_open || !docker_active);
-        docker_df_worker.set_paused(log_modal_open || !docker_active);
-        ports_worker.set_paused(log_modal_open || !ports_active);
-        process_worker.set_paused(log_modal_open || !process_active);
-        node_worker.set_paused(log_modal_open || !node_active);
+        docker_worker.set_paused(log_modal_open || !(docker_active || workspace_active));
+        docker_df_worker.set_paused(log_modal_open || !(docker_active || workspace_active));
+        ports_worker.set_paused(log_modal_open || !(ports_active || workspace_active));
+        process_worker.set_paused(log_modal_open || !(process_active || workspace_active));
+        node_worker.set_paused(log_modal_open || !(node_active || workspace_active));
+
+        let metadata = docker_worker.snapshot();
+        let metadata_changed = !Arc::ptr_eq(&docker_metadata, &metadata.data);
+        if metadata_changed {
+            docker_metadata = metadata.data.clone();
+            state.docker_memory.sync_containers(&docker_metadata);
+        }
+        let memory_active = docker_active
+            || state.view_mode == ViewMode::Projects
+            || state.workspace.inspector.as_ref().is_some_and(|i| {
+                matches!(
+                    i.record.resource,
+                    super::projects::Resource::Container(_) | super::projects::Resource::Project(_)
+                )
+            });
+        let memory_changed = state.docker_memory.update(memory_active);
+        if metadata_changed || memory_changed {
+            docker_raw = Arc::new(
+                docker_metadata
+                    .iter()
+                    .cloned()
+                    .map(|mut container| {
+                        container.memory = state.docker_memory.get(&container.id);
+                        container
+                    })
+                    .collect(),
+            );
+            docker_dirty = true;
+            needs_render = true;
+        }
 
         // Periodic system refresh (paused while log modal is open)
         if last_tick.elapsed() >= tick_rate {
             if !log_modal_open {
-                refresh_system(&mut system, !docker_active);
+                refresh_system(&mut system);
                 update_system_snapshot(&mut state, &system);
 
                 match state.view_mode {
-                    ViewMode::Process => {}
+                    ViewMode::Process | ViewMode::Projects => {}
                     ViewMode::Docker | ViewMode::DockerEnv => {}
                     ViewMode::Ports => {}
                     ViewMode::Node => {}
@@ -309,7 +389,40 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
             docker_df_worker.refresh();
         }
 
+        if state.refresh_requested {
+            state.refresh_requested = false;
+            process_worker.refresh();
+            ports_worker.refresh();
+            node_worker.refresh();
+        }
+        state.process_loaded = process_worker.is_loaded();
+        state.ports_loaded = ports_worker.is_loaded();
+        state.ports_error = ports_worker.error();
+        if state.view_mode == ViewMode::Node && state.node_tab == NodeTab::Pm2 {
+            let (pm2_area, _) = crate::ui::layout::node_tables(
+                crate::ui::workspace::panes(
+                    crate::ui::layout::main_area(ratatui::layout::Rect::new(
+                        0,
+                        0,
+                        term_width,
+                        term_height,
+                    )),
+                    state.workspace.inspector.is_some(),
+                )
+                .0,
+                state.node_tab,
+            );
+            let capacity = pm2_area.height.saturating_sub(3) as usize;
+            if state.pm2_selected < state.pm2_scroll {
+                state.pm2_scroll = state.pm2_selected;
+            } else if capacity > 0 && state.pm2_selected >= state.pm2_scroll + capacity {
+                state.pm2_scroll = state.pm2_selected + 1 - capacity;
+            }
+        }
         if state.tick_spinner() {
+            needs_render = true;
+        }
+        if state.tick_logo_at(Instant::now()) {
             needs_render = true;
         }
 
@@ -325,14 +438,17 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 continue;
             }
             let selected_pid = state.visible_pids.get(state.selected).copied();
-            if let Some(selected) = selected_pid.and_then(|pid| result.visible_pids.iter().position(|next| *next == pid)) {
+            if let Some(selected) = selected_pid
+                .and_then(|pid| result.visible_pids.iter().position(|next| *next == pid))
+            {
                 state.selected = selected;
             }
+            state.process_identities = result.identities;
             process_cache = result.process_cache;
             rows_cache = result.rows_cache;
             state.visible_pids = result.visible_pids;
             clamp_selection(&mut state, rows_cache.len());
-            process_dirty = false;
+            process_dirty = !Arc::ptr_eq(&result.source, &process_raw);
             process_build_in_progress = false;
             needs_render = true;
         }
@@ -348,6 +464,32 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 node_build_in_progress = false;
                 continue;
             }
+            let selected_pm2 = pm2_rows
+                .get(state.pm2_selected)
+                .and_then(|idx| pm2_view.get(*idx))
+                .map(|proc| proc.pm_id);
+            let selected_pid = state
+                .visible_pids
+                .get(state.selected)
+                .copied()
+                .filter(|pid| pid.as_u32() != 0);
+            if let Some(next) = selected_pid
+                .and_then(|pid| result.visible_pids.iter().position(|next| *next == pid))
+            {
+                state.selected = next;
+            }
+            if let Some(next) = selected_pm2.and_then(|pm_id| {
+                result
+                    .pm2_rows
+                    .iter()
+                    .position(|idx| result.pm2_view[*idx].pm_id == pm_id)
+            }) {
+                state.pm2_selected = next;
+            }
+            state.pm2_selected = state
+                .pm2_selected
+                .min(result.pm2_rows.len().saturating_sub(1));
+            state.pm2_hover_row = None;
             node_view = result.node_view;
             node_rows = result.node_rows;
             pm2_view = result.pm2_view;
@@ -357,7 +499,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
             state.visible_node_selectable = result.visible_node_selectable;
             clamp_selection(&mut state, node_rows.len());
             clamp_node_selection(&mut state);
-            node_dirty = false;
+            node_dirty = !Arc::ptr_eq(&result.source, &node_raw);
             node_build_in_progress = false;
             needs_render = true;
         }
@@ -385,7 +527,7 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
             state.docker_total = result.docker_total;
             state.docker_filtered_out = result.docker_filtered_out;
             clamp_docker_selection(&mut state);
-            docker_dirty = false;
+            docker_dirty = !Arc::ptr_eq(&result.source, &docker_raw);
             docker_build_in_progress = false;
             needs_render = true;
         }
@@ -401,306 +543,369 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
                 ports_build_in_progress = false;
                 continue;
             }
+            let selected_port = ports_rows.get(state.selected).and_then(|row| match row {
+                ports::PortRow::Item { index } => ports_cache.get(*index),
+                _ => None,
+            });
+            if let Some(old) = selected_port {
+                if let Some(next) = result.ports_rows.iter().position(|row| match row {
+                    ports::PortRow::Item { index } => {
+                        let next = &result.ports_cache[*index];
+                        next.proto == old.proto
+                            && next.port == old.port
+                            && next.pid == old.pid
+                            && next.container_id == old.container_id
+                    }
+                    _ => false,
+                }) {
+                    state.selected = next;
+                }
+            }
+            state.visible_port_indices = result.visible_port_indices;
+            state.hover_row = None;
             ports_cache = result.ports_cache;
             ports_rows = result.ports_rows;
             state.visible_ports = result.visible_ports;
             state.visible_ports_container_ids = result.visible_ports_container_ids;
             clamp_selection(&mut state, ports_rows.len());
             clamp_ports_selection(&mut state);
-            ports_dirty = false;
+            ports_dirty = !Arc::ptr_eq(&result.source, &ports_raw);
             ports_build_in_progress = false;
             needs_render = true;
-        }
-
-        if state.log_output.is_some()
-            && state.log_source.is_some()
-            && !state.log_refresh_in_progress
-            && !state.log_select_mode
-            && state.log_last_scroll.elapsed() >= Duration::from_millis(400)
-            && state.log_last_refresh.elapsed() >= Duration::from_secs(1)
-        {
-            let title = state
-                .log_output
-                .as_ref()
-                .map(|output| output.title.clone())
-                .unwrap_or_else(|| "Logs".to_string());
-            if let Some(source) = state.log_source.clone() {
-                match source {
-                    crate::app::state::LogSource::Process { pid } => {
-                        crate::app::actions::start_log_refresh(&mut state, title, move || {
-                            process::load_process_logs(pid)
-                        });
-                    }
-                    crate::app::state::LogSource::Pm2 { pm_id } => {
-                        crate::app::actions::start_log_refresh(&mut state, title, move || {
-                            node::load_pm2_logs(pm_id)
-                        });
-                    }
-                    crate::app::state::LogSource::Docker { container_id } => {
-                        crate::app::actions::start_log_refresh(&mut state, title, move || {
-                            docker::load_container_logs(&container_id)
-                        });
-                    }
-                }
-            }
         }
 
         // Update data based on current view (paused while log modal is open)
         if !log_modal_open {
             match state.view_mode {
-            ViewMode::Process => {
-                let new_snapshot = process_worker.snapshot();
-                if !Arc::ptr_eq(&new_snapshot, &process_raw) {
-                    process_raw = new_snapshot;
-                    process_dirty = true;
-                    process_build_version = process_build_version.wrapping_add(1);
-                }
-                if process_dirty && !process_build_in_progress {
-                    maybe_refresh_user_cache(&mut state);
-                    let entries = Arc::clone(&process_raw);
-                    let filter = state.process_filter.clone();
-                    let user_cache = state.user_cache.clone();
-                    let sort_by = state.sort_by;
-                    let sort_order = state.sort_order;
-                    let zoom = state.zoom;
-                    let tx = process_build_tx.clone();
-                    let version = process_build_version;
-                    process_build_in_progress = true;
-                    process_dirty = false;
-                    std::thread::spawn(move || {
-                        let process_cache = process::collect_processes_from_entries(
-                            &entries,
-                            &filter,
-                            &user_cache,
-                        );
-                        let rows_cache = process::build_tree_rows(
-                            &process_cache,
-                            sort_by,
-                            sort_order,
-                            zoom,
-                        );
-                        let visible_pids = rows_cache.iter().map(|row| row.pid).collect();
-                        let _ = tx.send(ProcessBuildResult {
-                            version,
-                            process_cache,
-                            rows_cache,
-                            visible_pids,
-                        });
-                    });
-                }
-            }
-            ViewMode::Docker => {
-                let next_df = docker_df_worker.snapshot();
-                if !Arc::ptr_eq(&next_df, &docker_df_snapshot) {
-                    state.docker_system_df = (*next_df.data).clone();
-                    state.docker_df_error = next_df.error.clone();
-                    state.docker_df_updated_at = next_df.updated_at;
-                    docker_df_snapshot = next_df;
-                    needs_render = true;
-                }
-                let next = docker_worker.snapshot();
-                if !Arc::ptr_eq(&next, &docker_snapshot) {
-                    state.docker_error = next.error.clone();
-                    state.docker_updated_at = next.updated_at;
-                    if !Arc::ptr_eq(&next.data, &docker_raw) {
-                        docker_raw = Arc::clone(&next.data);
-                        docker_dirty = true;
-                        docker_build_version = docker_build_version.wrapping_add(1);
+                ViewMode::Projects => {}
+                ViewMode::Process => {
+                    let new_snapshot = process_worker.snapshot();
+                    if !Arc::ptr_eq(&new_snapshot, &process_raw) {
+                        process_raw = new_snapshot;
+                        process_dirty = true;
                     }
-                    docker_snapshot = next;
-                    needs_render = true;
-                }
-
-                if docker_dirty && !docker_build_in_progress {
-                    let snapshot = Arc::clone(&docker_raw);
-                    let filter = state.docker_filter.clone();
-                    let tx = docker_build_tx.clone();
-                    let version = docker_build_version;
-                    docker_build_in_progress = true;
-                    docker_dirty = false;
-                    std::thread::spawn(move || {
-                        let mut docker_view = (*snapshot).clone();
-                        docker::apply_container_filter(&mut docker_view, &filter);
-                    let (grouped, rows) = docker::group_containers(docker_view);
-                        let docker_total = snapshot.len();
-                        let docker_filtered_out = docker_total.saturating_sub(grouped.len());
-
-                        let mut visible_containers = Vec::with_capacity(grouped.len());
-                        let mut visible_container_names = Vec::with_capacity(grouped.len());
-                        let mut visible_container_ports_public = Vec::with_capacity(grouped.len());
-                        let mut visible_container_ports_internal = Vec::with_capacity(grouped.len());
-                        let mut visible_container_group_name = Vec::with_capacity(grouped.len());
-                        let mut visible_container_group_path = Vec::with_capacity(grouped.len());
-
-                        for container in &grouped {
-                            visible_containers.push(container.id.clone());
-                            visible_container_names.push(container.name.clone());
-                            visible_container_ports_public.push(container.port_public.clone());
-                            visible_container_ports_internal.push(container.port_internal.clone());
-                            visible_container_group_name.push(container.group_name.clone());
-                            visible_container_group_path.push(
-                                container.group_path.clone().unwrap_or_else(|| "-".to_string())
+                    if process_dirty && !process_build_in_progress {
+                        maybe_refresh_user_cache(&mut state);
+                        let entries = Arc::clone(&process_raw);
+                        let filter = state.process_filter.clone();
+                        let user_cache = state.user_cache.clone();
+                        let sort_by = state.sort_by;
+                        let sort_order = state.sort_order;
+                        let zoom = state.zoom;
+                        let tx = process_build_tx.clone();
+                        let version = process_build_version;
+                        process_build_in_progress = true;
+                        process_dirty = false;
+                        std::thread::spawn(move || {
+                            let process_cache = process::collect_processes_from_entries(
+                                &entries,
+                                &filter,
+                                &user_cache,
                             );
-                        }
-
-                        let _ = tx.send(DockerBuildResult {
-                            version,
-                            docker_view: grouped,
-                            docker_rows: rows,
-                            visible_containers,
-                            visible_container_names,
-                            visible_container_ports_public,
-                            visible_container_ports_internal,
-                            visible_container_group_name,
-                            visible_container_group_path,
-                            docker_total,
-                            docker_filtered_out,
+                            let rows_cache =
+                                process::build_tree_rows(&process_cache, sort_by, sort_order, zoom);
+                            let visible_pids = rows_cache.iter().map(|row| row.pid).collect();
+                            let identities = entries
+                                .iter()
+                                .map(|entry| (entry.pid.as_u32(), entry.start_time))
+                                .collect();
+                            let _ = tx.send(ProcessBuildResult {
+                                version,
+                                source: Arc::clone(&entries),
+                                process_cache,
+                                identities,
+                                rows_cache,
+                                visible_pids,
+                            });
                         });
-                    });
+                    }
                 }
-            }
-            ViewMode::DockerEnv => {}
-            ViewMode::Ports => {
-                // Snapshot ports from background worker (non-blocking)
-                let new_ports = ports_worker.snapshot();
+                ViewMode::Docker => {
+                    let next_df = docker_df_worker.snapshot();
+                    if !Arc::ptr_eq(&next_df, &docker_df_snapshot) {
+                        state.docker_system_df = (*next_df.data).clone();
+                        state.docker_df_error = next_df.error.clone();
+                        state.docker_df_updated_at = next_df.updated_at;
+                        docker_df_snapshot = next_df;
+                        needs_render = true;
+                    }
+                    let next = docker_worker.snapshot();
+                    if !Arc::ptr_eq(&next, &docker_snapshot) {
+                        state.docker_error = next.error.clone();
+                        state.docker_updated_at = next.updated_at;
+                        docker_snapshot = next;
+                        needs_render = true;
+                    }
 
-                // Only update if data changed (pointer comparison)
-                if !Arc::ptr_eq(&new_ports, &ports_raw) {
-                    ports_raw = new_ports;
-                    ports_dirty = true;
-                    ports_build_version = ports_build_version.wrapping_add(1);
+                    if docker_dirty && !docker_build_in_progress {
+                        let snapshot = Arc::clone(&docker_raw);
+                        let filter = state.docker_filter.clone();
+                        let sort = state.sort_for(crate::app::sorting::SortTarget::Docker);
+                        let scope = state.docker_volume_scope.clone();
+                        let tx = docker_build_tx.clone();
+                        let version = docker_build_version;
+                        docker_build_in_progress = true;
+                        docker_dirty = false;
+                        std::thread::spawn(move || {
+                            let mut docker_view = (*snapshot).clone();
+                            docker::apply_container_filter(&mut docker_view, &filter);
+                            if let Some((_, ids)) = scope {
+                                docker_view
+                                    .retain(|container| ids.iter().any(|id| id == &container.id));
+                            }
+                            let (grouped, rows) =
+                                docker::group_containers_sorted(docker_view, Some(sort));
+                            let docker_total = snapshot.len();
+                            let docker_filtered_out = docker_total.saturating_sub(grouped.len());
+
+                            let mut visible_containers = Vec::with_capacity(grouped.len());
+                            let mut visible_container_names = Vec::with_capacity(grouped.len());
+                            let mut visible_container_ports_public =
+                                Vec::with_capacity(grouped.len());
+                            let mut visible_container_ports_internal =
+                                Vec::with_capacity(grouped.len());
+                            let mut visible_container_group_name =
+                                Vec::with_capacity(grouped.len());
+                            let mut visible_container_group_path =
+                                Vec::with_capacity(grouped.len());
+
+                            for container in &grouped {
+                                visible_containers.push(container.id.clone());
+                                visible_container_names.push(container.name.clone());
+                                visible_container_ports_public.push(container.port_public.clone());
+                                visible_container_ports_internal
+                                    .push(container.port_internal.clone());
+                                visible_container_group_name.push(container.group_name.clone());
+                                visible_container_group_path.push(
+                                    container
+                                        .group_path
+                                        .clone()
+                                        .unwrap_or_else(|| "-".to_string()),
+                                );
+                            }
+
+                            let _ = tx.send(DockerBuildResult {
+                                version,
+                                source: Arc::clone(&snapshot),
+                                docker_view: grouped,
+                                docker_rows: rows,
+                                visible_containers,
+                                visible_container_names,
+                                visible_container_ports_public,
+                                visible_container_ports_internal,
+                                visible_container_group_name,
+                                visible_container_group_path,
+                                docker_total,
+                                docker_filtered_out,
+                            });
+                        });
+                    }
                 }
+                ViewMode::DockerEnv => {}
+                ViewMode::Ports => {
+                    // Snapshot ports from background worker (non-blocking)
+                    let new_ports = ports_worker.snapshot();
 
-                if ports_dirty && !ports_build_in_progress {
-                    let snapshot = Arc::clone(&ports_raw);
-                    let filter = state.ports_filter.clone();
-                    let tx = ports_build_tx.clone();
-                    let version = ports_build_version;
-                    ports_build_in_progress = true;
-                    ports_dirty = false;
-                    std::thread::spawn(move || {
-                        let mut ports_cache = (*snapshot).clone();
-                        crate::util::apply_filter(&mut ports_cache, &filter);
-                        let ports_rows = ports::group_ports(&ports_cache);
+                    // Only update if data changed (pointer comparison)
+                    if !Arc::ptr_eq(&new_ports, &ports_raw) {
+                        ports_raw = new_ports;
+                        ports_dirty = true;
+                    }
 
-                        let mut visible_ports = Vec::with_capacity(ports_rows.len());
-                        let mut visible_ports_container_ids = Vec::with_capacity(ports_rows.len());
-                        for row in &ports_rows {
-                            match row {
-                                ports::PortRow::Group { .. } => {
-                                    visible_ports.push(Pid::from_u32(0));
-                                    visible_ports_container_ids.push(None);
-                                }
-                                ports::PortRow::Item { index, .. } => {
-                                    let port = &ports_cache[*index];
-                                    visible_ports.push(port.pid);
-                                    visible_ports_container_ids.push(port.container_id.clone());
+                    if ports_dirty && !ports_build_in_progress {
+                        let snapshot = Arc::clone(&ports_raw);
+                        let filter = state.ports_filter.clone();
+                        let sort = state.sort_for(crate::app::sorting::SortTarget::Ports);
+                        let tx = ports_build_tx.clone();
+                        let version = ports_build_version;
+                        ports_build_in_progress = true;
+                        ports_dirty = false;
+                        std::thread::spawn(move || {
+                            let mut ports_cache = (*snapshot).clone();
+                            crate::util::apply_filter(&mut ports_cache, &filter);
+                            crate::app::sorting::sort_ports(&mut ports_cache, sort);
+                            let ports_rows = ports::group_ports(&ports_cache);
+
+                            let mut visible_ports = Vec::with_capacity(ports_rows.len());
+                            let mut visible_port_indices = Vec::with_capacity(ports_rows.len());
+                            let mut visible_ports_container_ids =
+                                Vec::with_capacity(ports_rows.len());
+                            for row in &ports_rows {
+                                match row {
+                                    ports::PortRow::Group { .. } => {
+                                        visible_port_indices.push(None);
+                                        visible_ports.push(Pid::from_u32(0));
+                                        visible_ports_container_ids.push(None);
+                                    }
+                                    ports::PortRow::Item { index, .. } => {
+                                        let port = &ports_cache[*index];
+                                        visible_port_indices.push(Some(*index));
+                                        visible_ports.push(port.pid);
+                                        visible_ports_container_ids.push(port.container_id.clone());
+                                    }
                                 }
                             }
-                        }
 
-                        let _ = tx.send(PortsBuildResult {
-                            version,
-                            ports_cache,
-                            ports_rows,
-                            visible_ports,
-                            visible_ports_container_ids,
+                            let _ = tx.send(PortsBuildResult {
+                                version,
+                                source: Arc::clone(&snapshot),
+                                ports_cache,
+                                ports_rows,
+                                visible_ports,
+                                visible_port_indices,
+                                visible_ports_container_ids,
+                            });
                         });
-                    });
+                    }
                 }
-            }
-            ViewMode::Node => {
-                let new_snapshot = node_worker.snapshot();
-                if !Arc::ptr_eq(&new_snapshot, &node_raw) {
-                    node_raw = new_snapshot;
-                    node_dirty = true;
-                    node_build_version = node_build_version.wrapping_add(1);
-                }
-                if node_dirty && !node_build_in_progress {
-                    let snapshot = Arc::clone(&node_raw);
-                    let filter = state.node_filter.clone();
-                    let tx = node_build_tx.clone();
-                    let version = node_build_version;
-                    node_build_in_progress = true;
-                    node_dirty = false;
-                    std::thread::spawn(move || {
-                        let pm2_available = snapshot.pm2_available;
-                        let mut pm2_view = snapshot.pm2_procs.clone();
-                        let pm2_rows = if pm2_available {
-                            node::filter_pm2_processes(&pm2_view, &filter)
-                        } else {
-                            pm2_view.clear();
-                            Vec::new()
-                        };
-                        let node_cache = node::filter_node_processes(&snapshot.node_procs, &filter);
-                        let mut node_main = Vec::new();
-                        let mut node_utils = Vec::new();
-                        for proc in node_cache {
-                            if pm2_available && proc.pm2.is_some() {
-                                continue;
-                            }
-                            if node::is_node_util(&proc) {
-                                node_utils.push(proc);
+                ViewMode::Node => {
+                    let new_snapshot = node_worker.snapshot();
+                    if !Arc::ptr_eq(&new_snapshot, &node_raw) {
+                        state.node_loaded = new_snapshot.loaded;
+                        state.pm2_error = new_snapshot.pm2_error.clone();
+                        state.pm2_loading = new_snapshot.pm2_loading;
+                        node_raw = new_snapshot;
+                        node_dirty = true;
+                    }
+                    if node_dirty && !node_build_in_progress {
+                        let snapshot = Arc::clone(&node_raw);
+                        let filter = state.node_filter.clone();
+                        let native_sort = state.sort_for(crate::app::sorting::SortTarget::Node);
+                        let pm2_sort = state.sort_for(crate::app::sorting::SortTarget::Pm2);
+                        let tx = node_build_tx.clone();
+                        let version = node_build_version;
+                        node_build_in_progress = true;
+                        node_dirty = false;
+                        std::thread::spawn(move || {
+                            let pm2_available = snapshot.pm2_available;
+                            let mut pm2_view = snapshot.pm2_procs.clone();
+                            crate::app::sorting::sort_pm2(&mut pm2_view, pm2_sort);
+                            let pm2_rows = if pm2_available {
+                                node::filter_pm2_processes(&pm2_view, &filter)
                             } else {
-                                node_main.push(proc);
-                            }
-                        }
-
-                        let utils_offset = node_main.len();
-                        let mut node_view = node_main;
-                        node_view.extend(node_utils);
-                        let mut node_rows = Vec::new();
-                        if node_view.is_empty() {
-                            node_rows.clear();
-                        } else if utils_offset == 0 {
-                            node_rows.push(node::NodeRow::UtilsSpacer);
-                            node_rows.push(node::NodeRow::UtilsTitle);
-                            node_rows.push(node::NodeRow::UtilsTop);
-                            node_rows.push(node::NodeRow::UtilsHeader);
-                            node_rows.push(node::NodeRow::UtilsSeparator);
-                            node_rows.extend(node::group_node_processes(&node_view, 0));
-                        } else {
-                            node_rows = node::group_node_processes(&node_view[..utils_offset], 0);
-                            if utils_offset < node_view.len() {
-                                node_rows.push(node::NodeRow::UtilsSpacer);
-                                node_rows.push(node::NodeRow::UtilsTitle);
-                                node_rows.push(node::NodeRow::UtilsTop);
-                                node_rows.push(node::NodeRow::UtilsHeader);
-                                node_rows.push(node::NodeRow::UtilsSeparator);
-                                node_rows.extend(node::group_node_processes(&node_view[utils_offset..], utils_offset));
-                            }
-                        }
-
-                        let mut visible_pids = Vec::with_capacity(node_rows.len());
-                        let mut visible_node_selectable = Vec::with_capacity(node_rows.len());
-                        for row in &node_rows {
-                            match row {
-                                node::NodeRow::Item { index } => {
-                                    let proc = &node_view[*index];
-                                    visible_pids.push(proc.pid);
-                                    visible_node_selectable.push(true);
+                                pm2_view.clear();
+                                Vec::new()
+                            };
+                            let mut node_cache =
+                                node::filter_node_processes(&snapshot.node_procs, &filter);
+                            crate::app::sorting::sort_node(&mut node_cache, native_sort);
+                            let mut node_main = Vec::new();
+                            let mut node_utils = Vec::new();
+                            for proc in node_cache {
+                                if pm2_available && proc.pm2.is_some() {
+                                    continue;
                                 }
-                                _ => {
-                                    visible_pids.push(Pid::from_u32(0));
-                                    visible_node_selectable.push(false);
+                                if node::is_node_util(&proc) {
+                                    node_utils.push(proc);
+                                } else {
+                                    node_main.push(proc);
                                 }
                             }
-                        }
 
-                        let _ = tx.send(NodeBuildResult {
-                            version,
-                            node_view,
-                            node_rows,
-                            pm2_view,
-                            pm2_rows,
-                            visible_pids,
-                            visible_node_selectable,
-                            pm2_available,
+                            let utils_offset = node_main.len();
+                            let mut node_view = node_main;
+                            node_view.extend(node_utils);
+                            let mut node_rows = Vec::new();
+                            if node_view.is_empty() {
+                                node_rows.clear();
+                            } else if utils_offset == 0 {
+                                node_rows.push(node::NodeRow::Group {
+                                    name: "Utilities".into(),
+                                    count: node_view.len(),
+                                });
+                                node_rows.extend(node::group_node_processes(&node_view, 0));
+                            } else {
+                                node_rows =
+                                    node::group_node_processes(&node_view[..utils_offset], 0);
+                                if utils_offset < node_view.len() {
+                                    node_rows.push(node::NodeRow::Group {
+                                        name: "Utilities".into(),
+                                        count: node_view.len() - utils_offset,
+                                    });
+                                    node_rows.extend(node::group_node_processes(
+                                        &node_view[utils_offset..],
+                                        utils_offset,
+                                    ));
+                                }
+                            }
+
+                            let mut visible_pids = Vec::with_capacity(node_rows.len());
+                            let mut visible_node_selectable = Vec::with_capacity(node_rows.len());
+                            for row in &node_rows {
+                                match row {
+                                    node::NodeRow::Item { index } => {
+                                        let proc = &node_view[*index];
+                                        visible_pids.push(proc.pid);
+                                        visible_node_selectable.push(true);
+                                    }
+                                    _ => {
+                                        visible_pids.push(Pid::from_u32(0));
+                                        visible_node_selectable.push(false);
+                                    }
+                                }
+                            }
+
+                            let _ = tx.send(NodeBuildResult {
+                                version,
+                                source: Arc::clone(&snapshot),
+                                node_view,
+                                node_rows,
+                                pm2_view,
+                                pm2_rows,
+                                visible_pids,
+                                visible_node_selectable,
+                                pm2_available,
+                            });
                         });
-                    });
+                    }
                 }
             }
-            }
+        }
+
+        if workspace_active && !log_modal_open {
+            state.workspace.start_events();
+            let processes = process_worker.snapshot();
+            let docker = docker_worker.snapshot();
+            let nodes = node_worker.snapshot();
+            let port_snapshot = ports_worker.snapshot();
+            let errors = [
+                docker.error.clone(),
+                nodes.pm2_error.clone(),
+                ports_worker.error(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            state.workspace.catalog_error = (!errors.is_empty()).then(|| errors.join(" · "));
+            needs_render |= catalog.update(
+                &mut state,
+                processes,
+                docker.data.clone(),
+                nodes,
+                port_snapshot,
+            );
+        }
+        needs_render |= state.workspace.drain();
+        let navigation_view = state.view_mode;
+        let navigation_pending = state.workspace.navigation.is_some();
+        let owner_pending = state.workspace.owner_request.is_some();
+        super::workspace_input::complete_navigation(&mut state, &pm2_view, &pm2_rows);
+        if navigation_view != state.view_mode {
+            process_dirty = true;
+            docker_dirty = true;
+            ports_dirty = true;
+            node_dirty = true;
+            terminal.clear()?;
+            needs_render = true;
+        }
+        needs_render |= navigation_pending != state.workspace.navigation.is_some()
+            || owner_pending != state.workspace.owner_request.is_some();
+        if let Some(copy) = state.workspace.clipboard.take() {
+            use std::io::Write;
+            terminal
+                .backend_mut()
+                .write_all(super::workspace::clipboard_escape(&copy).as_bytes())?;
+            terminal.backend_mut().flush()?;
         }
 
         // Render using ratatui
@@ -713,6 +918,10 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
             state.term_height = term_height;
             let visible_height = adjust_visible_height(&state, size.height);
             let total = match state.view_mode {
+                ViewMode::Projects => state
+                    .workspace
+                    .visible_projects(state.sort_for(crate::app::sorting::SortTarget::Projects))
+                    .len(),
                 ViewMode::Process => rows_cache.len(),
                 ViewMode::Docker => state.docker_rows.len(),
                 ViewMode::Ports => ports_rows.len(),
@@ -749,57 +958,31 @@ pub fn run_ratatui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Res
         }
     }
 
+    if state.workspace.config_error.is_none() {
+        if let Some(path) = &state.workspace.config_path {
+            super::workspace_config::save(path, &super::workspace_config::encode(&state))?;
+        }
+    }
     Ok(())
 }
 
 /// Calculate visible height for table rows based on view mode and terminal height
 fn adjust_visible_height(state: &AppState, height: u16) -> usize {
-    // Layout offsets:
-    // Process: title(3) + header(1) + search(3) + bars(4) + table_border_header(2) + help(2) = 15
-    // Docker: title(3) + header(1) + search(3) + df_stats(7) + table_border_header(2) + help(2) = 18
-    // Ports/Node: title(3) + header(1) + search(3) + table_border_header(2) + help(2) = 11
-    let overhead = match state.view_mode {
-        ViewMode::Process => return crate::ui::layout::process_table(height).height.saturating_sub(3) as usize,
-        ViewMode::Docker => {
-            return crate::ui::layout::docker_layout(ratatui::layout::Rect::new(
-                0,
-                0,
-                state.term_width,
-                height,
-            ))[4]
-                .height
-                .saturating_sub(3) as usize
-        }
-        ViewMode::Ports => 11,
-        ViewMode::Node => {
-            if state.pm2_available {
-                let table_top = 7u16;
-                let help_height = 2u16;
-                let available = height.saturating_sub(table_top + help_height);
-                let mut pm2_height = available / 2;
-                if pm2_height < 5 {
-                    pm2_height = available.min(5);
-                }
-                let mut node_height = available.saturating_sub(pm2_height);
-                if node_height < 5 {
-                    let deficit = 5u16.saturating_sub(node_height);
-                    if pm2_height > deficit {
-                        node_height = node_height.saturating_add(deficit);
-                    }
-                }
-                return node_height.saturating_sub(2) as usize;
-            }
-            11
-        }
+    let full =
+        crate::ui::layout::main_area(ratatui::layout::Rect::new(0, 0, state.term_width, height));
+    let area = crate::ui::workspace::panes(full, state.workspace.inspector.is_some()).0;
+    let table = match state.view_mode {
+        ViewMode::Projects => crate::ui::workspace::project_layout(area)[1],
+        ViewMode::Process => crate::ui::layout::process_layout(area)[4],
+        ViewMode::Docker => crate::ui::layout::docker_layout(area)[4],
+        ViewMode::Ports => crate::ui::layout::resource_layout(area)[3],
+        ViewMode::Node => crate::ui::layout::node_tables(area, state.node_tab).1,
         ViewMode::DockerEnv => return 0,
     };
-    (height.saturating_sub(overhead)) as usize
+    table.height.saturating_sub(3) as usize
 }
 
-fn refresh_system(system: &mut System, refresh_processes: bool) {
-    if refresh_processes {
-        system.refresh_processes();
-    }
+fn refresh_system(system: &mut System) {
     system.refresh_cpu();
     system.refresh_memory();
 }
@@ -834,7 +1017,9 @@ fn maybe_refresh_user_cache(state: &mut AppState) {
         let users = sysinfo::Users::new_with_refreshed_list();
         state.user_cache.clear();
         for user in users.iter() {
-            state.user_cache.insert(user.id().clone(), user.name().to_string());
+            state
+                .user_cache
+                .insert(user.id().clone(), user.name().to_string());
         }
         state.user_last_refresh = Instant::now();
     }
@@ -946,8 +1131,21 @@ mod tests {
     fn process_scroll_capacity_matches_rendered_memory_rows() {
         let state = AppState::new();
         for height in [16, 20, 24, 36] {
-            assert_eq!(adjust_visible_height(&state, height),
-                crate::ui::layout::process_table(height).height.saturating_sub(3) as usize);
+            assert_eq!(
+                adjust_visible_height(&state, height),
+                crate::ui::layout::process_table(
+                    crate::ui::layout::main_area(ratatui::layout::Rect::new(
+                        0,
+                        0,
+                        state.term_width,
+                        height
+                    ))
+                    .width,
+                    height
+                )
+                .height
+                .saturating_sub(3) as usize
+            );
         }
     }
 
@@ -991,9 +1189,18 @@ mod tests {
         for height in [16, 20, 24, 36] {
             assert_eq!(
                 adjust_visible_height(&state, height),
-                crate::ui::layout::docker_table(height)
-                    .height
-                    .saturating_sub(3) as usize
+                crate::ui::layout::docker_table(
+                    crate::ui::layout::main_area(ratatui::layout::Rect::new(
+                        0,
+                        0,
+                        state.term_width,
+                        height
+                    ))
+                    .width,
+                    height
+                )
+                .height
+                .saturating_sub(3) as usize
             );
         }
     }

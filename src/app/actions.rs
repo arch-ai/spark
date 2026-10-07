@@ -1,15 +1,11 @@
 use sysinfo::{Pid, System};
 
-use crate::app::{AppState, InputMode, ViewMode};
 use crate::app::state::{LogOutputMode, LogSource, OperationComplete};
+use crate::app::{AppState, InputMode, ViewMode};
 use crate::system::{docker, node, process};
 
 /// Check if a PID is managed by PM2 and return the PM2 ID if found
 fn find_pm2_id_for_pid(pid: u32) -> Option<u32> {
-    if !node::is_pm2_running() {
-        return None;
-    }
-
     let pm2_procs = node::load_pm2_processes().ok()?;
     pm2_procs
         .iter()
@@ -28,130 +24,185 @@ fn find_supervisor_parent(pid: Pid, system: &System) -> Option<(Pid, String)> {
     if parent_name.contains("nodemon")
         || parent_name.contains("tsx")
         || parent_name.contains("ts-node-dev")
-        || parent_name.contains("node-dev") {
+        || parent_name.contains("node-dev")
+    {
         Some((parent_pid, parent.name().to_string()))
     } else {
         None
     }
 }
 
-pub(crate) fn kill_selected_process(state: &mut AppState, system: &mut System) {
-    let Some(pid) = state.visible_pids.get(state.selected).cloned() else {
+pub(crate) fn kill_selected_process(state: &mut AppState, _system: &mut System) {
+    let Some(pid) = state
+        .visible_pids
+        .get(state.selected)
+        .copied()
+        .filter(|pid| pid.as_u32() != 0)
+    else {
         state.set_message("No process selected");
         return;
     };
+    start_process_kill(state, pid.as_u32());
+}
 
-    match system.process(pid) {
-        Some(process) => {
-            let name = process.name().to_string();
-            if process.kill() {
-                state.set_message(format!("Killed PID {} ({})", pid, name));
-            } else {
-                state.set_message(format!("Failed to kill PID {} ({})", pid, name));
-            }
-        }
-        None => {
-            state.set_message(format!("Process PID {} not found", pid));
-        }
+pub(crate) fn kill_selected_port_process(state: &mut AppState, _system: &mut System) {
+    if let Some(id) = state
+        .visible_ports_container_ids
+        .get(state.selected)
+        .and_then(Clone::clone)
+    {
+        start_container_kills(state, vec![id]);
+        return;
+    }
+    match state
+        .visible_ports
+        .get(state.selected)
+        .copied()
+        .filter(|pid| pid.as_u32() != 0)
+    {
+        Some(pid) => start_process_kill(state, pid.as_u32()),
+        None => state.set_message("No accessible process associated with this port"),
     }
 }
 
-pub(crate) fn kill_selected_port_process(state: &mut AppState, system: &mut System) {
-    use sysinfo::Signal;
-
-    let Some(pid) = state.visible_ports.get(state.selected).cloned() else {
-        state.set_message("No port selected");
+/// Queue one action per target and deliver its actual result to the UI thread.
+pub(crate) fn start_background_action(
+    state: &mut AppState,
+    key: String,
+    label: String,
+    command: impl FnOnce() -> std::io::Result<String> + Send + 'static,
+) {
+    if state.pending_operations.contains_key(&key) {
+        state.set_message("An action is already running for this target");
         return;
+    }
+    state.pending_operations.insert(key.clone(), false);
+    state.set_message(format!("{label}..."));
+    let tx = state.operation_tx.clone();
+    std::thread::spawn(move || {
+        let result = command();
+        let success = result.is_ok();
+        let message = result.unwrap_or_else(|err| format!("{label} failed:\n\n{err}"));
+        let _ = tx.send(OperationComplete {
+            request_id: None,
+            container_id: key,
+            success,
+            message,
+            output: None,
+        });
+    });
+}
+
+pub(crate) fn start_pm2_action(
+    state: &mut AppState,
+    pm_id: u32,
+    name: String,
+    action: crate::app::ContextMenuAction,
+) {
+    use crate::app::ContextMenuAction;
+    let (verb, command): (&str, fn(u32) -> std::io::Result<()>) = match action {
+        ContextMenuAction::Start => ("Starting", node::pm2_start),
+        ContextMenuAction::Stop => ("Stopping", node::pm2_stop),
+        ContextMenuAction::Restart => ("Restarting", node::pm2_restart),
+        _ => return,
     };
-    if pid == Pid::from_u32(0) {
-        let container_id = state
-            .visible_ports_container_ids
-            .get(state.selected)
-            .and_then(|id| id.clone());
-        if let Some(id) = container_id {
-            start_container_kills(state, vec![id]);
-        } else {
-            state.set_message("No process associated with this port");
-        }
-        return;
-    }
+    start_background_action(
+        state,
+        format!("pm2::{pm_id}"),
+        format!("{verb} PM2 {name}"),
+        move || {
+            command(pm_id)?;
+            Ok(format!("PM2 {name}: action completed"))
+        },
+    );
+}
 
-    let pid_u32 = pid.as_u32();
-
-    // Check if this process is managed by PM2
-    if let Some(pm2_id) = find_pm2_id_for_pid(pid_u32) {
-        match node::pm2_stop(pm2_id) {
-            Ok(()) => {
-                state.set_message(format!("Stopped PM2 process {} (PID {})", pm2_id, pid_u32));
-            }
-            Err(err) => {
-                state.set_message(format!("Failed to stop PM2 process: {}", err));
-            }
-        }
-        return;
-    }
-
-    // Check if this process is managed by nodemon/tsx/ts-node-dev
-    if let Some((supervisor_pid, supervisor_name)) = find_supervisor_parent(pid, system) {
-        if let Some(supervisor) = system.process(supervisor_pid) {
-            // Kill the supervisor parent instead of the child
-            let mut killed = supervisor.kill_with(Signal::Term).unwrap_or(false);
-            if !killed {
-                state.set_message(format!("Failed to signal {} (PID {})", supervisor_name, supervisor_pid));
-                return;
-            }
-
-            // Wait briefly for graceful shutdown
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            system.refresh_processes();
-
-            // If still running, send SIGKILL
-            if system.process(supervisor_pid).is_some() {
-                if let Some(process) = system.process(supervisor_pid) {
-                    killed = process.kill_with(Signal::Kill).unwrap_or(false);
-                }
-            }
-
-            if killed {
-                state.set_message(format!("Killed {} (PID {}) and child process (PID {})", supervisor_name, supervisor_pid, pid_u32));
-            } else {
-                state.set_message(format!("Failed to kill {} (PID {})", supervisor_name, supervisor_pid));
-            }
+pub(crate) fn start_process_kill(state: &mut AppState, pid: u32) {
+    // Capture the kernel start tick before background work can delay the action.
+    let identity = match process::process_identity(pid) {
+        Ok(identity) => identity,
+        Err(err) => {
+            state.set_message(format!("Cannot access PID {pid}: {err}"));
             return;
         }
+    };
+    if state.view_mode == ViewMode::Process
+        && state
+            .process_identities
+            .get(&pid)
+            .is_some_and(|expected| *expected != identity)
+    {
+        state.set_message("Selected process exited. Refresh before retrying.");
+        return;
     }
-
-    match system.process(pid) {
-        Some(process) => {
-            let name = process.name().to_string();
-            // Try SIGTERM first
-            let mut killed = process.kill_with(Signal::Term).unwrap_or(false);
-            if !killed {
-                state.set_message(format!("Failed to signal PID {} ({})", pid, name));
-                return;
+    start_background_action(
+        state,
+        format!("process::{pid}"),
+        format!("Stopping PID {pid}"),
+        move || {
+            use sysinfo::Signal;
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessRefreshKind::new()
+                    .with_cmd(sysinfo::UpdateKind::OnlyIfNotSet)
+                    .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+            );
+            if process::process_identity(pid)? != identity {
+                return Err(std::io::Error::other(
+                    "The selected process has exited; PID was reused",
+                ));
             }
-
-            // Wait briefly for graceful shutdown
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            system.refresh_processes();
-
-            // If still running, send SIGKILL
-            if system.process(pid).is_some() {
-                if let Some(process) = system.process(pid) {
-                    killed = process.kill_with(Signal::Kill).unwrap_or(false);
+            let target = Pid::from_u32(pid);
+            let selected = system
+                .process(target)
+                .ok_or_else(|| std::io::Error::other("Process no longer exists"))?;
+            // Capture both targets before a PM2 lookup can delay the action.
+            let (signal_target, name) = find_supervisor_parent(target, &system)
+                .unwrap_or_else(|| (target, selected.name().to_string()));
+            let target_identity = if signal_target == target {
+                identity
+            } else {
+                process::process_identity(signal_target.as_u32())?
+            };
+            // Query PM2 only for Node processes, outside the UI thread.
+            if selected.name().contains("node") {
+                if let Some(pm_id) = find_pm2_id_for_pid(pid) {
+                    if process::process_identity(pid)? != identity {
+                        return Err(std::io::Error::other("The selected process has exited"));
+                    }
+                    node::pm2_stop(pm_id)?;
+                    return Ok(format!("Stopped PM2 {pm_id} (PID {pid})"));
                 }
             }
-
-            if killed {
-                state.set_message(format!("Killed PID {} ({})", pid, name));
-            } else {
-                state.set_message(format!("Failed to kill PID {} ({})", pid, name));
+            if process::process_identity(pid)? != identity
+                || process::process_identity(signal_target.as_u32())? != target_identity
+            {
+                return Err(std::io::Error::other(
+                    "The selected process or its supervisor has exited; refresh before retrying",
+                ));
             }
-        }
-        None => {
-            state.set_message(format!("Process PID {} not found", pid));
-        }
-    }
+            let target = signal_target;
+            let selected = system.process(target).unwrap();
+            if !selected.kill_with(Signal::Term).unwrap_or(false) {
+                return Err(std::io::Error::other(
+                    "Permission denied or process already exited",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // One recheck before escalation; never signal a replacement with this PID.
+            if process::process_identity(target.as_u32()).ok() == Some(target_identity) {
+                system.refresh_processes();
+                if let Some(remaining) = system.process(target) {
+                    if process::process_identity(target.as_u32()).ok() == Some(target_identity)
+                        && !remaining.kill_with(Signal::Kill).unwrap_or(false)
+                    {
+                        return Err(std::io::Error::other("Unable to stop process"));
+                    }
+                }
+            }
+            Ok(format!("Stopped {name} (PID {target})"))
+        },
+    );
 }
 
 pub(crate) fn kill_selected_in_docker(state: &mut AppState) {
@@ -292,12 +343,7 @@ pub(crate) fn open_selected_container_logs(state: &mut AppState) {
     )
 }
 
-pub(crate) fn start_log_fetch<F>(
-    state: &mut AppState,
-    title: String,
-    source: LogSource,
-    command: F,
-)
+pub(crate) fn start_log_fetch<F>(state: &mut AppState, title: String, source: LogSource, command: F)
 where
     F: FnOnce() -> std::io::Result<String> + Send + 'static,
 {
@@ -331,17 +377,18 @@ where
             request_id,
             container_id: format!("logs::{}", title),
             success,
-            message: if success { String::new() } else { output.clone() },
+            message: if success {
+                String::new()
+            } else {
+                output.clone()
+            },
             output: Some(output),
         });
     });
 }
 
-pub(crate) fn start_inspect_fetch<F>(
-    state: &mut AppState,
-    title: String,
-    command: F,
-) where
+pub(crate) fn start_inspect_fetch<F>(state: &mut AppState, title: String, command: F)
+where
     F: FnOnce() -> std::io::Result<String> + Send + 'static,
 {
     state.log_request_id = state.log_request_id.wrapping_add(1);
@@ -405,7 +452,11 @@ where
             request_id,
             container_id: format!("logs::{}", title),
             success,
-            message: if success { String::new() } else { output.clone() },
+            message: if success {
+                String::new()
+            } else {
+                output.clone()
+            },
             output: Some(output),
         });
     });
@@ -417,7 +468,7 @@ pub(crate) fn open_selected_env(state: &mut AppState, system: &System) {
         ViewMode::Process => open_selected_process_env(state, system, ViewMode::Process),
         ViewMode::Ports => open_selected_ports_env(state, system),
         ViewMode::Node => open_selected_process_env(state, system, ViewMode::Node),
-        ViewMode::DockerEnv => {}
+        ViewMode::DockerEnv | ViewMode::Projects => {}
     }
 }
 
@@ -523,25 +574,31 @@ fn open_selected_process_env(state: &mut AppState, system: &System, return_view:
 
 fn open_process_env_for_pid(
     state: &mut AppState,
-    system: &System,
+    _system: &System,
     pid: Pid,
     return_view: ViewMode,
 ) {
-    let Some(process) = system.process(pid) else {
-        state.set_message(format!("Process PID {pid} not found"));
-        return;
-    };
-
-    let name = process.name().to_string();
-    let user = process
-        .user_id()
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|name| name.trim().to_string())
+        .unwrap_or_else(|_| format!("PID {pid}"));
+    let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Uid:")
+                    .and_then(|ids| ids.split_whitespace().next())
+                    .and_then(|id| id.parse::<sysinfo::Uid>().ok())
+            })
+        });
+    let user = uid
+        .as_ref()
         .and_then(|uid| state.user_cache.get(uid))
         .cloned()
-        .unwrap_or_else(|| "-".to_string());
-    let exe = process
-        .exe()
+        .or_else(|| uid.map(|uid| uid.to_string()))
+        .unwrap_or_else(|| "-".into());
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
         .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "-".to_string());
+        .unwrap_or_else(|_| "-".into());
 
     enter_env_view(
         state,
@@ -552,12 +609,7 @@ fn open_process_env_for_pid(
         format!("User: {user}"),
         format!("Path: {exe}"),
     );
-    match process::load_process_env(pid) {
-        Ok(envs) => state.env_vars = envs,
-        Err(err) => {
-            state.env_vars = vec![format!("Failed to load env: {err}")];
-        }
-    }
+    start_process_env_fetch(state, pid);
 }
 
 pub(crate) fn enter_env_view(
@@ -590,11 +642,91 @@ fn format_ports_line(port_public: &str, port_internal: &str) -> String {
     }
 }
 
-pub(crate) fn start_container_env_fetch(state: &mut AppState, container_id: String) {
+pub(crate) fn start_env_fetch(
+    state: &mut AppState,
+    command: impl FnOnce() -> std::io::Result<Vec<String>> + Send + 'static,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
     state.env_vars = vec!["Loading environment...".into()];
     state.env_request = Some(rx);
     std::thread::spawn(move || {
-        let _ = tx.send(docker::load_container_env(&container_id));
+        let _ = tx.send(command());
     });
+}
+
+pub(crate) fn start_process_env_fetch(state: &mut AppState, pid: Pid) {
+    start_env_fetch(state, move || process::load_process_env(pid));
+}
+
+pub(crate) fn start_container_env_fetch(state: &mut AppState, container_id: String) {
+    start_env_fetch(state, move || docker::load_container_env(&container_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_owner_is_available_without_a_ui_process_scan() {
+        let mut state = AppState::new();
+        let uid: sysinfo::Uid = unsafe { libc::getuid() }.to_string().parse().unwrap();
+        state.user_cache.insert(uid, "qa-owner".into());
+        open_process_env_for_pid(
+            &mut state,
+            &System::new(),
+            Pid::from_u32(std::process::id()),
+            ViewMode::Process,
+        );
+        assert_eq!(state.env_info_left2, "User: qa-owner");
+    }
+    #[test]
+    fn pending_actions_do_not_block_input_or_start_duplicate_work() {
+        let mut state = AppState::new();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, entry) = std::sync::mpsc::channel();
+        start_background_action(
+            &mut state,
+            "pm2::7".into(),
+            "Restarting PM2 api".into(),
+            move || {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok("Restarted api".into())
+            },
+        );
+        entry
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        start_background_action(
+            &mut state,
+            "pm2::7".into(),
+            "Restarting PM2 api".into(),
+            || panic!("duplicate action must not execute"),
+        );
+        assert_eq!(state.pending_operations.len(), 1);
+        state.set_view(ViewMode::Ports);
+        assert_eq!(state.view_mode, ViewMode::Ports);
+        release.send(()).unwrap();
+        let result = state
+            .operation_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.message, "Restarted api");
+    }
+    #[test]
+    fn a_stale_process_identity_prevents_signaling_a_reused_pid() {
+        let mut state = AppState::new();
+        let pid = std::process::id();
+        state
+            .process_identities
+            .insert(pid, process::process_identity(pid).unwrap() + 1);
+        start_process_kill(&mut state, pid);
+        assert!(state.pending_operations.is_empty());
+        assert!(state
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("Selected process exited"));
+    }
 }

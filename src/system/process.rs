@@ -1,8 +1,8 @@
+use crate::system::worker::{self, Worker};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sysinfo::{Pid, System, Uid};
@@ -47,6 +47,20 @@ pub struct ProcessEntry {
 /// Static string constant to avoid repeated allocations
 const DASH: &str = "-";
 
+/// Kernel start ticks distinguish a selected process from a reused PID.
+pub(crate) fn process_identity(pid: u32) -> io::Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| io::Error::other("Invalid process stat"))?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(|| io::Error::other("Process start time unavailable"))
+}
+
 pub fn load_process_logs(pid: u32) -> io::Result<String> {
     let cmd = format!(
         "if [ -r /proc/{pid}/fd/1 ] || [ -r /proc/{pid}/fd/2 ]; then \
@@ -65,7 +79,11 @@ pub fn load_process_logs(pid: u32) -> io::Result<String> {
         fi",
     );
 
-    let output = Command::new("bash").args(["-lc", &cmd]).output()?;
+    let output = crate::system::command::run_output(
+        Command::new("bash").args(["-lc", &cmd]),
+        Duration::from_secs(15),
+        "Process logs",
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
@@ -195,71 +213,54 @@ fn aggregate_tree_memory(processes: &mut HashMap<Pid, ProcInfo>) {
     }
 }
 
-pub struct ProcessWorker {
-    data: Arc<RwLock<Arc<Vec<ProcessEntry>>>>,
-    paused: Arc<AtomicBool>,
-}
-
+pub struct ProcessWorker(Worker<Vec<ProcessEntry>>);
 impl ProcessWorker {
     pub fn snapshot(&self) -> Arc<Vec<ProcessEntry>> {
-        let guard = self.data.read().unwrap_or_else(|err| err.into_inner());
-        Arc::clone(&guard)
+        Arc::clone(&self.0.snapshot().data)
     }
-
+    pub fn is_loaded(&self) -> bool {
+        self.0.snapshot().updated_at.is_some()
+    }
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
+        self.0.set_paused(paused);
+    }
+    pub fn refresh(&self) {
+        self.0.refresh();
     }
 }
 
 pub fn start_process_worker(interval: Duration) -> ProcessWorker {
-    let data = Arc::new(RwLock::new(Arc::new(Vec::new())));
-    let thread_data = Arc::clone(&data);
-    let paused = Arc::new(AtomicBool::new(false));
-    let thread_paused = Arc::clone(&paused);
-
-    std::thread::spawn(move || {
-        let mut system = System::new();
-        let mut memory = memory::MemorySampler::default();
-        loop {
-            if thread_paused.load(Ordering::Relaxed) {
-                std::thread::sleep(interval);
+    let mut system = System::new();
+    let mut memory = memory::MemorySampler::default();
+    ProcessWorker(worker::start_worker(interval, move || {
+        system.refresh_processes_specifics(
+            sysinfo::ProcessRefreshKind::new()
+                .with_cpu()
+                .with_memory()
+                .with_user(sysinfo::UpdateKind::OnlyIfNotSet),
+        );
+        system.refresh_cpu();
+        let mut entries = Vec::with_capacity(system.processes().len());
+        for (pid, process) in system.processes() {
+            if process.thread_kind().is_some() {
                 continue;
             }
-            system.refresh_processes();
-            system.refresh_cpu();
-
-            let mut entries = Vec::with_capacity(system.processes().len());
-            for (pid, process) in system.processes() {
-                if process.thread_kind().is_some() {
-                    continue;
-                }
-                entries.push(ProcessEntry {
-                    pid: *pid,
-                    name: process.name().to_string(),
-                    cpu: process.cpu_usage(),
-                    memory_bytes: process.memory(),
-                    start_time: process.start_time(),
-                    memory_sample: None,
-                    user_id: process.user_id().cloned(),
-                    parent: process.parent(),
-                    is_thread: process.thread_kind().is_some(),
-                });
-            }
-            memory.refresh(&mut entries);
-            entries.sort_unstable_by_key(|entry| entry.pid);
-            let should_update = {
-                let guard = thread_data.read().unwrap_or_else(|err| err.into_inner());
-                guard.as_ref() != &entries
-            };
-            if should_update {
-                let mut guard = thread_data.write().unwrap_or_else(|err| err.into_inner());
-                *guard = Arc::new(entries);
-            }
-            std::thread::sleep(interval);
+            entries.push(ProcessEntry {
+                pid: *pid,
+                name: process.name().to_string(),
+                cpu: process.cpu_usage(),
+                memory_bytes: process.memory(),
+                start_time: process_identity(pid.as_u32()).unwrap_or(0),
+                memory_sample: None,
+                user_id: process.user_id().cloned(),
+                parent: process.parent(),
+                is_thread: false,
+            });
         }
-    });
-
-    ProcessWorker { data, paused }
+        memory.refresh(&mut entries);
+        entries.sort_unstable_by_key(|entry| entry.pid);
+        Ok(entries)
+    }))
 }
 
 pub fn build_tree_rows(
@@ -350,28 +351,42 @@ fn sort_pid_list(
 ) {
     pids.sort_by(|a_pid, b_pid| {
         let ordering = match (processes.get(a_pid), processes.get(b_pid)) {
-            (Some(a), Some(b)) => compare_proc(a, b, sort_by),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => {
+                if sort_by == SortBy::Swap {
+                    match (a.tree_swap_bytes, b.tree_swap_bytes) {
+                        (Some(_), None) => return std::cmp::Ordering::Less,
+                        (None, Some(_)) => return std::cmp::Ordering::Greater,
+                        _ => {}
+                    }
+                }
+                compare_proc(a, b, sort_by)
+            }
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         };
-        if ordering == std::cmp::Ordering::Equal {
+        let ordering = if ordering == std::cmp::Ordering::Equal {
             a_pid.cmp(b_pid)
+        } else {
+            ordering
+        };
+        if sort_order == SortOrder::Desc {
+            ordering.reverse()
         } else {
             ordering
         }
     });
-
-    if sort_order == SortOrder::Desc {
-        pids.reverse();
-    }
 }
 
 fn compare_proc(a: &ProcInfo, b: &ProcInfo, sort_by: SortBy) -> std::cmp::Ordering {
     match sort_by {
         SortBy::Cpu => cmp_f32(a.cpu, b.cpu),
         SortBy::Memory => a.tree_memory_bytes.cmp(&b.tree_memory_bytes),
+        SortBy::SelfMemory => a.memory_bytes.cmp(&b.memory_bytes),
+        SortBy::Swap => a.tree_swap_bytes.cmp(&b.tree_swap_bytes),
+        SortBy::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
         SortBy::Name => a.name_lower.cmp(&b.name_lower),
+        SortBy::Pid => std::cmp::Ordering::Equal, // The caller compares the PID keys.
     }
 }
 
@@ -432,6 +447,26 @@ fn is_skipped_parent(pid: Pid, processes: &HashMap<Pid, ProcInfo>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ram_and_tree_sort_differ_and_unknown_swap_stays_last_in_both_directions() {
+        let entries = vec![
+            measured(entry(10, None, "parent", 10), 10, 10),
+            measured(entry(11, Some(10), "child", 100), 100, 25),
+            measured(entry(20, None, "other", 50), 50, 1),
+            entry(30, None, "unknown", 200),
+        ];
+        let processes = collect_processes_from_entries(&entries, "", &HashMap::new());
+        let pids = |field, order| {
+            build_tree_rows(&processes, field, order, false)
+                .into_iter()
+                .map(|row| row.pid.as_u32())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pids(SortBy::SelfMemory, SortOrder::Desc), [30, 20, 10]);
+        assert_eq!(pids(SortBy::Memory, SortOrder::Desc), [30, 10, 20]);
+        assert_eq!(pids(SortBy::Swap, SortOrder::Desc), [10, 20, 30]);
+        assert_eq!(pids(SortBy::Swap, SortOrder::Asc), [20, 10, 30]);
+    }
 
     pub(super) fn entry(pid: u32, parent: Option<u32>, name: &str, rss: u64) -> ProcessEntry {
         ProcessEntry {

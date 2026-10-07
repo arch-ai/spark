@@ -97,6 +97,7 @@ fn parse_containers(stdout: &str) -> Vec<ContainerInfo> {
                 .unwrap_or(Cow::Borrowed(OTHER)),
             group_path: group.and_then(|g| g.path),
             running,
+            memory: None,
             activity_secs,
         });
     }
@@ -110,8 +111,14 @@ struct ComposeGroup {
     path: Option<String>,
 }
 
-pub fn group_containers(
+#[cfg(test)]
+pub fn group_containers(containers: Vec<ContainerInfo>) -> (Vec<ContainerInfo>, Vec<DockerRow>) {
+    group_containers_sorted(containers, None)
+}
+
+pub fn group_containers_sorted(
     containers: Vec<ContainerInfo>,
+    sort: Option<crate::app::sorting::TableSort>,
 ) -> (Vec<ContainerInfo>, Vec<DockerRow>) {
     struct GroupBucket {
         name: Cow<'static, str>,
@@ -140,23 +147,35 @@ pub fn group_containers(
 
     let other = grouped.remove("Other");
 
-    // Convert to vec and sort groups by activity (most recent first)
+    // Rank groups by their first member under the selected ordering.
     let mut buckets: Vec<_> = grouped.into_values().collect();
-    buckets.sort_by_key(|b| b.min_activity);
+    if let Some(sort) = sort {
+        for bucket in buckets.iter_mut() {
+            bucket
+                .containers
+                .sort_by(|a, b| crate::app::sorting::compare_containers(a, b, sort));
+        }
+        buckets.sort_by(|a, b| {
+            crate::app::sorting::compare_containers(&a.containers[0], &b.containers[0], sort)
+        });
+    } else {
+        buckets.sort_by_key(|b| b.min_activity);
+    }
 
     let mut flat = Vec::new();
     let mut rows = Vec::new();
     let mut first_group = true;
 
     for mut bucket in buckets {
-        // Sort containers within group by name (A-Z)
-        bucket.containers.sort_by(|a, b| {
-            let a_name = a.name.to_lowercase();
-            let b_name = b.name.to_lowercase();
-            a_name
-                .cmp(&b_name)
-                .then_with(|| a.activity_secs.cmp(&b.activity_secs))
-        });
+        if sort.is_none() {
+            bucket.containers.sort_by(|a, b| {
+                let a_name = a.name.to_lowercase();
+                let b_name = b.name.to_lowercase();
+                a_name
+                    .cmp(&b_name)
+                    .then_with(|| a.activity_secs.cmp(&b.activity_secs))
+            });
+        }
 
         if !first_group {
             rows.push(DockerRow::Separator);
@@ -185,6 +204,9 @@ pub fn group_containers(
     // "Other" group always goes last
     if let Some(mut bucket) = other {
         bucket.containers.sort_by(|a, b| {
+            if let Some(sort) = sort {
+                return crate::app::sorting::compare_containers(a, b, sort);
+            }
             let a_name = a.name.to_lowercase();
             let b_name = b.name.to_lowercase();
             a_name
@@ -370,7 +392,10 @@ fn parse_activity_time(status: &str) -> u64 {
     let time_str = if status_lower.starts_with("up") {
         status_lower.trim_start_matches("up").trim()
     } else if let Some(pos) = status_lower.find(')') {
-        status_lower[pos + 1..].trim().trim_end_matches("ago").trim()
+        status_lower[pos + 1..]
+            .trim()
+            .trim_end_matches("ago")
+            .trim()
     } else {
         &status_lower
     };
@@ -386,7 +411,10 @@ fn parse_duration_string(input: &str) -> u64 {
     // Handle special cases
     if input.starts_with("a ") || input.starts_with("an ") {
         // "a minute", "an hour", etc.
-        let unit = input.trim_start_matches("a ").trim_start_matches("an ").trim();
+        let unit = input
+            .trim_start_matches("a ")
+            .trim_start_matches("an ")
+            .trim();
         return match unit {
             s if s.starts_with("second") => 1,
             s if s.starts_with("minute") => 60,
@@ -401,7 +429,10 @@ fn parse_duration_string(input: &str) -> u64 {
 
     // Parse "N units" format
     let mut parts = input.split_whitespace();
-    let number = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(1);
+    let number = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1);
     let unit = parts.next().unwrap_or("");
 
     let multiplier = match unit {

@@ -30,7 +30,21 @@ pub(super) struct MemorySampler {
 
 impl MemorySampler {
     pub fn refresh(&mut self, entries: &mut [ProcessEntry]) {
-        self.refresh_with(entries, Instant::now(), read_memory);
+        let identities: HashMap<_, _> = entries
+            .iter()
+            .map(|entry| (entry.pid, entry.start_time))
+            .collect();
+        self.refresh_with(entries, Instant::now(), |pid| {
+            let expected = identities[&pid];
+            if super::process_identity(pid.as_u32())? != expected {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            let sample = read_memory(pid)?;
+            if super::process_identity(pid.as_u32())? != expected {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            Ok(sample)
+        });
     }
 
     fn refresh_with(
@@ -56,12 +70,16 @@ impl MemorySampler {
                     })
             })
             .collect();
-        // Service the oldest samples first; prioritize large processes on the first pass.
+        // Refresh expired measurements before newcomers. Otherwise a busy host
+        // with process churn can leave every existing tree using RSS forever.
         pending.sort_by_key(|entry| {
+            let cached = self.samples.get(&(entry.pid, entry.start_time));
+            let expired = cached.is_some_and(|cached| {
+                now.saturating_duration_since(cached.checked_at) >= MAX_SAMPLE_AGE
+            });
             (
-                self.samples
-                    .get(&(entry.pid, entry.start_time))
-                    .map(|cached| cached.checked_at),
+                !expired,
+                cached.map(|cached| cached.checked_at),
                 std::cmp::Reverse(entry.memory_bytes),
                 entry.pid,
             )
@@ -186,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_is_bounded_and_expired_samples_fall_back_until_resampled() {
+    fn sampling_is_bounded_and_process_churn_cannot_starve_expired_samples() {
         let now = Instant::now();
         let mut sampler = MemorySampler::default();
         let mut entries: Vec<_> = (10..310)
@@ -212,8 +230,8 @@ mod tests {
             })
         });
         assert!(reads > 0 && reads <= MAX_READS);
-        // Unsampled entries were prioritized ahead of the expired cache entry.
-        assert!(entries[0].memory_sample.is_none());
+        // Process churn cannot starve an already expired measurement.
+        assert_eq!(entries[0].memory_sample.unwrap().pss_bytes, 60);
     }
 
     #[cfg(target_os = "linux")]

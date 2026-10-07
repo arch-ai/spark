@@ -3,27 +3,85 @@
 use std::collections::HashMap;
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap},
     Frame,
 };
 use sysinfo::Pid;
 
+use crate::app::sorting::{RenderedHeaders, SortField, SortHeaderHit, SortTarget};
 use crate::app::{
     AppState, DeleteConfirmChoice, DeleteKind, DockerListKind, Focus, InputMode, LogOutputMode,
-    SortBy, SortOrder, ViewMode,
+    NodeTab, SortBy, SortOrder, ViewMode,
 };
 use crate::system::docker::DockerSystemDf;
 use crate::system::{docker, node, ports, process};
 
 use super::widgets::{HelpBar, HelpItem, Sidebar};
 
-
 #[cfg(test)]
 #[path = "render_tests.rs"]
 mod tests;
+
+/// Uses the same constraints and spacing as Table, including dynamic column widths.
+pub(super) fn sortable_header(
+    state: &AppState,
+    area: Rect,
+    target: SortTarget,
+    labels: &[&str],
+    fields: &[Option<SortField>],
+    widths: &[Constraint],
+) -> Row<'static> {
+    let columns = Layout::horizontal(widths.iter().copied())
+        .flex(Flex::Start)
+        .spacing(1)
+        .split(Rect::new(area.x, area.y, area.width, area.height.min(1)));
+    let sort = state.sort_for(target);
+    let mut hits = state.rendered_headers.borrow_mut();
+    let cells = labels
+        .iter()
+        .zip(fields)
+        .zip(columns.iter())
+        .map(|((label, field), column)| {
+            if let Some(field) = field {
+                if column.width > 0 && column.height > 0 {
+                    hits.hits.push(SortHeaderHit {
+                        area: *column,
+                        target,
+                        field: *field,
+                    });
+                }
+            }
+            let active = *field == Some(sort.field);
+            let text = if active {
+                let arrow = if sort.order == SortOrder::Asc {
+                    "▲"
+                } else {
+                    "▼"
+                };
+                if column.width >= 2 {
+                    let label = label
+                        .chars()
+                        .take(column.width.saturating_sub(2) as usize)
+                        .collect::<String>();
+                    format!("{label} {arrow}")
+                } else {
+                    arrow.to_owned()
+                }
+            } else {
+                (*label).to_owned()
+            };
+            Cell::from(text).style(
+                Style::default()
+                    .fg(if active { Color::Cyan } else { Color::Gray })
+                    .add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect::<Vec<_>>();
+    Row::new(cells)
+}
 
 /// Render navigation icons (▲/▼) in table area corners for jump to top/bottom
 fn render_nav_icons(frame: &mut Frame, area: Rect, scroll: usize, total: usize, visible: usize) {
@@ -69,6 +127,17 @@ pub fn render_ratatui(
     pm2_rows: &[usize],
 ) {
     let area = frame.area();
+    *state.rendered_headers.borrow_mut() = RenderedHeaders {
+        bounds: area,
+        view: Some(state.view_mode),
+        resource: if state.docker_list_open {
+            state.docker_list_kind
+        } else {
+            None
+        },
+        node_tab: (state.view_mode == ViewMode::Node).then_some(state.node_tab),
+        hits: Vec::new(),
+    };
 
     if area.width < 30 || area.height < 10 {
         frame.render_widget(
@@ -79,7 +148,9 @@ pub fn render_ratatui(
         return;
     }
 
-    let main_area = super::layout::main_area(area);
+    let full_main_area = super::layout::main_area(area);
+    let (main_area, inspector_area) =
+        super::workspace::panes(full_main_area, state.workspace.inspector.is_some());
     let sidebar_area = (main_area.x > area.x)
         .then(|| Rect::new(area.x, area.y, main_area.x - area.x, area.height));
 
@@ -89,28 +160,35 @@ pub fn render_ratatui(
     }
 
     // Render main content based on view mode
-    match state.view_mode {
-        ViewMode::Process => {
-            render_process_view(frame, state, main_area, process_cache, rows_cache);
-        }
-        ViewMode::Docker => {
-            render_docker_view(frame, state, main_area, docker_view, docker_rows);
-        }
-        ViewMode::DockerEnv => {
-            render_docker_env_view(frame, state, main_area);
-        }
-        ViewMode::Ports => {
-            render_ports_view(frame, state, main_area, ports_cache, ports_rows);
-        }
-        ViewMode::Node => {
-            render_node_view(frame, state, main_area, node_view, node_rows, pm2_view, pm2_rows);
+    if main_area.width > 0 && main_area.height > 0 {
+        match state.view_mode {
+            ViewMode::Projects => super::workspace::render_projects(frame, state, main_area),
+            ViewMode::Process => {
+                render_process_view(frame, state, main_area, process_cache, rows_cache);
+            }
+            ViewMode::Docker => {
+                render_docker_view(frame, state, main_area, docker_view, docker_rows);
+            }
+            ViewMode::DockerEnv => {
+                render_docker_env_view(frame, state, main_area);
+            }
+            ViewMode::Ports => {
+                render_ports_view(frame, state, main_area, ports_cache, ports_rows);
+            }
+            ViewMode::Node => {
+                render_node_view(
+                    frame, state, main_area, node_view, node_rows, pm2_view, pm2_rows,
+                );
+            }
         }
     }
+    if let Some(inspector_area) = inspector_area {
+        super::workspace::render_inspector(frame, state, inspector_area);
+    }
+    super::workspace::render_dialogs(frame, state, full_main_area);
 
     let blocking_modal_open = state.pending_delete.is_some()
         || state.pending_prune.is_some()
-        || state.prune_in_progress.is_some()
-        || state.prune_output.is_some()
         || state.log_in_progress.is_some()
         || state.log_output.is_some();
     let any_modal_open = blocking_modal_open || state.env_modal_open || state.docker_list_open;
@@ -126,14 +204,6 @@ pub fn render_ratatui(
         render_prune_confirm(frame, state, main_area);
     }
 
-    if let Some(label) = state.prune_in_progress.as_deref() {
-        render_prune_progress(frame, state, main_area, label);
-    }
-
-    if state.prune_output.is_some() {
-        render_prune_output(frame, state, main_area);
-    }
-
     if let Some(label) = state.log_in_progress.as_deref() {
         render_log_progress(frame, state, main_area, label);
     }
@@ -146,6 +216,7 @@ pub fn render_ratatui(
         render_env_modal(frame, state, main_area);
     }
     if state.docker_list_open && !blocking_modal_open && !state.env_modal_open {
+        state.rendered_headers.borrow_mut().hits.clear();
         render_docker_list_modal(frame, state, main_area);
     }
 
@@ -153,26 +224,134 @@ pub fn render_ratatui(
     if state.context_menu.is_some() {
         render_context_menu(frame, state, main_area);
     }
-    if let Some(delete) = &state.delete_in_progress {
+    let status = if matches!(
+        state.workspace.cleanup,
+        crate::app::workspace::Cleanup::Running(_)
+    ) && !state.workspace.cleanup_open
+    {
+        Some(("Volume cleanup running · F6 progress".into(), Color::Yellow))
+    } else if let crate::app::workspace::Cleanup::Result(_, failed) = &state.workspace.cleanup {
+        if !state.workspace.cleanup_open {
+            Some((
+                format!(
+                    "Volume cleanup {} · F6 details",
+                    if *failed { "failed" } else { "completed" }
+                ),
+                if *failed {
+                    Color::LightRed
+                } else {
+                    Color::Cyan
+                },
+            ))
+        } else {
+            None
+        }
+    } else if let Some(delete) = &state.delete_in_progress {
         let elapsed = delete.started_at.elapsed().as_secs();
-        let status = format!("{} Deleting {}:{:02} | {}",
-            state.spinner_char(), elapsed / 60, elapsed % 60, delete.label);
-        let area = Rect::new(main_area.x, main_area.bottom().saturating_sub(1), main_area.width, 1);
+        Some((
+            format!(
+                "{} Deleting {}:{:02} | {}",
+                state.spinner_char(),
+                elapsed / 60,
+                elapsed % 60,
+                delete.label
+            ),
+            Color::Yellow,
+        ))
+    } else if let Some(label) = &state.prune_in_progress {
+        Some((
+            format!(
+                "{} Pruning {label} · running in background",
+                state.spinner_char()
+            ),
+            Color::Yellow,
+        ))
+    } else if !state.pending_operations.is_empty() {
+        Some((
+            format!(
+                "{} {} action(s) in progress",
+                state.spinner_char(),
+                state.pending_operations.len()
+            ),
+            Color::Yellow,
+        ))
+    } else {
+        state
+            .message
+            .as_ref()
+            .map(|message| (message.clone(), Color::Cyan))
+    };
+    if let Some((status, color)) = status {
+        if !blocking_modal_open && !state.env_modal_open {
+            let area = Rect::new(
+                main_area.x,
+                main_area.bottom().saturating_sub(1),
+                main_area.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(truncate(&status, area.width as usize))
+                    .style(Style::default().bg(Color::Black).fg(color)),
+                area,
+            );
+        }
+    }
+    if state.sort_menu.is_some() {
+        render_modal_overlay(frame, frame.area());
+        render_sort_menu(frame, state, main_area);
+    }
+}
+
+fn render_sort_menu(frame: &mut Frame, state: &AppState, bounds: Rect) {
+    let Some(menu) = state.sort_menu else {
+        return;
+    };
+    let fields = menu.target.fields();
+    let current = state.sort_for(menu.target);
+    let (area, scroll) = super::layout::sort_menu_area(bounds, fields.len(), menu.selected);
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Sort · {} ", menu.target.sort_label(current)))
+            .title_bottom(" Enter apply · r reverse · Esc "),
+        area,
+    );
+    for (row, field) in fields
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(area.height.saturating_sub(2) as usize)
+    {
+        let style = if row == menu.selected {
+            Style::default().bg(Color::Cyan).fg(Color::Black)
+        } else {
+            Style::default()
+        };
+        let label = format!(" {}", menu.target.field_label(*field));
         frame.render_widget(
-            Paragraph::new(truncate(&status, area.width as usize))
-                .style(Style::default().bg(Color::Black).fg(Color::Yellow)),
-            area,
+            Paragraph::new(format!(
+                "{label:<width$}",
+                width = area.width.saturating_sub(2) as usize
+            ))
+            .style(style),
+            Rect::new(
+                area.x + 1,
+                area.y + 1 + (row - scroll) as u16,
+                area.width.saturating_sub(2),
+                1,
+            ),
         );
     }
-
 }
 
 fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     let items = vec![
-        "Processes",
-        "Ports",
-        "Docker",
-        "Node JS",
+        "1 Processes",
+        "2 Ports",
+        "3 Docker",
+        "4 Node JS",
+        "5 Projects",
     ];
 
     let active_view = if state.view_mode == ViewMode::DockerEnv {
@@ -182,6 +361,7 @@ fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let active_index = match active_view {
+        ViewMode::Projects => 4,
         ViewMode::Process => 0,
         ViewMode::Ports => 1,
         ViewMode::Docker | ViewMode::DockerEnv => 2,
@@ -192,6 +372,7 @@ fn render_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
         .active_index(active_index)
         .selected_index(state.sidebar_index)
         .hover_index(state.sidebar_hover)
+        .logo_frame(state.logo_frame)
         .has_focus(state.focus == Focus::Sidebar);
 
     frame.render_widget(sidebar, area);
@@ -204,20 +385,18 @@ fn render_process_view(
     processes: &HashMap<Pid, process::ProcInfo>,
     rows: &[process::TreeRow],
 ) {
-    // Layout: title, header, search, bars, table, help
+    // Header with search, system bars, table, help.
     let chunks = super::layout::process_layout(area);
-
-    // Title block
-    let title = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .title(" PROCESS VIEW ");
-    frame.render_widget(title, chunks[0]);
 
     // Header info
     let sort_label = match state.sort_by {
         SortBy::Cpu => "CPU",
         SortBy::Memory => "TREE RAM",
         SortBy::Name => "NAME",
+        SortBy::Pid => "PID",
+        SortBy::SelfMemory => "RAM",
+        SortBy::Swap => "TREE SWAP",
+        SortBy::User => "USER",
     };
     let order_label = match state.sort_order {
         SortOrder::Asc => "asc",
@@ -230,14 +409,17 @@ fn render_process_view(
     let zoom_label = if state.zoom { "ON" } else { "OFF" };
 
     let header_text = format!(
-        "Spark | View: PROC | Sort: {} {} | Zoom: {} | Mode: {}",
+        "Sort: {} {} | Tree: {} | {}",
         sort_label, order_label, zoom_label, mode_label
     );
-    let header = Paragraph::new(header_text);
-    frame.render_widget(header, chunks[1]);
-
-    // Search box
-    render_search_box(frame, chunks[2], &state.process_filter, state.input_mode == InputMode::Filter);
+    render_collection_header(
+        frame,
+        super::layout::collection_header(area, ViewMode::Process),
+        "PROCESS VIEW",
+        vec![Line::raw(header_text)],
+        &state.process_filter,
+        state.input_mode == InputMode::Filter,
+    );
 
     // System bars - constrain to max 60 chars width
     let bars_area = chunks[3];
@@ -251,14 +433,18 @@ fn render_process_view(
     // Help bar
     let help_items = vec![
         vec![
-            HelpItem::key("j/k"),
+            HelpItem::key("s"),
+            HelpItem::plain(" sort "),
+            HelpItem::key("?"),
+            HelpItem::plain(" help · "),
+            HelpItem::key("↑/↓"),
             HelpItem::plain(" nav "),
-            HelpItem::key("Enter"),
+            HelpItem::key("k"),
             HelpItem::plain(" kill "),
             HelpItem::key("/"),
             HelpItem::plain(" filter "),
-            HelpItem::key("s"),
-            HelpItem::plain(" sort "),
+            HelpItem::key("F10"),
+            HelpItem::plain(" actions "),
             HelpItem::key("z"),
             HelpItem::plain(" tree "),
             HelpItem::key("q"),
@@ -287,7 +473,7 @@ fn render_process_table(
             .map(|info| info.user.len())
             .max()
             .unwrap_or(4)
-            .clamp(4, 12)
+            .clamp(6, 12)
     } else {
         0
     };
@@ -336,33 +522,56 @@ fn render_process_table(
         })
         .collect();
     let mut headers = vec!["PID"];
+    let mut fields = vec![Some(SortField::Pid)];
     let mut widths = vec![Constraint::Length(8)];
     if show_cpu {
         headers.push("CPU");
+        fields.push(Some(SortField::Cpu));
         widths.push(Constraint::Length(7));
     }
     if show_self {
         headers.push("RAM");
+        fields.push(Some(SortField::SelfMemory));
         widths.push(Constraint::Length(8));
     }
     headers.push("TREE");
+    fields.push(Some(SortField::Memory));
     widths.push(Constraint::Length(8));
     if show_swap {
         headers.push("SWAPtree");
-        widths.push(Constraint::Length(8));
+        fields.push(Some(SortField::Swap));
+        widths.push(Constraint::Length(10));
     }
     if show_user {
         headers.push("USER");
+        fields.push(Some(SortField::User));
         widths.push(Constraint::Length(max_user_len as u16));
     }
     headers.push("NAME");
+    fields.push(Some(SortField::Name));
     widths.push(Constraint::Fill(1));
-    let header = Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD));
+    let header = sortable_header(
+        state,
+        Block::default().borders(Borders::ALL).inner(area),
+        SortTarget::Process,
+        &headers,
+        &fields,
+        &widths,
+    );
     let table = Table::new(table_rows, widths)
         .column_spacing(1)
         .header(header)
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(table, area);
+    if rows.is_empty() {
+        render_collection_empty(
+            frame,
+            area,
+            state.process_loaded,
+            &state.process_filter,
+            "No processes found.",
+        );
+    }
     render_nav_icons(frame, area, scroll_offset, rows.len(), visible_height);
 }
 
@@ -382,41 +591,29 @@ fn render_docker_view(
     docker_rows: &[docker::DockerRow],
 ) {
     let chunks = super::layout::docker_layout(area);
+    let header = super::layout::collection_header(area, ViewMode::Docker);
     let running = docker_view
         .iter()
         .filter(|container| container.running)
         .count();
-    let summary = format!(
-        "{} shown / {} total   {} running   {} stopped",
-        docker_view.len(),
-        state.docker_total,
-        running,
-        docker_view.len() - running
-    );
-    if chunks[0].height > 1 {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" DOCKER ")
-            .border_style(Style::default().fg(Color::Cyan));
-        let inner = block.inner(chunks[0]);
-        frame.render_widget(block, chunks[0]);
-        frame.render_widget(Paragraph::new(summary), inner);
+    let stopped = docker_view.len() - running;
+    let summary = if header.details.width >= 54 {
+        format!(
+            "{} shown / {} total   {} running   {} stopped",
+            docker_view.len(),
+            state.docker_total,
+            running,
+            stopped
+        )
     } else {
-        frame.render_widget(
-            Paragraph::new(format!(
-                " DOCKER  {}/{} shown · {} running",
-                docker_view.len(),
-                state.docker_total,
-                running
-            ))
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            chunks[0],
-        );
-    }
+        format!(
+            "{}/{} shown · {} run · {} stop",
+            docker_view.len(),
+            state.docker_total,
+            running,
+            stopped
+        )
+    };
     let (notice, color) = if let Some(error) = &state.docker_error {
         (
             format!(
@@ -431,24 +628,37 @@ fn render_docker_view(
         )
     } else if let Some(message) = &state.message {
         (message.clone(), Color::Cyan)
+    } else if let Some(notice) = state.docker_memory.notice() {
+        (notice, Color::Yellow)
     } else if let Some(updated) = state.docker_updated_at {
         (
-            format!(
-                "Updated {}s ago  | / filter   x clear   F5 refresh",
-                updated.elapsed().as_secs()
-            ),
+            format!("Updated {}s ago · F5 refresh", updated.elapsed().as_secs()),
             Color::Gray,
         )
     } else {
         ("Connecting to Docker...".into(), Color::Cyan)
     };
-    frame.render_widget(
-        Paragraph::new(notice).style(Style::default().fg(color)),
-        chunks[1],
-    );
-    render_search_box(
+    let title = if header.columns {
+        "DOCKER".to_string()
+    } else {
+        format!(
+            "DOCKER  {}/{} shown · {} running",
+            docker_view.len(),
+            state.docker_total,
+            running
+        )
+    };
+    let status = Line::styled(notice, Style::default().fg(color));
+    let details = if header.columns {
+        vec![Line::raw(summary), status]
+    } else {
+        vec![status]
+    };
+    render_collection_header(
         frame,
-        chunks[2],
+        header,
+        &title,
+        details,
         &state.docker_filter,
         state.input_mode == InputMode::Filter,
     );
@@ -463,6 +673,8 @@ fn render_docker_view(
                 HelpItem::plain(" move "),
                 HelpItem::key("↵"),
                 HelpItem::plain(" shell "),
+                HelpItem::key("F2"),
+                HelpItem::plain(" details "),
                 HelpItem::key("l"),
                 HelpItem::plain(" logs "),
                 HelpItem::key("e"),
@@ -482,10 +694,16 @@ fn render_docker_view(
     } else {
         vec![
             vec![
+                HelpItem::key("s"),
+                HelpItem::plain(" sort "),
+                HelpItem::key("?"),
+                HelpItem::plain(" help · "),
                 HelpItem::key("↑/↓"),
                 HelpItem::plain(" select "),
                 HelpItem::key("Enter"),
                 HelpItem::plain(" shell "),
+                HelpItem::key("F2"),
+                HelpItem::plain(" details "),
                 HelpItem::key("l"),
                 HelpItem::plain(" logs "),
                 HelpItem::key("e"),
@@ -515,7 +733,22 @@ fn render_docker_table(
 ) {
     let visible_height = area.height.saturating_sub(3) as usize;
     let scroll_offset = state.docker_scroll;
-    let block = Block::default().borders(Borders::ALL).title(" Containers ");
+    let title = if let Some((name, _)) = &state.docker_volume_scope {
+        format!(
+            " Volume: {name} · x clears · {} ",
+            state
+                .sort_for(crate::app::sorting::SortTarget::Docker)
+                .label()
+        )
+    } else {
+        format!(
+            " Containers · {} · s sort ",
+            state
+                .sort_for(crate::app::sorting::SortTarget::Docker)
+                .label()
+        )
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     if docker_rows.is_empty() {
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -536,26 +769,40 @@ fn render_docker_table(
         );
         return;
     }
-    let show_ports = area.width >= 48;
-    let show_image = area.width >= 78;
-    let show_id = area.width >= 110;
+    let show_status = area.width >= 40;
+    let show_ports = area.width >= 62;
+    let show_image = area.width >= 92;
+    let show_id = area.width >= 124;
     let mut widths = vec![
         Constraint::Length(2),
         Constraint::Fill(3),
-        Constraint::Fill(3),
+        Constraint::Length(9),
     ];
-    let mut labels = vec!["", "NAME / PROJECT", "STATUS"];
+    let mut labels = vec!["", "NAME / PROJECT", "RAM"];
+    let mut fields = vec![None, Some(SortField::Name), Some(SortField::Memory)];
+    if show_status {
+        widths.push(if area.width < 62 {
+            Constraint::Length(11)
+        } else {
+            Constraint::Fill(3)
+        });
+        labels.push("STATUS");
+        fields.push(Some(SortField::Status));
+    }
     if show_ports {
         widths.push(Constraint::Fill(2));
         labels.push("HOST PORTS");
+        fields.push(Some(SortField::Port));
     }
     if show_image {
         widths.push(Constraint::Fill(3));
         labels.push("IMAGE");
+        fields.push(Some(SortField::Image));
     }
     if show_id {
         widths.push(Constraint::Length(12));
         labels.push("ID");
+        fields.push(Some(SortField::Id));
     }
     let table_rows: Vec<Row> = docker_rows
         .iter()
@@ -579,21 +826,29 @@ fn render_docker_table(
                     count,
                     running_count,
                     ..
-                } => vec![
-                    Cell::from(if *running_count == *count {
-                        "●"
-                    } else {
-                        "◐"
-                    })
-                    .style(Style::default().fg(Color::Cyan)),
-                    Cell::from(name.clone()).style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Cell::from(format!("{running_count}/{count} running"))
-                        .style(Style::default().fg(Color::Gray)),
-                ],
+                } => {
+                    let mut cells = vec![
+                        Cell::from(if *running_count == *count {
+                            "●"
+                        } else {
+                            "◐"
+                        })
+                        .style(Style::default().fg(Color::Cyan)),
+                        Cell::from(name.clone()).style(
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Cell::from(""),
+                    ];
+                    if show_status {
+                        cells.push(
+                            Cell::from(format!("{running_count}/{count} running"))
+                                .style(Style::default().fg(Color::Gray)),
+                        );
+                    }
+                    cells
+                }
                 docker::DockerRow::Separator => vec![Cell::from(""); 3],
                 docker::DockerRow::Item { index, prefix } => {
                     let Some(container) = docker_view.get(*index) else {
@@ -620,13 +875,35 @@ fn render_docker_table(
                             if area.width < 60 { "" } else { prefix },
                             container.name
                         )),
-                        Cell::from(if loading {
-                            "Working...".into()
+                        Cell::from(if !container.running {
+                            "-".into()
+                        } else if let Some(memory) = container.memory {
+                            format!(
+                                "{}{}",
+                                format_memory(memory.used_bytes),
+                                if memory.stale { "*" } else { "" }
+                            )
                         } else {
-                            docker_status_text(&container.status)
+                            "?".into()
                         })
-                        .style(Style::default().fg(color)),
+                        .style(Style::default().fg(
+                            if container.memory.is_some_and(|m| m.stale) {
+                                Color::Yellow
+                            } else {
+                                Color::Gray
+                            },
+                        )),
                     ];
+                    if show_status {
+                        cells.push(
+                            Cell::from(if loading {
+                                "Working...".into()
+                            } else {
+                                docker_status_text(&container.status)
+                            })
+                            .style(Style::default().fg(color)),
+                        );
+                    }
                     if show_ports {
                         cells.push(Cell::from(container.port_public.clone()));
                     }
@@ -645,10 +922,13 @@ fn render_docker_table(
             Row::new(cells).style(style)
         })
         .collect();
-    let header = Row::new(labels).style(
-        Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::BOLD),
+    let header = sortable_header(
+        state,
+        block.inner(area),
+        SortTarget::Docker,
+        &labels,
+        &fields,
+        &widths,
     );
     frame.render_widget(
         Table::new(table_rows, widths)
@@ -701,29 +981,35 @@ fn render_ports_view(
     ports_cache: &[ports::PortInfo],
     ports_rows: &[ports::PortRow],
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(2),
-        ])
-        .split(area);
-
-    // Title
-    let title = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .title(" PORTS VIEW ");
-    frame.render_widget(title, chunks[0]);
-
-    // Header
-    let header_text = format!("Listening ports: {}", ports_cache.len());
-    frame.render_widget(Paragraph::new(header_text), chunks[1]);
-
-    // Search
-    render_search_box(frame, chunks[2], &state.ports_filter, state.input_mode == InputMode::Filter);
+    let chunks = super::layout::resource_layout(area);
+    let header_text = if let Some(error) = &state.ports_error {
+        format!("{error} | F5 retry")
+    } else if state.ports_loaded {
+        format!(
+            "Listening bindings: {} · {} · s sort",
+            ports_cache.len(),
+            state
+                .sort_for(crate::app::sorting::SortTarget::Ports)
+                .label()
+        )
+    } else {
+        "Loading listening ports...".into()
+    };
+    render_collection_header(
+        frame,
+        super::layout::collection_header(area, ViewMode::Ports),
+        "PORTS VIEW",
+        vec![Line::styled(
+            header_text,
+            Style::default().fg(if state.ports_error.is_some() {
+                Color::Yellow
+            } else {
+                Color::Reset
+            }),
+        )],
+        &state.ports_filter,
+        state.input_mode == InputMode::Filter,
+    );
 
     // Table
     render_ports_table(frame, state, chunks[3], ports_cache, ports_rows);
@@ -731,13 +1017,20 @@ fn render_ports_view(
     // Help
     let help_items = vec![
         vec![
-            HelpItem::key("j/k"),
+            HelpItem::key("s"),
+            HelpItem::plain(" sort "),
+            HelpItem::key("?"),
+            HelpItem::plain(" help · "),
+            HelpItem::key("↑/↓"),
             HelpItem::plain(" nav "),
-            HelpItem::key("Enter"),
+            HelpItem::key("k"),
             HelpItem::plain(" kill "),
             HelpItem::key("/"),
             HelpItem::plain(" filter "),
+            HelpItem::key("F10"),
+            HelpItem::plain(" actions"),
         ],
+        vec![HelpItem::plain("1-5 views · F5 refresh · q quit")],
     ];
     frame.render_widget(HelpBar::new(help_items), chunks[4]);
 }
@@ -749,88 +1042,141 @@ fn render_ports_table(
     ports_cache: &[ports::PortInfo],
     ports_rows: &[ports::PortRow],
 ) {
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let scroll_offset = state.ports_scroll;
-
-    let table_rows: Vec<Row> = ports_rows
+    let capacity = area.height.saturating_sub(3) as usize;
+    let show_pid = area.width >= 55;
+    let show_command = area.width >= 85;
+    let rows: Vec<Row> = ports_rows
         .iter()
         .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(idx, row)| {
-            // idx is already the absolute index since enumerate() is before skip()
-            let is_selected = idx == state.selected;
-            let is_hovered = state.hover_row == Some(idx);
-
-            match row {
-                ports::PortRow::Group { name } => {
-                    // Subtle hover background for group rows
-                    let row_style = if is_hovered {
-                        Style::default().bg(Color::Rgb(40, 40, 45))
+        .skip(state.ports_scroll)
+        .take(capacity)
+        .map(|(idx, row)| match row {
+            ports::PortRow::Group { name } => Row::new(vec![Cell::from(truncate(name, 12)).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            ports::PortRow::Item { index } => {
+                let port = &ports_cache[*index];
+                let mut cells = vec![
+                    Cell::from(port.binding_display()),
+                    Cell::from(port.proto.clone()),
+                ];
+                if show_pid {
+                    cells.push(Cell::from(if port.pid.as_u32() == 0 {
+                        "-".into()
                     } else {
-                        Style::default()
-                    };
-
-                    Row::new(vec![
-                        Cell::from(name.clone()).style(Style::default().fg(Color::Rgb(255, 191, 0)).add_modifier(Modifier::BOLD)),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
-                    .style(row_style)
+                        port.pid.to_string()
+                    }));
                 }
-                ports::PortRow::Item { index, prefix } => {
-                    let port = &ports_cache[*index];
-                    let style = if is_selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else if is_hovered {
-                        // Subtle hover background
-                        Style::default().bg(Color::Rgb(40, 40, 45))
-                    } else {
-                        Style::default()
-                    };
-
-                    let pid_display = if port.pid.as_u32() == 0 {
-                        "-".to_string()
-                    } else {
-                        format!("{}", port.pid.as_u32())
-                    };
-
-                    Row::new(vec![
-                        Cell::from(format!("{}{}", prefix, port.binding_display())),
-                        Cell::from(pid_display),
-                        Cell::from(port.name.clone()),
-                        Cell::from(port.exe_path.clone()),
-                    ])
-                    .style(style)
+                cells.push(Cell::from(port.name.clone()));
+                if show_command {
+                    cells.push(Cell::from(port.exe_path.clone()));
                 }
+                Row::new(cells).style(selection_style(
+                    idx == state.selected,
+                    state.hover_row == Some(idx),
+                ))
             }
         })
         .collect();
+    let mut labels = vec!["EXT:INT", "PROTO"];
+    let mut fields = vec![Some(SortField::Port), Some(SortField::Protocol)];
+    let mut widths = vec![
+        Constraint::Length(11),
+        Constraint::Length(if area.width >= 40 { 7 } else { 5 }),
+    ];
+    if show_pid {
+        labels.push("PID");
+        fields.push(Some(SortField::Pid));
+        widths.push(Constraint::Length(8));
+    }
+    labels.push("NAME");
+    fields.push(Some(SortField::Name));
+    widths.push(Constraint::Fill(1));
+    if show_command {
+        labels.push("COMMAND");
+        fields.push(Some(SortField::Command));
+        widths.push(Constraint::Fill(1));
+    }
+    let header = sortable_header(
+        state,
+        Block::default().borders(Borders::ALL).inner(area),
+        SortTarget::Ports,
+        &labels,
+        &fields,
+        &widths,
+    );
+    frame.render_widget(
+        Table::new(rows, widths)
+            .column_spacing(1)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+    if ports_rows.is_empty() {
+        render_collection_empty(
+            frame,
+            area,
+            state.ports_loaded || state.ports_error.is_some(),
+            &state.ports_filter,
+            if state.ports_error.is_some() {
+                "Unable to refresh. F5 retries."
+            } else {
+                "No listening ports found."
+            },
+        );
+    }
+    for (offset, row) in ports_rows
+        .iter()
+        .skip(state.ports_scroll)
+        .take(capacity)
+        .enumerate()
+    {
+        if let ports::PortRow::Group { name } = row {
+            frame.render_widget(
+                Paragraph::new(name.as_str()).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Rect::new(
+                    area.x + 1,
+                    area.y + 2 + offset as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+            );
+        }
+    }
+    render_nav_icons(frame, area, state.ports_scroll, ports_rows.len(), capacity);
+}
 
-    let header = Row::new(vec![
-        Cell::from("EXT:INT").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("PID").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("COMMAND").style(Style::default().add_modifier(Modifier::BOLD)),
-    ]);
+fn selection_style(selected: bool, hovered: bool) -> Style {
+    if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else if hovered {
+        Style::default().bg(Color::Rgb(40, 40, 45))
+    } else {
+        Style::default()
+    }
+}
 
-    let table = Table::new(
-        table_rows,
-        [
-            Constraint::Length(12),
-            Constraint::Length(8),
-            Constraint::Percentage(30),
-            Constraint::Min(20),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL));
-
-    frame.render_widget(table, area);
-
-    // Navigation icons
-    render_nav_icons(frame, area, scroll_offset, ports_rows.len(), visible_height);
+fn render_collection_empty(frame: &mut Frame, area: Rect, loaded: bool, filter: &str, empty: &str) {
+    let text = if !loaded {
+        "Loading..."
+    } else if !filter.is_empty() {
+        "No matches. x clears the filter."
+    } else {
+        empty
+    };
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 2,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(3),
+    );
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_node_view(
@@ -842,100 +1188,78 @@ fn render_node_view(
     pm2_view: &[node::Pm2Process],
     pm2_rows: &[usize],
 ) {
-    let title_height = 3u16;
-    let header_height = 1u16;
-    let search_height = 3u16;
-    let help_height = 2u16;
-
-    let title_area = Rect::new(area.x, area.y, area.width, title_height);
-    let header_area = Rect::new(area.x, area.y + title_height, area.width, header_height);
-    let search_area = Rect::new(
-        area.x,
-        area.y + title_height + header_height,
-        area.width,
-        search_height,
-    );
-    let table_top = area.y + title_height + header_height + search_height;
-    let available = area.height.saturating_sub(title_height + header_height + search_height + help_height);
-    let help_area = Rect::new(
-        area.x,
-        area.y + area.height.saturating_sub(help_height),
-        area.width,
-        help_height,
-    );
-
-    let (pm2_area, node_area) = if state.pm2_available {
-        let mut pm2_height = available / 2;
-        if pm2_height < 5 {
-            pm2_height = available.min(5);
-        }
-        let mut node_height = available.saturating_sub(pm2_height);
-        if node_height < 5 {
-            let deficit = 5u16.saturating_sub(node_height);
-            if pm2_height > deficit {
-                pm2_height = pm2_height.saturating_sub(deficit);
-                node_height = node_height.saturating_add(deficit);
+    let chunks = super::layout::node_layout(area);
+    let (pm2_area, node_area) = super::layout::node_tables(area, state.node_tab);
+    let help_area = chunks[5];
+    let summary = match state.node_tab {
+        NodeTab::Processes if !state.node_loaded => "Loading Node.js processes...".into(),
+        NodeTab::Processes => format!("{} Node.js processes · Tab switches tabs", node_view.len()),
+        NodeTab::Pm2 => {
+            if let Some(error) = &state.pm2_error {
+                format!("PM2: {error} | F5 retry")
+            } else if state.pm2_loading {
+                "Loading PM2...".into()
+            } else {
+                format!("{} PM2 processes · Tab switches tabs", pm2_rows.len())
             }
         }
-        (
-            Rect::new(area.x, table_top, area.width, pm2_height),
-            Rect::new(area.x, table_top + pm2_height, area.width, node_height),
-        )
-    } else {
-        (
-            Rect::new(area.x, table_top, area.width, 0),
-            Rect::new(area.x, table_top, area.width, available),
-        )
     };
-
-    // Title
-    let title = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-        .title(" NODE VIEW ");
-    frame.render_widget(title, title_area);
-
-    // Header
-    let pm2_status = if state.pm2_available { "available" } else { "not running" };
-    let header_text = format!("Node processes: {} | PM2: {}", node_view.len(), pm2_status);
-    frame.render_widget(Paragraph::new(header_text), header_area);
-
-    // Search
-    render_search_box(frame, search_area, &state.node_filter, state.input_mode == InputMode::Filter);
+    let summary = Line::styled(
+        summary,
+        Style::default().fg(
+            if state.node_tab == NodeTab::Pm2 && state.pm2_error.is_some() {
+                Color::Yellow
+            } else {
+                Color::Reset
+            },
+        ),
+    );
+    render_collection_header(
+        frame,
+        super::layout::collection_header(area, ViewMode::Node),
+        "NODE VIEW",
+        vec![Line::default(), summary],
+        &state.node_filter,
+        state.input_mode == InputMode::Filter,
+    );
+    frame.render_widget(
+        Tabs::new(super::layout::NODE_TAB_LABELS)
+            .divider(super::layout::NODE_TAB_DIVIDER)
+            .padding(" ", " ")
+            .select(usize::from(state.node_tab == NodeTab::Pm2))
+            .style(Style::default().fg(Color::Gray))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        chunks[1],
+    );
 
     // Tables
-    if state.pm2_available {
-        render_pm2_table(frame, state, pm2_area, pm2_view, pm2_rows);
+    match state.node_tab {
+        NodeTab::Pm2 => render_pm2_table(frame, state, pm2_area, pm2_view, pm2_rows),
+        NodeTab::Processes => render_node_table(frame, state, node_area, node_view, node_rows),
     }
-    render_node_table(frame, state, node_area, node_view, node_rows);
 
-    // Help
-    let help_items = if state.pm2_available {
-        vec![vec![
-            HelpItem::key("j/k"),
+    let help_items = vec![
+        vec![
+            HelpItem::key("Tab"),
+            HelpItem::plain(" tabs · "),
+            HelpItem::key("s"),
+            HelpItem::plain(" sort "),
+            HelpItem::key("?"),
+            HelpItem::plain(" help · "),
+            HelpItem::key("↑/↓"),
             HelpItem::plain(" nav "),
-            HelpItem::key("Enter"),
-            HelpItem::plain(" kill "),
-            HelpItem::key("e"),
-            HelpItem::plain(" env "),
-            HelpItem::key("Ctrl+R"),
-            HelpItem::plain(" pm2 restart "),
-            HelpItem::key("Ctrl+S"),
-            HelpItem::plain(" stop "),
-            HelpItem::key("Ctrl+T"),
-            HelpItem::plain(" start "),
-            HelpItem::key("Ctrl+O"),
-            HelpItem::plain(" open dir"),
-        ]]
-    } else {
-        vec![vec![
-            HelpItem::key("j/k"),
-            HelpItem::plain(" nav "),
-            HelpItem::key("Enter"),
-            HelpItem::plain(" kill "),
-            HelpItem::key("e"),
-            HelpItem::plain(" env "),
-        ]]
-    };
+            HelpItem::key("F10"),
+            HelpItem::plain(" actions "),
+            HelpItem::key("/"),
+            HelpItem::plain(" filter"),
+        ],
+        vec![HelpItem::plain("k stop/kill · e env · F5 refresh")],
+    ];
     frame.render_widget(HelpBar::new(help_items), help_area);
 }
 
@@ -949,80 +1273,151 @@ fn render_pm2_table(
     if area.height < 3 {
         return;
     }
-
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let scroll_offset = state.pm2_scroll;
-
-    let table_rows: Vec<Row> = pm2_rows
+    let show_id = area.width >= 36;
+    let show_pid = area.width >= 55;
+    let show_cpu = area.width >= 65;
+    let show_mode = area.width >= 80;
+    let show_uptime = area.width >= 100;
+    let capacity = area.height.saturating_sub(3) as usize;
+    let rows: Vec<Row> = pm2_rows
         .iter()
         .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(idx, row_index)| {
-            let is_hovered = state.pm2_hover_row == Some(idx + scroll_offset);
-            let style = if is_hovered {
-                Style::default().bg(Color::Rgb(40, 40, 45))
+        .skip(state.pm2_scroll)
+        .take(capacity)
+        .map(|(idx, source)| {
+            let proc = &pm2_view[*source];
+            let pending = state
+                .pending_operations
+                .contains_key(&format!("pm2::{}", proc.pm_id));
+            let status = if pending {
+                "working"
             } else {
-                Style::default()
+                proc.status.as_str()
             };
-            let proc = &pm2_view[*row_index];
-            let status_color = match proc.status.to_lowercase().as_str() {
+            let color = match status {
                 "online" => Color::Green,
-                "stopped" => Color::Red,
-                "errored" => Color::Red,
-                "starting" => Color::Yellow,
-                _ => Color::Cyan,
+                "stopped" | "errored" => Color::Red,
+                "working" => Color::Yellow,
+                _ => Color::Reset,
             };
-            let pid = proc.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".to_string());
-            let cpu = proc.cpu.map(|c| format!("{:.1}%", c)).unwrap_or_else(|| "-".to_string());
-            let mem = proc.memory_bytes.map(format_memory).unwrap_or_else(|| "-".to_string());
-            let uptime = proc
-                .uptime_ms
-                .map(|ms| format_uptime(ms / 1000))
-                .unwrap_or_else(|| "-".to_string());
-            Row::new(vec![
-                Cell::from(proc.pm_id.to_string()),
-                Cell::from(truncate(&proc.name, 20)),
-                Cell::from(proc.status.clone()).style(Style::default().fg(status_color)),
-                Cell::from(truncate(&proc.mode, 8)),
-                Cell::from(pid),
-                Cell::from(cpu),
-                Cell::from(mem),
-                Cell::from(uptime),
-            ])
-            .style(style)
+            let mut cells = vec![
+                Cell::from(proc.name.clone()),
+                Cell::from(status.to_owned()).style(Style::default().fg(color)),
+                Cell::from(
+                    proc.memory_bytes
+                        .map(format_memory)
+                        .unwrap_or_else(|| "-".into()),
+                ),
+            ];
+            if show_id {
+                cells.insert(0, Cell::from(proc.pm_id.to_string()));
+            }
+            if show_pid {
+                cells.push(Cell::from(
+                    proc.pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                ));
+            }
+            if show_cpu {
+                cells.push(Cell::from(
+                    proc.cpu
+                        .map(|cpu| format!("{cpu:.1}%"))
+                        .unwrap_or_else(|| "-".into()),
+                ));
+            }
+            if show_mode {
+                cells.push(Cell::from(proc.mode.clone()));
+            }
+            if show_uptime {
+                cells.push(Cell::from(
+                    proc.uptime_ms
+                        .map(|ms| format_uptime(ms / 1000))
+                        .unwrap_or_else(|| "-".into()),
+                ));
+            }
+            Row::new(cells).style(selection_style(
+                idx == state.pm2_selected,
+                state.pm2_hover_row == Some(idx),
+            ))
         })
         .collect();
-
-    let header = Row::new(vec![
-        Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("STATUS").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("MODE").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("PID").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("CPU").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("MEM").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("UPTIME").style(Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-
-    let table = Table::new(
-        table_rows,
-        [
-            Constraint::Length(4),
-            Constraint::Percentage(22),
-            Constraint::Length(10),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Length(10),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL).title(" PM2 "));
-
-    frame.render_widget(table, area);
-    render_nav_icons(frame, area, scroll_offset, pm2_rows.len(), visible_height);
+    let mut labels = vec!["NAME", "STATUS", "RSS"];
+    let mut fields = vec![
+        Some(SortField::Name),
+        Some(SortField::Status),
+        Some(SortField::Memory),
+    ];
+    let mut widths = vec![
+        Constraint::Fill(1),
+        Constraint::Length(9),
+        Constraint::Length(7),
+    ];
+    if show_id {
+        labels.insert(0, "ID");
+        fields.insert(0, Some(SortField::Id));
+        widths.insert(0, Constraint::Length(4));
+    }
+    for (show, label, field, width) in [
+        (show_pid, "PID", SortField::Pid, 8),
+        (show_cpu, "CPU", SortField::Cpu, 7),
+        (show_mode, "MODE", SortField::Mode, 8),
+        (show_uptime, "UPTIME", SortField::Uptime, 10),
+    ] {
+        if show {
+            labels.push(label);
+            fields.push(Some(field));
+            widths.push(Constraint::Length(width));
+        }
+    }
+    let title = if state.pm2_error.is_some() {
+        " PM2 · cached · F5 retry "
+    } else {
+        " PM2 "
+    };
+    let title = format!(
+        "{}· {} · s sort ",
+        title,
+        crate::app::sorting::SortTarget::Pm2
+            .sort_label(state.sort_for(crate::app::sorting::SortTarget::Pm2))
+    );
+    let header = sortable_header(
+        state,
+        Block::default().borders(Borders::ALL).inner(area),
+        SortTarget::Pm2,
+        &labels,
+        &fields,
+        &widths,
+    );
+    frame.render_widget(
+        Table::new(rows, widths)
+            .column_spacing(1)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+    if pm2_rows.is_empty() {
+        let error = state
+            .pm2_error
+            .as_ref()
+            .map(|error| format!("{error} · F5 retry"));
+        render_collection_empty(
+            frame,
+            area,
+            state.pm2_error.is_some() || (state.node_loaded && !state.pm2_loading),
+            if error.is_some() || !state.pm2_available {
+                ""
+            } else {
+                &state.node_filter
+            },
+            error.as_deref().unwrap_or(if state.pm2_available {
+                "No PM2 processes."
+            } else {
+                "PM2 unavailable. F5 retries."
+            }),
+        );
+    }
+    render_nav_icons(frame, area, state.pm2_scroll, pm2_rows.len(), capacity);
 }
 
 fn render_node_table(
@@ -1035,109 +1430,171 @@ fn render_node_table(
     if area.height < 3 {
         return;
     }
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let scroll_offset = state.node_scroll;
-
-    let table_rows: Vec<Row> = node_rows
+    let show_cpu = area.width >= 55;
+    let show_script = area.width >= 80;
+    let capacity = area.height.saturating_sub(3) as usize;
+    let rows: Vec<Row> = node_rows
         .iter()
         .enumerate()
-        .skip(scroll_offset)
-        .take(visible_height)
-        .map(|(idx, row)| {
-            // idx is already the absolute index since enumerate() is before skip()
-            let is_selected = idx == state.selected;
-            let is_hovered = state.hover_row == Some(idx);
-
-            match row {
-                node::NodeRow::Group { name, count } => {
-                    Row::new(vec![
-                        Cell::from(format!("{} ({})", name, count))
-                            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
+        .skip(state.node_scroll)
+        .take(capacity)
+        .map(|(idx, row)| match row {
+            node::NodeRow::Item { index } => {
+                let proc = &node_view[*index];
+                let mut cells = vec![
+                    Cell::from(proc.pid.to_string()),
+                    Cell::from(format_memory(proc.memory_bytes)),
+                    Cell::from(proc.name.clone()),
+                ];
+                if show_cpu {
+                    cells.push(Cell::from(format!("{:.1}%", proc.cpu)));
                 }
-                node::NodeRow::Item { index } => {
-                    let proc = &node_view[*index];
-                    let style = if is_selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else if is_hovered {
-                        // Subtle hover background
-                        Style::default().bg(Color::Rgb(40, 40, 45))
-                    } else {
-                        Style::default()
-                    };
-
-                    let script_display = if proc.script.is_empty() {
-                        proc.project_name.as_deref().unwrap_or("-")
-                    } else {
-                        &proc.script
-                    };
-
-                    Row::new(vec![
-                        Cell::from(format!("{}", proc.pid.as_u32())),
-                        Cell::from(format!("{:.1}%", proc.cpu)),
-                        Cell::from(format_memory(proc.memory_bytes)),
-                        Cell::from(proc.name.clone()),
-                        Cell::from(truncate(script_display, 30)),
-                    ])
-                    .style(style)
+                if show_script {
+                    cells.push(Cell::from(proc.script.clone()));
                 }
-                node::NodeRow::UtilsTitle => {
-                    Row::new(vec![
-                        Cell::from("--- Node Utilities ---").style(Style::default().fg(Color::Yellow)),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
-                }
-                node::NodeRow::UtilsHeader => {
-                    Row::new(vec![
-                        Cell::from("PID").style(Style::default().add_modifier(Modifier::BOLD)),
-                        Cell::from("CPU").style(Style::default().add_modifier(Modifier::BOLD)),
-                        Cell::from("MEM").style(Style::default().add_modifier(Modifier::BOLD)),
-                        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
-                        Cell::from("SCRIPT").style(Style::default().add_modifier(Modifier::BOLD)),
-                    ])
-                }
-                _ => Row::new(vec![Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from("")]),
+                Row::new(cells).style(selection_style(
+                    state.selected == idx,
+                    state.hover_row == Some(idx),
+                ))
+            }
+            node::NodeRow::Group { name, count } => {
+                Row::new(vec![Cell::from(format!("{name} ({count})")).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )])
             }
         })
         .collect();
+    let mut labels = vec!["PID", "RSS", "NAME"];
+    let mut fields = vec![
+        Some(SortField::Pid),
+        Some(SortField::Memory),
+        Some(SortField::Name),
+    ];
+    let mut widths = vec![
+        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Fill(1),
+    ];
+    if show_cpu {
+        labels.push("CPU");
+        fields.push(Some(SortField::Cpu));
+        widths.push(Constraint::Length(7));
+    }
+    if show_script {
+        labels.push("SCRIPT");
+        fields.push(Some(SortField::Script));
+        widths.push(Constraint::Fill(1));
+    }
+    let header = sortable_header(
+        state,
+        Block::default().borders(Borders::ALL).inner(area),
+        SortTarget::Node,
+        &labels,
+        &fields,
+        &widths,
+    );
+    frame.render_widget(
+        Table::new(rows, widths)
+            .column_spacing(1)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                    " Node.js · {} · s sort ",
+                    crate::app::sorting::SortTarget::Node
+                        .sort_label(state.sort_for(crate::app::sorting::SortTarget::Node))
+                ))),
+        area,
+    );
+    if node_rows.is_empty() {
+        render_collection_empty(
+            frame,
+            area,
+            state.node_loaded,
+            &state.node_filter,
+            "No Node processes.",
+        );
+    }
+    for (offset, row) in node_rows
+        .iter()
+        .skip(state.node_scroll)
+        .take(capacity)
+        .enumerate()
+    {
+        if let node::NodeRow::Group { name, count } = row {
+            frame.render_widget(
+                Paragraph::new(format!("{name} ({count})")).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Rect::new(
+                    area.x + 1,
+                    area.y + 2 + offset as u16,
+                    area.width.saturating_sub(2),
+                    1,
+                ),
+            );
+        }
+    }
+    render_nav_icons(frame, area, state.node_scroll, node_rows.len(), capacity);
+}
 
-    let header = Row::new(vec![
-        Cell::from("PID").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("CPU").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("MEM").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("SCRIPT").style(Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-
-    let table = Table::new(
-        table_rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Percentage(30),
-            Constraint::Min(20),
-        ],
-    )
-    .header(header)
-    .block(Block::default().borders(Borders::ALL));
-
-    frame.render_widget(table, area);
-
-    // Navigation icons
-    render_nav_icons(frame, area, scroll_offset, node_rows.len(), visible_height);
+/// Draws the shared two-column header, or the compact stacked version.
+pub(super) fn render_collection_header(
+    frame: &mut Frame,
+    layout: super::layout::CollectionHeader,
+    title: &str,
+    details: Vec<Line<'_>>,
+    filter: &str,
+    active: bool,
+) {
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    if layout.columns {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} "))
+                .border_style(Style::default().fg(Color::Cyan)),
+            layout.area,
+        );
+        let divider_x = layout.details.right() + 1;
+        for y in layout.area.y..layout.area.bottom() {
+            let symbol = if y == layout.area.y {
+                "┬"
+            } else if y == layout.area.bottom() - 1 {
+                "┴"
+            } else {
+                "│"
+            };
+            frame.render_widget(
+                Paragraph::new(symbol).style(Style::default().fg(Color::Cyan)),
+                Rect::new(divider_x, y, 1, 1),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(" Search ").style(if active {
+                title_style
+            } else {
+                Style::default().fg(Color::Gray)
+            }),
+            Rect::new(layout.search.x, layout.area.y, layout.search.width, 1),
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(format!(" {title}")).style(title_style),
+            Rect::new(layout.area.x, layout.area.y, layout.area.width, 1),
+        );
+    }
+    frame.render_widget(Paragraph::new(details), layout.details);
+    render_search_box(frame, layout.search, filter, active);
 }
 
 fn render_search_box(frame: &mut Frame, area: Rect, filter: &str, is_active: bool) {
     let style = if is_active {
-        Style::default().fg(Color::Yellow)
+        Style::default().bg(Color::Cyan).fg(Color::Black)
     } else {
         Style::default()
     };
@@ -1150,7 +1607,11 @@ fn render_search_box(frame: &mut Frame, area: Rect, filter: &str, is_active: boo
 
     let search = Paragraph::new(search_text)
         .style(style)
-        .block(Block::default().borders(Borders::ALL).title("Search"));
+        .block(if area.height >= 3 {
+            Block::default().borders(Borders::ALL).title("Search")
+        } else {
+            Block::default()
+        });
 
     frame.render_widget(search, area);
 }
@@ -1169,7 +1630,11 @@ fn render_context_menu(frame: &mut Frame, state: &AppState, main_area: Rect) {
     // Get labels for width calculation
     let labels: Vec<&str> = items.iter().map(|a| a.label(menu.is_group)).collect();
     let menu_area = super::layout::context_menu_area(
-        main_area, menu.x, menu.y, &labels, menu.header.as_deref(),
+        main_area,
+        menu.x,
+        menu.y,
+        &labels,
+        menu.header.as_deref(),
     );
     if menu_area.width < 3 || menu_area.height < 3 {
         return;
@@ -1185,7 +1650,12 @@ fn render_context_menu(frame: &mut Frame, state: &AppState, main_area: Rect) {
     frame.render_widget(block, menu_area);
 
     // Render items - full width with consistent padding and explicit background
-    let inner = Rect::new(menu_area.x + 1, menu_area.y + 1, menu_area.width - 2, menu_area.height - 2);
+    let inner = Rect::new(
+        menu_area.x + 1,
+        menu_area.y + 1,
+        menu_area.width - 2,
+        menu_area.height - 2,
+    );
     let inner_width = inner.width as usize;
     let mut row_y = inner.y;
 
@@ -1193,20 +1663,33 @@ fn render_context_menu(frame: &mut Frame, state: &AppState, main_area: Rect) {
         let padded = format!(" {}", truncate(header, inner_width.saturating_sub(1)));
         let line = Line::from(Span::styled(
             padded,
-            Style::default().bg(Color::Black).fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(Color::Black)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
-        frame.render_widget(Paragraph::new(line), Rect::new(inner.x, row_y, inner.width, 1));
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(inner.x, row_y, inner.width, 1),
+        );
         row_y = row_y.saturating_add(1);
     }
 
-    for (i, label) in labels.iter().enumerate() {
+    let capacity = inner
+        .height
+        .saturating_sub(u16::from(menu.header.is_some())) as usize;
+    let scroll = menu
+        .hover
+        .unwrap_or(0)
+        .saturating_sub(capacity.saturating_sub(1));
+    for (i, label) in labels.iter().enumerate().skip(scroll).take(capacity) {
         let is_hovered = menu.hover == Some(i);
         let style = if is_hovered {
             Style::default().bg(Color::White).fg(Color::Black)
         } else {
             Style::default().bg(Color::Black).fg(Color::White)
         };
-        let y = row_y + i as u16;
+        let y = row_y + (i - scroll) as u16;
         if y < inner.y + inner.height {
             // Pad label to full width: " Label" + spaces to fill
             let padded = format!(" {:<width$}", label, width = inner_width.saturating_sub(1));
@@ -1216,76 +1699,49 @@ fn render_context_menu(frame: &mut Frame, state: &AppState, main_area: Rect) {
     }
 }
 
-fn render_prune_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
-    let label = match state.pending_prune {
-        Some(crate::app::ContextMenuAction::PruneBuildCache) => "build cache",
-        Some(crate::app::ContextMenuAction::PruneDanglingImages) => "unused images",
-        Some(crate::app::ContextMenuAction::PruneVolumes) => "volumes",
+fn render_prune_confirm(frame: &mut Frame, state: &AppState, bounds: Rect) {
+    let scope = match state.pending_prune {
+        Some(crate::app::ContextMenuAction::PruneBuildCache) => "unused build cache",
+        Some(crate::app::ContextMenuAction::PruneDanglingImages) => "all unused images",
+        Some(crate::app::ContextMenuAction::PruneVolumes) => "unused anonymous volumes",
         _ => return,
     };
-
-    let mut text = vec![Line::from(vec![
-        Span::styled("Confirm prune ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(label),
-        Span::raw("?"),
-    ])];
-
-    if label == "volumes" {
-        text.push(Line::from("WARNING! This will remove all volumes not used by at least one container."));
-        text.push(Line::from("Are you sure you want to continue?"));
-    } else if label == "unused images" {
-        text.push(Line::from("WARNING! This will remove all images not used by any container."));
-        text.push(Line::from("Are you sure you want to continue?"));
-    } else if label == "build cache" {
-        text.push(Line::from("WARNING! This will remove all unused build cache."));
-        text.push(Line::from("Are you sure you want to continue?"));
-    }
-
-    text.push(Line::from(vec![
-        Span::styled("Y", Style::default().fg(Color::Yellow)),
-        Span::raw(" = yes, "),
-        Span::styled("N/Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(" = cancel"),
-    ]));
-
-    let width = 54u16.max(label.len() as u16 + 28);
-    let height = 9u16;
-    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
-    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
-    let area = Rect::new(x, y, width, height);
-
+    let (area, yes, no) = super::layout::prune_confirmation(bounds);
     frame.render_widget(ratatui::widgets::Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Confirm Prune ");
-    frame.render_widget(block, area);
-
-    let inner = Rect::new(area.x + 2, area.y + 2, area.width.saturating_sub(4), area.height.saturating_sub(6));
-    frame.render_widget(Paragraph::new(text), inner);
-
-    let buttons_y = area.y + area.height - 3;
-    let button_w = 10u16;
-    let gap = 4u16;
-    let total_buttons_w = button_w * 2 + gap;
-    let buttons_x = area.x + (area.width.saturating_sub(total_buttons_w)) / 2;
-
-    let yes_hover = state.pending_prune_hover == Some(crate::app::PruneConfirmChoice::Yes);
-    let no_hover = state.pending_prune_hover == Some(crate::app::PruneConfirmChoice::No);
-    let yes_style = if yes_hover {
-        Style::default().bg(Color::Cyan).fg(Color::Black)
-    } else {
-        Style::default().bg(Color::Black).fg(Color::White)
-    };
-    let no_style = if no_hover {
-        Style::default().bg(Color::Cyan).fg(Color::Black)
-    } else {
-        Style::default().bg(Color::Black).fg(Color::White)
-    };
-
-    let yes_text = Line::from(Span::styled(" [ Yes ] ", yes_style));
-    let no_text = Line::from(Span::styled(" [ No ] ", no_style));
-    frame.render_widget(Paragraph::new(yes_text), Rect::new(buttons_x, buttons_y, button_w, 1));
-    frame.render_widget(Paragraph::new(no_text), Rect::new(buttons_x + button_w + gap, buttons_y, button_w, 1));
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm Prune "),
+        area,
+    );
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(4),
+    );
+    frame.render_widget(Paragraph::new(format!("Remove {scope}?\nCannot be undone.\nReferenced items are kept.\nY confirms · N/Esc cancels")).wrap(Wrap { trim: false }), inner);
+    for (button, text, hovered) in [
+        (
+            yes,
+            "[ Yes ]",
+            state.pending_prune_hover == Some(crate::app::PruneConfirmChoice::Yes),
+        ),
+        (
+            no,
+            "[ No ]",
+            state.pending_prune_hover == Some(crate::app::PruneConfirmChoice::No),
+        ),
+    ] {
+        frame.render_widget(
+            Paragraph::new(text).style(if hovered {
+                Style::default().bg(Color::Cyan).fg(Color::Black)
+            } else {
+                Style::default()
+            }),
+            button,
+        );
+    }
 }
 
 fn render_delete_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
@@ -1330,12 +1786,18 @@ fn render_delete_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let (area, yes_area, no_area) = super::layout::delete_confirmation(main_area);
     frame.render_widget(ratatui::widgets::Clear, area);
     frame.render_widget(
-        Block::default().borders(Borders::ALL)
+        Block::default()
+            .borders(Borders::ALL)
             .title(" Confirm Delete ")
             .title_bottom(" Y: delete | N/Esc: cancel "),
         area,
     );
-    let inner = Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), area.height.saturating_sub(5));
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 1,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(5),
+    );
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 
     let yes_hover = state.pending_delete_hover == Some(DeleteConfirmChoice::Yes);
@@ -1355,93 +1817,6 @@ fn render_delete_confirm(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let no_text = Line::from(Span::styled(" [ No ] ", no_style));
     frame.render_widget(Paragraph::new(yes_text), yes_area);
     frame.render_widget(Paragraph::new(no_text), no_area);
-}
-
-fn render_prune_progress(frame: &mut Frame, state: &AppState, main_area: Rect, label: &str) {
-    let spinner = state.spinner_char();
-    let text = vec![
-        Line::from(vec![
-            Span::styled("Pruning ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(label),
-            Span::raw("..."),
-        ]),
-        Line::from(vec![
-            Span::styled(spinner.to_string(), Style::default().fg(Color::Cyan)),
-            Span::raw(" working in background"),
-        ]),
-    ];
-
-    let width = 38u16.max(label.len() as u16 + 20);
-    let height = 6u16;
-    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
-    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
-    let area = Rect::new(x, y, width, height);
-
-    frame.render_widget(ratatui::widgets::Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Prune In Progress ");
-    frame.render_widget(block, area);
-
-    let inner = Rect::new(area.x + 2, area.y + 2, area.width.saturating_sub(4), area.height.saturating_sub(4));
-    frame.render_widget(Paragraph::new(text), inner);
-}
-
-fn render_prune_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
-    let output = match state.prune_output.as_ref() {
-        Some(o) => o,
-        None => return,
-    };
-    let title = format!(" Prune Output: {} ", output.label);
-    let width = (main_area.width.saturating_mul(85) / 100).max(72);
-    let height = (main_area.height.saturating_mul(75) / 100).max(12);
-    let x = main_area.x + (main_area.width.saturating_sub(width)) / 2;
-    let y = main_area.y + (main_area.height.saturating_sub(height)) / 2;
-    let area = Rect::new(x, y, width, height);
-
-    frame.render_widget(ratatui::widgets::Clear, area);
-    let bg_color = if output.label == "build cache" {
-        Color::Reset
-    } else {
-        Color::Black
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(bg_color).fg(Color::White));
-    frame.render_widget(block, area);
-
-    let inner = Rect::new(
-        area.x + 2,
-        area.y + 2,
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(6),
-    );
-    let cleaned = output.output.replace('\r', "").replace('\t', " ");
-    let text = if cleaned.trim().is_empty() {
-        "No output from docker.".to_string()
-    } else {
-        cleaned
-    };
-    frame.render_widget(ratatui::widgets::Clear, inner);
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: true })
-            .style(Style::default().bg(bg_color).fg(Color::White)),
-        inner,
-    );
-
-    let button_w = 10u16;
-    let button_y = area.y + area.height.saturating_sub(3);
-    let button_x = area.x + (area.width.saturating_sub(button_w)) / 2;
-    let hover = state.prune_output_hover;
-    let style = if hover {
-        Style::default().bg(Color::Cyan).fg(Color::Black)
-    } else {
-        Style::default().bg(Color::Black).fg(Color::White)
-    };
-    let line = Line::from(Span::styled(" [ Close ] ", style));
-    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
 }
 
 fn render_log_progress(frame: &mut Frame, state: &AppState, main_area: Rect, label: &str) {
@@ -1539,10 +1914,7 @@ fn render_log_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
         state.log_lines[start..end].to_vec()
     };
     frame.render_widget(ratatui::widgets::Clear, inner);
-    frame.render_widget(
-        Paragraph::new(lines),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(lines), inner);
 
     let button_w = 12u16;
     let button_y = area.y + area.height.saturating_sub(3);
@@ -1568,15 +1940,24 @@ fn render_log_output(frame: &mut Frame, state: &AppState, main_area: Rect) {
             Style::default().bg(Color::Black).fg(Color::White)
         };
         let select_line = Line::from(Span::styled(select_label, select_style));
-        frame.render_widget(Paragraph::new(select_line), Rect::new(button_x, button_y, button_w, 1));
+        frame.render_widget(
+            Paragraph::new(select_line),
+            Rect::new(button_x, button_y, button_w, 1),
+        );
 
         let close_x = button_x + button_w + gap;
         let close_line = Line::from(Span::styled(" [ Close ] ", close_style));
-        frame.render_widget(Paragraph::new(close_line), Rect::new(close_x, button_y, button_w, 1));
+        frame.render_widget(
+            Paragraph::new(close_line),
+            Rect::new(close_x, button_y, button_w, 1),
+        );
     } else {
         let close_x = area.x + (area.width.saturating_sub(button_w)) / 2;
         let close_line = Line::from(Span::styled(" [ Close ] ", close_style));
-        frame.render_widget(Paragraph::new(close_line), Rect::new(close_x, button_y, button_w, 1));
+        frame.render_widget(
+            Paragraph::new(close_line),
+            Rect::new(close_x, button_y, button_w, 1),
+        );
     }
 }
 
@@ -1597,8 +1978,7 @@ fn render_env_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
     let area = Rect::new(x, y, width, height);
 
     frame.render_widget(ratatui::widgets::Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL);
+    let block = Block::default().borders(Borders::ALL);
     frame.render_widget(block, area);
 
     let inner = Rect::new(
@@ -1629,7 +2009,10 @@ fn render_env_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
         Style::default().bg(Color::Black).fg(Color::White)
     };
     let line = Line::from(Span::styled(" [ Close ] ", style));
-    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(button_x, button_y, button_w, 1),
+    );
 }
 
 fn render_docker_list_modal(frame: &mut Frame, state: &AppState, main_area: Rect) {
@@ -1659,17 +2042,26 @@ fn render_docker_list_modal(frame: &mut Frame, state: &AppState, main_area: Rect
     frame.render_widget(ratatui::widgets::Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", title))
-        .title_bottom(if kind == DockerListKind::Volumes { " Enter/i details | Del delete | F5 refresh " } else { " i inspect | F5 refresh " });
+        .title(format!(
+            " {} · {} ",
+            title,
+            state.sort_for(state.sort_target()).label()
+        ))
+        .title_bottom(if kind == DockerListKind::Volumes {
+            " Enter details | c containers | s sort "
+        } else {
+            " i inspect | s sort | F10 actions "
+        });
     frame.render_widget(block, area);
 
     let list_area = Rect::new(
         area.x + 2,
-        area.y + 2,
+        area.y + super::layout::docker_list_top_padding(area.height),
         area.width.saturating_sub(4),
         super::layout::docker_list_content_height(area.height, kind == DockerListKind::Volumes),
     );
-    let visible_height = list_area.height.saturating_sub(1) as usize;
+    let header_height = super::layout::docker_list_header_height(area.height);
+    let visible_height = list_area.height.saturating_sub(header_height) as usize;
     let total = state.docker_list_items.len();
     let selected = if total > 0 {
         state.docker_list_selected.min(total - 1)
@@ -1716,35 +2108,83 @@ fn render_docker_list_modal(frame: &mut Frame, state: &AppState, main_area: Rect
                 };
                 let cells = if kind == DockerListKind::Volumes {
                     vec![
-                        Cell::from(item.name.clone()),
+                        Cell::from(item.name.clone()).style(
+                            if item.attachments.as_ref().is_some_and(Vec::is_empty) {
+                                Style::default()
+                                    .fg(Color::Gray)
+                                    .add_modifier(Modifier::ITALIC)
+                            } else if item
+                                .attachments
+                                .as_ref()
+                                .is_some_and(|entries| !entries.is_empty())
+                            {
+                                Style::default().add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            },
+                        ),
                         Cell::from(item.size.clone()),
                         Cell::from(item.activity.as_deref().unwrap_or("Unknown")),
                     ]
                 } else {
-                    vec![Cell::from(item.name.clone()), Cell::from(item.id.clone()), Cell::from(item.size.clone())]
+                    vec![
+                        Cell::from(item.name.clone()),
+                        Cell::from(item.id.clone()),
+                        Cell::from(item.size.clone()),
+                    ]
                 };
-                Row::new(cells)
-                .style(style)
+                Row::new(cells).style(style)
             })
             .collect()
     };
 
-    let header = Row::new(vec![
-        Cell::from("NAME").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from(if kind == DockerListKind::Volumes { "SIZE" } else { "ID" }).style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from(if kind == DockerListKind::Volumes { "ACTIVITY" } else { "SIZE" }).style(Style::default().add_modifier(Modifier::BOLD)),
-    ]);
-
-    let table = Table::new(
-        rows,
-        if kind == DockerListKind::Volumes {
-            [Constraint::Fill(3), Constraint::Length(9), Constraint::Fill(3)]
-        } else {
-            [Constraint::Fill(3), Constraint::Fill(2), Constraint::Length(10)]
-        },
-    )
-    .header(header)
-    .column_spacing(1);
+    let (labels, fields, widths) = if kind == DockerListKind::Volumes {
+        (
+            ["NAME", "SIZE", "ACTIVITY"],
+            [
+                Some(SortField::Name),
+                Some(SortField::Size),
+                Some(SortField::Activity),
+            ],
+            [
+                Constraint::Fill(3),
+                Constraint::Length(9),
+                Constraint::Fill(3),
+            ],
+        )
+    } else {
+        (
+            ["NAME", "ID", "SIZE"],
+            [
+                Some(SortField::Name),
+                Some(SortField::Id),
+                Some(SortField::Size),
+            ],
+            [
+                Constraint::Fill(3),
+                Constraint::Fill(2),
+                Constraint::Length(10),
+            ],
+        )
+    };
+    let header = if total > 0 && header_height > 0 {
+        sortable_header(
+            state,
+            list_area,
+            state.sort_target(),
+            &labels,
+            &fields,
+            &widths,
+        )
+    } else {
+        Row::default()
+    };
+    let table = Table::new(rows, widths).column_spacing(1);
+    let table = if header_height > 0 {
+        table.header(header)
+    } else {
+        table
+    };
     if total == 0 {
         frame.render_widget(
             Paragraph::new(placeholder).wrap(Wrap { trim: true }),
@@ -1757,20 +2197,42 @@ fn render_docker_list_modal(frame: &mut Frame, state: &AppState, main_area: Rect
         let is_volume = kind == DockerListKind::Volumes;
         let width = area.width.saturating_sub(4);
         let lines = if is_volume {
-            vec![
+            let mut lines = vec![
                 Line::from(truncate(&item.detail_left, width as usize)),
                 Line::from(truncate(&item.detail_right, width as usize)),
-            ]
+            ];
+            if area.height >= 12 {
+                lines.push(Line::from(truncate(&item.detail_project, width as usize)));
+            } else {
+                lines[1] = Line::from(truncate(&item.detail_project, width as usize));
+            }
+            lines
         } else {
-            vec![Line::from(format!("{}  {}", item.detail_left, item.detail_right))]
+            vec![Line::from(format!(
+                "{}  {}",
+                item.detail_left, item.detail_right
+            ))]
         };
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().fg(Color::Gray)),
             Rect::new(
                 area.x + 2,
-                area.bottom().saturating_sub(if is_volume { 5 } else { 4 }),
+                area.bottom()
+                    .saturating_sub(if is_volume && area.height >= 12 {
+                        6
+                    } else if is_volume {
+                        5
+                    } else {
+                        4
+                    }),
                 width,
-                if is_volume { 2 } else { 1 },
+                if is_volume && area.height >= 12 {
+                    3
+                } else if is_volume {
+                    2
+                } else {
+                    1
+                },
             ),
         );
     }
@@ -1785,7 +2247,10 @@ fn render_docker_list_modal(frame: &mut Frame, state: &AppState, main_area: Rect
         Style::default().bg(Color::Black).fg(Color::White)
     };
     let line = Line::from(Span::styled(" [ Close ] ", style));
-    frame.render_widget(Paragraph::new(line), Rect::new(button_x, button_y, button_w, 1));
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect::new(button_x, button_y, button_w, 1),
+    );
 }
 
 fn render_modal_overlay(frame: &mut Frame, area: Rect) {
@@ -1860,10 +2325,22 @@ fn render_system_bars(frame: &mut Frame, state: &AppState, area: Rect) {
         format_bytes(state.disk_total)
     );
 
-    frame.render_widget(Paragraph::new(cpu_line), Rect::new(area.x, area.y, area.width, 1));
-    frame.render_widget(Paragraph::new(mem_line), Rect::new(area.x, area.y + 1, area.width, 1));
-    frame.render_widget(Paragraph::new(swap_line), Rect::new(area.x, area.y + 2, area.width, 1));
-    frame.render_widget(Paragraph::new(disk_line), Rect::new(area.x, area.y + 3, area.width, 1));
+    frame.render_widget(
+        Paragraph::new(cpu_line),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(mem_line),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(swap_line),
+        Rect::new(area.x, area.y + 2, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(disk_line),
+        Rect::new(area.x, area.y + 3, area.width, 1),
+    );
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1897,7 +2374,7 @@ fn calculate_scroll_offset(selected: usize, visible_height: usize, total: usize)
     ideal_offset.min(max_offset)
 }
 
-fn format_memory(bytes: u64) -> String {
+pub(super) fn format_memory(bytes: u64) -> String {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
     const KB: u64 = 1024;
@@ -1968,35 +2445,73 @@ fn render_docker_df_stats(frame: &mut Frame, state: &AppState, area: Rect, df: &
 
     // Build table rows - 5 rows total (header + 4 data)
     let rows = [
-        ("Images", df.images_total, df.images_active, &df.images_size, &df.images_reclaimable, &df.images_reclaimable_pct),
-        ("Containers", df.containers_total, df.containers_active, &df.containers_size, &df.containers_reclaimable, &df.containers_reclaimable_pct),
-        ("Volumes", df.volumes_total, df.volumes_active, &df.volumes_size, &df.volumes_reclaimable, &df.volumes_reclaimable_pct),
-        ("Build Cache", df.build_cache_total as u32, 0, &df.build_cache_size, &df.build_cache_reclaimable, &df.build_cache_reclaimable_pct),
+        (
+            "Images",
+            df.images_total,
+            df.images_active,
+            &df.images_size,
+            &df.images_reclaimable,
+            &df.images_reclaimable_pct,
+        ),
+        (
+            "Containers",
+            df.containers_total,
+            df.containers_active,
+            &df.containers_size,
+            &df.containers_reclaimable,
+            &df.containers_reclaimable_pct,
+        ),
+        (
+            "Volumes",
+            df.volumes_total,
+            df.volumes_active,
+            &df.volumes_size,
+            &df.volumes_reclaimable,
+            &df.volumes_reclaimable_pct,
+        ),
+        (
+            "Build Cache",
+            df.build_cache_total as u32,
+            0,
+            &df.build_cache_size,
+            &df.build_cache_reclaimable,
+            &df.build_cache_reclaimable_pct,
+        ),
     ];
 
-    let table_rows: Vec<Row> = rows.iter().enumerate().map(|(i, &(name, total, active, size, reclaimable, reclaimable_pct))| {
-        let reclaimable_display = if !reclaimable_pct.is_empty() {
-            format!("{} ({})", reclaimable, reclaimable_pct)
-        } else {
-            reclaimable.to_string()
-        };
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(
+            |(i, &(name, total, active, size, reclaimable, reclaimable_pct))| {
+                let reclaimable_display = if !reclaimable_pct.is_empty() {
+                    format!("{} ({})", reclaimable, reclaimable_pct)
+                } else {
+                    reclaimable.to_string()
+                };
 
-        let is_hovered = hover_row == Some(i);
-        let row_style = if is_hovered {
-            Style::default().bg(Color::Rgb(40, 40, 45))
-        } else {
-            Style::default()
-        };
+                let is_hovered = hover_row == Some(i);
+                let row_style = if is_hovered {
+                    Style::default().bg(Color::Rgb(40, 40, 45))
+                } else {
+                    Style::default()
+                };
 
-        Row::new(vec![
-            Cell::from(name).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from(total.to_string()),
-            Cell::from(active.to_string()),
-            Cell::from(size.clone()),
-            Cell::from(reclaimable_display).style(Style::default().fg(Color::DarkGray)),
-        ])
-        .style(row_style)
-    }).collect();
+                Row::new(vec![
+                    Cell::from(name).style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Cell::from(total.to_string()),
+                    Cell::from(active.to_string()),
+                    Cell::from(size.clone()),
+                    Cell::from(reclaimable_display).style(Style::default().fg(Color::DarkGray)),
+                ])
+                .style(row_style)
+            },
+        )
+        .collect();
 
     let header = Row::new(vec![
         Cell::from("Type").style(Style::default().add_modifier(Modifier::BOLD)),
