@@ -268,6 +268,7 @@ pub struct AppState {
     pub logo_frame: u8,
     pub logo_animated: bool,
     pub logo_last_tick: Instant,
+    pub logo_cycle_elapsed: Duration,
     pub input_mode: InputMode,
     pub process_filter: String,
     pub docker_filter: String,
@@ -463,6 +464,7 @@ impl AppState {
             logo_frame: 0,
             logo_animated: true,
             logo_last_tick: Instant::now(),
+            logo_cycle_elapsed: Duration::ZERO,
             input_mode: InputMode::Normal,
             process_filter: String::new(),
             docker_filter: String::new(),
@@ -1026,6 +1028,8 @@ impl AppState {
         }
     }
     pub fn tick_logo_at(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.logo_last_tick);
+        self.logo_last_tick = now;
         if !self.logo_animated
             || self.term_width < 60
             || self.term_height < 18
@@ -1040,12 +1044,25 @@ impl AppState {
         {
             return false;
         }
-        if now.saturating_duration_since(self.logo_last_tick) < Duration::from_millis(200) {
-            return false;
+        // Spin for 2.4 seconds, then rest until the next ten-second cycle.
+        // Only visible, unpaused time advances the cycle.
+        const CYCLE: Duration = Duration::from_secs(10);
+        const FRAME: Duration = Duration::from_millis(200);
+        let phase =
+            (self.logo_cycle_elapsed.saturating_add(elapsed).as_nanos() % CYCLE.as_nanos()) as u64;
+        self.logo_cycle_elapsed = Duration::from_nanos(phase);
+        let frame = self.logo_cycle_elapsed.as_millis() / FRAME.as_millis();
+        let frame = if frame < crate::ui::widgets::Sidebar::LOGO_FRAME_COUNT as u128 {
+            frame as u8
+        } else {
+            0
+        };
+        if frame == self.logo_frame {
+            false
+        } else {
+            self.logo_frame = frame;
+            true
         }
-        self.logo_frame = self.logo_frame.wrapping_add(1) % 8;
-        self.logo_last_tick = now;
-        true
     }
 
     pub(crate) fn set_view(&mut self, view: ViewMode) {
@@ -1305,6 +1322,28 @@ mod tests {
         state.sort_menu = None;
         state.term_width = 40;
         assert!(!state.tick_logo_at(start + Duration::from_secs(1)));
+        state.term_width = 100;
+        assert!(state.tick_logo_at(start + Duration::from_millis(1200)));
+        assert_eq!(state.logo_frame, 2);
+    }
+
+    #[test]
+    fn logo_spins_once_every_ten_seconds_and_stays_still_between_spins() {
+        let mut state = AppState::new();
+        state.term_width = 100;
+        state.term_height = 24;
+        let start = state.logo_last_tick;
+        assert!(state.tick_logo_at(start + Duration::from_millis(2200)));
+        assert_eq!(state.logo_frame, 11);
+        assert!(state.tick_logo_at(start + Duration::from_millis(2400)));
+        assert_eq!(state.logo_frame, 0);
+        assert!(!state.tick_logo_at(start + Duration::from_millis(9999)));
+        assert!(!state.tick_logo_at(start + Duration::from_secs(10)));
+        assert!(state.tick_logo_at(start + Duration::from_millis(10200)));
+        assert_eq!(state.logo_frame, 1);
+        // A delayed UI tick skips missed frames without replaying a backlog.
+        assert!(state.tick_logo_at(start + Duration::from_secs(30)));
+        assert_eq!(state.logo_frame, 0);
     }
     #[test]
     fn resource_sort_and_refresh_keep_the_selected_volume_identity() {
