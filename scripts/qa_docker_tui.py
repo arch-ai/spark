@@ -2,6 +2,7 @@
 """Bounded Linux PTY smoke test; never invokes the real Docker or PM2 CLIs."""
 import codecs
 import fcntl
+import json
 import os
 from pathlib import Path
 import pty
@@ -172,6 +173,21 @@ else:
     sys.exit(2)
 ''')
         pm2.chmod(0o755)
+        terminal_ready = fixture / 'terminal-ready'
+        os.mkfifo(terminal_ready)
+        terminal_fd = os.open(terminal_ready, os.O_RDWR | os.O_NONBLOCK)
+        terminal = fixture / 'terminator'
+        terminal.write_text('''#!/usr/bin/python3
+import json, os, pathlib, sys
+print('QA TERMINAL STDOUT LEAK', flush=True)
+print('ConfigBase::load: QA TERMINAL STDERR LEAK', file=sys.stderr, flush=True)
+with (pathlib.Path(os.environ['SPARK_QA_DIR']) / 'terminal-ready').open('w') as ready:
+    ready.write(json.dumps(sys.argv[1:]))
+''')
+        terminal.chmod(0o755)
+        (fixture / 'gnome-terminal').symlink_to(terminal.name)
+        (fixture / 'x-terminal-emulator').write_bytes(terminal.read_bytes())
+        (fixture / 'x-terminal-emulator').chmod(0o755)
         # An owned fixture process with a Node executable path and script argument.
         # It blocks on stdin, so native snapshots can be checked during a slow PM2 query.
         native_script = fixture / 'qa-native.js'
@@ -184,9 +200,11 @@ else:
         master, slave = pty.openpty()
         original = termios.tcgetattr(slave)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 100, 0, 0))
-        env = dict(os.environ, PATH=f'{fixture}:' + os.environ['PATH'], TERM='xterm-256color', SPARK_QA_DIR=directory, SPARK_CONFIG_DIR=str(fixture / 'config'))
+        # Restrict PATH so fallback tests cannot launch a real desktop terminal.
+        env = dict(os.environ, PATH=str(fixture), TERM='xterm-256color', TERMINAL=str(terminal), SPARK_QA_DIR=directory, SPARK_CONFIG_DIR=str(fixture / 'config'))
         proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True)
         screen = Screen()
+        ui_output = bytearray()
 
         def expect(text, timeout=8, absent=False, predicate=None):
             matches = lambda: predicate(screen.text()) if predicate else ((text not in screen.text()) if absent else (text in screen.text()))
@@ -199,6 +217,7 @@ else:
                 if not ready:
                     break
                 chunk = os.read(master, 65536)
+                ui_output.extend(chunk)
                 received.extend(chunk)
                 screen.feed(chunk)
                 if matches():
@@ -238,13 +257,34 @@ else:
                     return
             raise AssertionError(f'Cannot click tab {label!r}:\n{screen.text()}')
 
+        def check_terminal_launch(action, expected_command, execute_option):
+            if action == 'Shell':
+                click_text('qa-api')
+                os.write(master, b'\r')
+            else:
+                click_text('qa-api')
+                os.write(master, b'\x1b[21~')  # F10
+                expect(action)
+                click_text(action)
+            ready, _, _ = select.select([terminal_fd], [], [], 8)
+            assert ready, f'Terminal launcher did not acknowledge {action}'
+            arguments = json.loads(os.read(terminal_fd, 65536))
+            assert arguments == [execute_option, 'bash', '-lc', expected_command], arguments
+            # A fresh render after the launch receipt consumes any leaked output.
+            os.write(master, b'?')
+            expect('KEYBOARD HELP')
+            assert b'QA TERMINAL STDOUT LEAK' not in ui_output, 'Terminal stdout leaked into Spark'
+            assert b'QA TERMINAL STDERR LEAK' not in ui_output, 'Terminal stderr leaked into Spark'
+            os.write(master, b'\x1b')
+            expect('KEYBOARD HELP', absent=True)
+
         try:
             expect('PROCESS VIEW')
             search_via_mouse('qa-search')
             os.write(master, b'x')
             expect('/ to filter...')
-            logo = screen.cells[4][9]
-            expect('animated logo', timeout=1, predicate=lambda text: screen.cells[4][9] != logo)
+            logo = [row[1:19] for row in screen.cells[1:8]]
+            expect('animated logo', timeout=1, predicate=lambda text: [row[1:19] for row in screen.cells[1:8]] != logo)
             os.write(master, b' ')
             expect('Logo animation paused')
             os.write(master, b' ')
@@ -270,6 +310,19 @@ else:
             os.write(master, b'd')
             expect('qa-api')
             expect('qa-other')
+            logs_command = 'docker logs -f --tail 200 0123456789abcdef; exec bash'
+            shell_command = 'docker exec -it 0123456789abcdef bash 2>/dev/null || docker exec -it 0123456789abcdef sh; exec bash'
+            check_terminal_launch('Logs - New Window', logs_command, '-x')
+            # Keep a GNOME fixture after the configured Terminator disappears.
+            (fixture / 'gnome-terminal').unlink()
+            (fixture / 'gnome-terminal').write_bytes(terminal.read_bytes())
+            (fixture / 'gnome-terminal').chmod(0o755)
+            terminal.unlink()
+            check_terminal_launch('Logs - New Window', logs_command, '--')
+            check_terminal_launch('Shell', shell_command, '--')
+            (fixture / 'gnome-terminal').unlink()
+            check_terminal_launch('Logs - New Window', logs_command, '-e')
+            check_terminal_launch('Shell', shell_command, '-e')
             search_via_mouse('qa')
             os.write(master, b'x')
             expect('/ to filter...')
@@ -360,7 +413,7 @@ else:
             assert len((fixture / 'container-deletions').read_text().splitlines()) == 1
             os.write(master, b'\x1b')
             expect('Delete failed', absent=True)
-            expect('Docker Volumes')
+            expect('Docker Volumes', predicate=lambda text: 'Docker Volumes' in text and 'qa-volume' in text and 'abcdef0123456789' in text)
             assert 'qa-volume' in screen.text(), screen.text()
             click_text('abcdef0123456789', button=2, near_right=True)
             expect('Delete Volume')
@@ -488,7 +541,7 @@ else:
             restored = termios.tcgetattr(slave)
             assert restored == original, 'terminal attributes were not restored'
             assert elapsed < 1.5, f'slow Docker list blocked navigation/quit for {elapsed:.2f}s'
-            print(f'PASS: mouse search across all section headers, default native Node.js tab, keyboard/mouse tab switching with empty native results, independent tab sorting/selection, clickable column sorting and keyboard sorting across views/resource lists with preserved action targets, volume project directories/owner navigation, animated logo/pause/help, native Node data during a slow PM2 query, keyboard menus, background prune failure, slow PM2 action failure/duplicate prevention, PM2 stale-data recovery, volume details, long-name menu click, slow deletion, duplicate prevention, container removal failure/success, successful removal, daemon failure/recovery, slow-list cancellation, navigation, clean exit, terminal restoration ({elapsed:.2f}s).')
+            print(f'PASS: isolated terminal launch output for logs/shell with Terminator/GNOME/system fallback, mouse search across all section headers, default native Node.js tab, keyboard/mouse tab switching with empty native results, independent tab sorting/selection, clickable column sorting and keyboard sorting across views/resource lists with preserved action targets, volume project directories/owner navigation, animated logo/pause/help, native Node data during a slow PM2 query, keyboard menus, background prune failure, slow PM2 action failure/duplicate prevention, PM2 stale-data recovery, volume details, long-name menu click, slow deletion, duplicate prevention, container removal failure/success, successful removal, daemon failure/recovery, slow-list cancellation, navigation, clean exit, terminal restoration ({elapsed:.2f}s).')
         finally:
             native_proc.terminate()
             native_proc.wait(timeout=2)
@@ -497,6 +550,7 @@ else:
                 proc.wait(timeout=2)
             os.close(master)
             os.close(slave)
+            os.close(terminal_fd)
 
 
 if __name__ == '__main__':

@@ -299,7 +299,10 @@ fn sort_menu_volume_directories_and_logo_motion_preserve_usable_rows_at_small_si
         .unwrap();
     let second = terminal.backend().buffer();
     export_feature_snapshot(second, "logo-spark");
-    assert_ne!(first[(9, 4)].symbol(), second[(9, 4)].symbol());
+    assert!(
+        (1..8).any(|y| (1..19).any(|x| first[(x, y)] != second[(x, y)])),
+        "the 3D facets should move between poses"
+    );
     for y in 9..14 {
         for x in 0..20 {
             assert_eq!(

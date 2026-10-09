@@ -57,6 +57,9 @@ curl -fsSL https://raw.githubusercontent.com/arch-ai/spark/main/install-from-git
 
 - Docker view requires the `docker` CLI in `PATH`.
 - Container shell uses `docker exec` and opens a new terminal window.
+- External logs and shells honor `TERMINAL`, then try Terminator, GNOME Terminal,
+  the system terminal, Konsole, XFCE, MATE, Tilix, or XTerm. Launcher diagnostics
+  are isolated from Spark's display.
 
 ## Navigation and actions
 
@@ -93,7 +96,8 @@ last in either direction. Numeric fields sort by their values, including sizes
 with different units. Grouped rows retain their project or application grouping.
 Short screens prioritize table rows and retain the important names and values.
 The sidebar hides below 60 columns; numeric navigation remains available.
-The ASCII logo animates at most five times per second within the existing UI loop.
+The 3D ASCII spark spins for 2.4 seconds once every 10 seconds, at five frames per
+second within the existing UI loop, and rests between spins.
 Animation pauses while a dialog is open and when the logo is hidden.
 
 Process stops, container actions, PM2 actions, and storage cleanup run in the
